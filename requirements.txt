@@ -1,0 +1,9 @@
+torch
+numpy
+pandas
+matplotlib
+pyarrow
+fastparquet
+yfinance
+requests
+tqdm
