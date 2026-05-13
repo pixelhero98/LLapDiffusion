@@ -244,6 +244,15 @@ The summarizer uses the shared public baseline in `configs/config.py`, with one 
 | `bms_air` | `SUM_LR = 1e-4`, `SUM_AMP = False` |
 | all others | shared summarizer defaults |
 
+
+### Time and imputation settings
+
+The default summarizer position mode is `SUM_POS_ENCODING="learned_abs"`, which keeps existing checkpoints compatible. Optional ablations can set `SUM_POS_ENCODING="continuous_rope"` or `"learned_plus_continuous_rope"` to rotate attention queries and keys by context-window relative time.
+
+`IMPUTATION_TRAINING=True` means imputation-style target anchors are allowed by configuration, not active by default. Pure extrapolation remains clean because `TARGET_MASK_AUX_P=0.0`; set a positive value only when intentionally running dual-task or imputation-style training.
+
+Context and target `delta_t` metadata are interpreted as window-local offsets when they start at zero and are monotone. Increment-style deltas are converted to offsets before use, so regular `[0, 1, 2, ...]` metadata is not accumulated twice.
+
 ## Practical tuning guidance
 
 When moving beyond the public presets, the most reliable order is:

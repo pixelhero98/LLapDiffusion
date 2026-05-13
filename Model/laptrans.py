@@ -6,6 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
+try:
+    from Model.time_utils import relative_time_offsets
+except ImportError:  # pragma: no cover - supports direct Model/ path imports
+    from time_utils import relative_time_offsets
+
 __all__ = ["LaplaceTransformEncoder", "LaplacePseudoInverse"]
 
 
@@ -185,8 +190,7 @@ class LaplaceTransformEncoder(nn.Module):
             dt = dt.to(device=device, dtype=dtype)
             if dt.dim() == 2:
                 dt = dt.unsqueeze(-1)
-            t_abs = torch.cumsum(dt, dim=1)
-            return t_abs - t_abs[:, :1]
+            return relative_time_offsets(dt, time_dim=1)
         return torch.arange(T, device=device, dtype=dtype).view(1, T, 1).expand(B, T, 1)
 
     @staticmethod

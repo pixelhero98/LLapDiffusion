@@ -5,6 +5,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from Model.time_utils import relative_time_offsets
+except ImportError:  # pragma: no cover - supports direct Model/ path imports
+    from time_utils import relative_time_offsets
+
 
 class TVHead(nn.Module):
     """Single-hidden-layer MLP that projects per-step features to a scalar signal.
@@ -63,6 +68,143 @@ class Time2Vec(nn.Module):
         return out
 
 
+class ContinuousRoPESelfAttention(nn.Module):
+    """Multi-head self-attention with continuous-time RoPE applied to Q/K."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        *,
+        dropout: float = 0.0,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by n_heads={n_heads}")
+        self.d_model = int(d_model)
+        self.n_heads = int(n_heads)
+        self.head_dim = self.d_model // self.n_heads
+        self.rope_dim = self.head_dim - (self.head_dim % 2)
+        if self.rope_dim <= 0:
+            raise ValueError(f"head_dim={self.head_dim} leaves no even RoPE dimensions")
+
+        inv_freq = 1.0 / (
+            float(rope_base) ** (torch.arange(0, self.rope_dim, 2, dtype=torch.float32) / self.rope_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.qkv = nn.Linear(self.d_model, 3 * self.d_model)
+        self.out_proj = nn.Linear(self.d_model, self.d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def _apply_rope_one(self, x: torch.Tensor, rel_t: torch.Tensor) -> torch.Tensor:
+        # x: [B, heads, K, head_dim], rel_t: [B, K]
+        x_rope = x[..., : self.rope_dim]
+        x_pass = x[..., self.rope_dim :]
+
+        angles = rel_t[:, None, :, None].to(dtype=x.dtype, device=x.device) * self.inv_freq.to(dtype=x.dtype)[
+            None, None, None, :
+        ]
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+
+        x_pair = x_rope.reshape(*x_rope.shape[:-1], self.rope_dim // 2, 2)
+        x_even = x_pair[..., 0]
+        x_odd = x_pair[..., 1]
+        x_rot = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).flatten(-2)
+        if x_pass.numel() == 0:
+            return x_rot
+        return torch.cat((x_rot, x_pass), dim=-1)
+
+    def forward(self, x: torch.Tensor, rel_t: torch.Tensor) -> torch.Tensor:
+        if rel_t.dim() == 3 and rel_t.size(-1) == 1:
+            rel_t = rel_t.squeeze(-1)
+        if rel_t.dim() != 2 or rel_t.shape != x.shape[:2]:
+            raise ValueError(f"rel_t must be [B,K]={tuple(x.shape[:2])}, got {tuple(rel_t.shape)}")
+
+        B, K, _ = x.shape
+        qkv = (
+            self.qkv(x)
+            .reshape(B, K, 3, self.n_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = self._apply_rope_one(q, rel_t)
+        k = self._apply_rope_one(k, rel_t)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, K, self.d_model)
+        return self.out_proj(out)
+
+
+class ContinuousRoPEEncoderLayer(nn.Module):
+    """Transformer encoder layer whose temporal self-attention uses continuous-time RoPE."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        *,
+        dim_feedforward: int,
+        dropout: float,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        self.self_attn = ContinuousRoPESelfAttention(
+            d_model,
+            n_heads,
+            dropout=dropout,
+            rope_base=rope_base,
+        )
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, rel_t: torch.Tensor) -> torch.Tensor:
+        x = self.norm1(x + self.dropout1(self.self_attn(x, rel_t)))
+        ff = self.linear2(self.dropout(F.gelu(self.linear1(x))))
+        return self.norm2(x + self.dropout2(ff))
+
+
+class ContinuousRoPEEncoder(nn.Module):
+    """Stack of continuous-time RoPE Transformer encoder layers."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        n_heads: int,
+        dim_feedforward: int,
+        num_layers: int,
+        dropout: float,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                ContinuousRoPEEncoderLayer(
+                    d_model,
+                    n_heads,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                    rope_base=rope_base,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor, rel_t: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, rel_t)
+        return x
+
+
 class PanelHistoryAE(nn.Module):
     """History summarizer (LaplaceAE) used to condition the diffusion model.
 
@@ -94,11 +236,17 @@ class PanelHistoryAE(nn.Module):
         irreg_residual_scale: float = 0.1,
         t_token_mode: str = "none",
         t_token_scale: float = 0.1,
+        pos_encoding: str = "learned_abs",
+        rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
 
         if patch_kernel % 2 == 0:
             raise ValueError(f"patch_kernel must be odd to maintain sequence length, got {patch_kernel}")
+        pos_encoding = str(pos_encoding).strip().lower()
+        valid_pos_encodings = {"learned_abs", "continuous_rope", "learned_plus_continuous_rope"}
+        if pos_encoding not in valid_pos_encodings:
+            raise ValueError(f"Unknown pos_encoding={pos_encoding!r}; expected one of {sorted(valid_pos_encodings)}")
 
         self.N = int(num_entities)
         self.D = int(feat_dim)
@@ -111,6 +259,10 @@ class PanelHistoryAE(nn.Module):
         self.irreg_residual_scale = float(irreg_residual_scale)
         self.t_token_mode = str(t_token_mode)
         self.t_token_scale = float(t_token_scale)
+        self.pos_encoding = pos_encoding
+        self.use_learned_pos = self.pos_encoding in {"learned_abs", "learned_plus_continuous_rope"}
+        self.use_rope = self.pos_encoding in {"continuous_rope", "learned_plus_continuous_rope"}
+        self.rope_time_scale = float(max(self.window_size - 1, 1))
 
         # 1) Port token: soft patching / feature mixing over time
         padding = (patch_kernel - 1) // 2
@@ -168,27 +320,39 @@ class PanelHistoryAE(nn.Module):
         base_dim = self.mix_dim + 2 + 1 + self.time2vec_dim
         self.encoder_dim = base_dim
 
-        # Learnable positional embeddings (over time dimension)
-        self.pos_embedding = nn.Parameter(torch.randn(1, self.window_size, self.encoder_dim) * 0.02)
+        # Learnable positional embeddings (over time dimension) for the baseline path.
+        if self.use_learned_pos:
+            self.pos_embedding = nn.Parameter(torch.randn(1, self.window_size, self.encoder_dim) * 0.02)
 
         # Ensure encoder_dim divisible by n_heads (pad if necessary)
         if self.encoder_dim % n_heads != 0:
             new_dim = ((self.encoder_dim // n_heads) + 1) * n_heads
             self.input_pad = nn.Linear(self.encoder_dim, new_dim)
             self.encoder_dim = new_dim
-            self.pos_embedding = nn.Parameter(torch.randn(1, self.window_size, self.encoder_dim) * 0.02)
+            if self.use_learned_pos:
+                self.pos_embedding = nn.Parameter(torch.randn(1, self.window_size, self.encoder_dim) * 0.02)
         else:
             self.input_pad = nn.Identity()
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.encoder_dim,
-            nhead=n_heads,
-            dim_feedforward=self.encoder_dim * 4,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-        )
-        self.history_encoder = nn.TransformerEncoder(encoder_layer, num_layers=enc_layers)
+        if self.use_rope:
+            self.history_encoder = ContinuousRoPEEncoder(
+                d_model=self.encoder_dim,
+                n_heads=n_heads,
+                dim_feedforward=self.encoder_dim * 4,
+                num_layers=enc_layers,
+                dropout=dropout,
+                rope_base=rope_base,
+            )
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=self.encoder_dim,
+                nhead=n_heads,
+                dim_feedforward=self.encoder_dim * 4,
+                dropout=dropout,
+                batch_first=True,
+                activation="gelu",
+            )
+            self.history_encoder = nn.TransformerEncoder(encoder_layer, num_layers=enc_layers)
 
         # Project temporal encoder output to context token dimension
         self.token_proj = nn.Linear(self.encoder_dim, self.Hc)
@@ -308,6 +472,12 @@ class PanelHistoryAE(nn.Module):
         scale = rel_t.amax(dim=1, keepdim=True).clamp_min(1.0)
         return rel_t / scale
 
+    @staticmethod
+    def _relative_time_from_dt(dt_bkn: torch.Tensor) -> torch.Tensor:
+        """Compatibility wrapper for shared window-local time canonicalization."""
+
+        return relative_time_offsets(dt_bkn, time_dim=1)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -375,8 +545,7 @@ class PanelHistoryAE(nn.Module):
         # 3) Temporal token: Time2Vec(relative time) + missingness scalar
         # ---------------------------------------------------------
         dt_bkn = self._canon_dt(dt, B=B, K=K, N=N, device=device, dtype=torch.float32)  # [B,K,N]
-        rel_t = dt_bkn.cumsum(dim=1)
-        rel_t = rel_t - rel_t[:, :1, :]  # ensure t_1 = 0
+        rel_t = relative_time_offsets(dt_bkn, time_dim=1)
         rel_t_unit = self._normalize_rel_t(rel_t)
         # Use normalized relative time in Time2Vec to keep timestamp features
         # numerically stable across datasets with very different raw time scales.
@@ -402,9 +571,14 @@ class PanelHistoryAE(nn.Module):
         # ---------------------------------------------------------
         fused = torch.cat([x_mixed, v_flat.to(dtype), t_flat.to(dtype), obs_flat.to(dtype), t2v], dim=-1)
         fused = self.input_pad(fused)                   # maybe pad to multiple of heads
-        fused = fused + self.pos_embedding              # [B*N, K, encoder_dim]
+        if self.use_learned_pos:
+            fused = fused + self.pos_embedding          # [B*N, K, encoder_dim]
 
-        encoded_hist = self.history_encoder(fused)      # [B*N, K, encoder_dim]
+        if self.use_rope:
+            rope_t = rel_t_unit_flat.squeeze(-1).to(dtype=fused.dtype) * self.rope_time_scale
+            encoded_hist = self.history_encoder(fused, rope_t)  # [B*N, K, encoder_dim]
+        else:
+            encoded_hist = self.history_encoder(fused)  # [B*N, K, encoder_dim]
 
         # ---------------------------------------------------------
         # 5) Aggregate across entities and pool to S summary tokens
@@ -506,6 +680,8 @@ class LaplaceAE(PanelHistoryAE):
         irreg_residual_scale: float = 0.1,
         t_token_mode: str = "none",
         t_token_scale: float = 0.1,
+        pos_encoding: str = "learned_abs",
+        rope_base: float = 10000.0,
     ) -> None:
         super().__init__(
             num_entities=num_entities,
@@ -525,4 +701,6 @@ class LaplaceAE(PanelHistoryAE):
             irreg_residual_scale=irreg_residual_scale,
             t_token_mode=t_token_mode,
             t_token_scale=t_token_scale,
+            pos_encoding=pos_encoding,
+            rope_base=rope_base,
         )

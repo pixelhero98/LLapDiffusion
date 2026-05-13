@@ -30,6 +30,7 @@ from Model.llapdiff_utils import (
     sample_training_timesteps,
     decode_latents_with_vae,
 )
+from Model.time_utils import relative_time_offsets
 
 
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
@@ -96,20 +97,37 @@ def _sanitize_batch(
     return (V, T), yb, mask
 
 
+def _context_entity_mask(
+    mask_bn: torch.Tensor,
+    V: torch.Tensor,
+    T: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Entity-valid mask for context-derived conditioning and target clocks.
+
+    This intentionally does not inspect target values or target masks. Target
+    timestamps are a known prediction grid, so their batch-level clock should
+    depend only on entity/context validity.
+    """
+
+    mask = mask_bn.to(device=device, dtype=torch.bool)
+    return mask & _entity_finite_mask(V) & _entity_finite_mask(T)
+
+
 def _flatten_dt(
     meta: Dict[str, object],
     mask_bn: torch.Tensor,
     device: torch.device,
     *,
     key: str,
-    yb: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """
     Reduce per-entity relative-time deltas to a per-batch timeline.
 
     The dataloader/collate provides ``delta_t`` and ``delta_t_y`` as [B,N,L]. The set-VAE + diffusion
     operate at the batch level (B), so we collapse the entity dimension via a masked mean over entities
-    present in ``mask_bn``.
+    present in ``mask_bn``. Callers pass a context/entity-valid mask; this
+    function must not inspect future target values or target masks.
     """
     delta_t = meta.get(key)
     if delta_t is None:
@@ -125,13 +143,6 @@ def _flatten_dt(
     m = mask_bn.to(device=device, dtype=torch.bool)
     if m.shape != (B, N):
         return None
-
-    if yb is not None and torch.is_floating_point(yb):
-        y = yb.to(device)
-        finite_mask = torch.isfinite(y)
-        for _ in range(y.dim() - 2):
-            finite_mask = finite_mask.all(dim=-1)  # [B,N]
-        m = m & finite_mask
 
     dt = torch.nan_to_num(dt, nan=0.0, posinf=0.0, neginf=0.0)
     w = m.to(dtype=dt.dtype).unsqueeze(-1)
@@ -268,8 +279,7 @@ def _history_stat_tokens(
             raise ValueError(f"delta_t must have 2 or 3 dims, got {tuple(dt_raw.shape)}")
 
         dt_flat = torch.nan_to_num(dt_flat, nan=0.0, posinf=0.0, neginf=0.0)
-        rel_t = dt_flat.cumsum(dim=1)
-        rel_t = rel_t - rel_t[:, :1]
+        rel_t = relative_time_offsets(dt_flat, time_dim=1)
         rel_t_unit = rel_t / rel_t.amax(dim=1, keepdim=True).clamp_min(1.0)
 
     stats = torch.stack(
@@ -704,7 +714,12 @@ def evaluate_val_diagnostics(
             dt=meta.get("delta_t"),
             x_obs_mask=meta.get("x_obs_mask"),
         )
-        dt_b = _flatten_dt(meta, mask_bn, device, key="delta_t_y", yb=yb)
+        dt_b = _flatten_dt(
+            meta,
+            _context_entity_mask(meta["entity_mask"], V, T, device),
+            device,
+            key="delta_t_y",
+        )
 
         x_tok, entity_pad, obs = pack_targets_tokens(
             yb, mask_bn, device, y_obs_mask=meta.get("y_obs_mask")
@@ -976,7 +991,12 @@ def evaluate_regression(
         if disable_conditioning:
             cond_summary = None
             cond_summary_raw = None
-        dt_b = _flatten_dt(meta, mask_bn, device, key="delta_t_y", yb=yb)
+        dt_b = _flatten_dt(
+            meta,
+            _context_entity_mask(meta["entity_mask"], V, T, device),
+            device,
+            key="delta_t_y",
+        )
 
         y_obs_mask = meta.get("y_obs_mask")
         x_tok, entity_pad, obs = pack_targets_tokens(
@@ -1275,6 +1295,18 @@ def _resolve_target_mask_aux_start_epoch(
     return 1 if start_epoch <= 0 else start_epoch
 
 
+def _effective_target_mask_aux_probability(config_obj: object) -> float:
+    aux_prob = float(getattr(config_obj, "TARGET_MASK_AUX_P", 0.0) or 0.0)
+    if aux_prob <= 0.0:
+        return 0.0
+    if bool(getattr(config_obj, "IMPUTATION_TRAINING", True)):
+        return aux_prob
+    raise ValueError(
+        "TARGET_MASK_AUX_P > 0 requires IMPUTATION_TRAINING=True; "
+        "set TARGET_MASK_AUX_P=0.0 for clean forecast training."
+    )
+
+
 def _maybe_apply_target_mask_aux(
     scheduler,
     x_t: torch.Tensor,
@@ -1420,6 +1452,7 @@ def run(
         irreg_residual_scale=float(getattr(config, "SUM_IRREG_RES_SCALE", 0.1)),
         t_token_mode=str(getattr(config, "SUM_T_TOKEN_MODE", "none")),
         t_token_scale=float(getattr(config, "SUM_T_TOKEN_SCALE", 0.1)),
+        pos_encoding=str(getattr(config, "SUM_POS_ENCODING", "learned_abs")),
     ).to(device)
     sum_ckpt = Path(config.SUM_CKPT)
     if not sum_ckpt.exists():
@@ -1640,7 +1673,7 @@ def run(
         raise ValueError(
             f"Unknown COND_TRAIN_MODE '{cond_train_mode}'. Use 'auto', 'stochastic' or 'dual'."
         )
-    target_mask_aux_p = float(getattr(config, "TARGET_MASK_AUX_P", 0.0) or 0.0)
+    target_mask_aux_p = _effective_target_mask_aux_probability(config)
     target_mask_aux_keep_prob = float(getattr(config, "TARGET_MASK_AUX_KEEP_PROB", 0.5))
     target_mask_aux_keep_mode = str(getattr(config, "TARGET_MASK_AUX_KEEP_MODE", "random"))
     target_mask_aux_keep_stride = max(1, int(getattr(config, "TARGET_MASK_AUX_KEEP_STRIDE", 4)))
@@ -1717,7 +1750,12 @@ def run(
                 print("[warn] non-finite cond_summary detected; skipping step")
                 continue
 
-            dt_flat = _flatten_dt(meta, mask_bn, device, key="delta_t_y", yb=yb)
+            dt_flat = _flatten_dt(
+                meta,
+                _context_entity_mask(meta["entity_mask"], V, T, device),
+                device,
+                key="delta_t_y",
+            )
             if not _is_finite_tensor(dt_flat):
                 print("[warn] non-finite delta_t_y detected; skipping step")
                 continue

@@ -80,10 +80,8 @@ def _make_regular_keep(obs_any: torch.Tensor, stride: int = 4) -> torch.Tensor:
     return _enforce_valid_keep_mask(obs_any, keep)
 
 
-def _make_random_keep(obs_any: torch.Tensor, frac: float, *, seed: int) -> torch.Tensor:
-    gen = torch.Generator(device=obs_any.device)
-    gen.manual_seed(seed)
-    keep = (torch.rand(obs_any.shape, generator=gen, device=obs_any.device) < frac) & obs_any
+def _make_random_keep(obs_any: torch.Tensor, frac: float, *, generator: torch.Generator) -> torch.Tensor:
+    keep = (torch.rand(obs_any.shape, generator=generator, device=obs_any.device) < frac) & obs_any
     return _enforce_valid_keep_mask(obs_any, keep)
 
 
@@ -123,6 +121,7 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
         irreg_residual_scale=float(getattr(cfg, "SUM_IRREG_RES_SCALE", 0.1)),
         t_token_mode=str(getattr(cfg, "SUM_T_TOKEN_MODE", "none")),
         t_token_scale=float(getattr(cfg, "SUM_T_TOKEN_SCALE", 0.1)),
+        pos_encoding=str(getattr(cfg, "SUM_POS_ENCODING", "learned_abs")),
     ).to(device)
     sum_state = torch.load(cfg.SUM_CKPT, map_location=device)
     tv._load_module_state(
@@ -203,7 +202,12 @@ def _evaluate_impute_case(
             dt=meta.get("delta_t"),
             x_obs_mask=meta.get("x_obs_mask"),
         )
-        dt_b = tv._flatten_dt(meta, mask_bn, device, key="delta_t_y", yb=yb)
+        dt_b = tv._flatten_dt(
+            meta,
+            tv._context_entity_mask(meta["entity_mask"], V, T, device),
+            device,
+            key="delta_t_y",
+        )
         x_tok, entity_pad, obs = pack_targets_tokens(
             yb,
             mask_bn,
@@ -379,6 +383,8 @@ def evaluate_checkpoint(
         rho=float(test_sampling["rho"]),
         generator_seed=generator_seed,
     )
+    random_keep_generator = torch.Generator(device=device)
+    random_keep_generator.manual_seed(1234)
     random_mask30 = _evaluate_impute_case(
         test_dl,
         diff_model=diff_model,
@@ -387,7 +393,7 @@ def evaluate_checkpoint(
         device=device,
         mu_mean=mu_mean,
         mu_std=mu_std,
-        keep_fn=lambda obs_any: _make_random_keep(obs_any, frac=0.70, seed=1234),
+        keep_fn=lambda obs_any: _make_random_keep(obs_any, frac=0.70, generator=random_keep_generator),
         num_samples=8,
         steps=int(test_sampling["steps"]),
         guidance_strength=test_sampling["guidance_strength"],

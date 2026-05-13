@@ -92,6 +92,7 @@ def _prepare_latent_batch(
     y: torch.Tensor,
     entity_mask: torch.Tensor,
     *,
+    y_obs_mask: Optional[torch.Tensor] = None,
     p_drop: float,
     noise_std: float,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -100,6 +101,7 @@ def _prepare_latent_batch(
     Args:
       y:           [B, N, T] target trajectories (may include NaNs).
       entity_mask: [B, N] bool, True for real entities, False for padded.
+      y_obs_mask:  optional [B, N, T] bool target observation mask from the dataset.
       p_drop:      additional random masking rate on observed entries.
       noise_std:   gaussian noise std added to observed values.
 
@@ -114,7 +116,21 @@ def _prepare_latent_batch(
         entity_mask = entity_mask.to(dtype=torch.bool)
     entity_mask = entity_mask.to(device=y.device)
 
-    obs = torch.isfinite(y) & entity_mask[..., None]  # [B,N,T]
+    if y_obs_mask is None:
+        obs = torch.isfinite(y)
+    else:
+        obs = torch.as_tensor(y_obs_mask, device=y.device, dtype=torch.bool)
+        if obs.dim() == 4 and obs.size(-1) == 1:
+            obs = obs.squeeze(-1)
+        if obs.shape != y.shape:
+            if obs.dim() == 3 and obs.size(0) == y.size(0) and obs.size(1) == y.size(2) and obs.size(2) == y.size(1):
+                obs = obs.permute(0, 2, 1).contiguous()
+            elif obs.dim() == 2 and obs.size(0) == y.size(0) and obs.size(1) == y.size(2):
+                obs = obs[:, None, :].expand_as(y)
+            else:
+                raise ValueError(f"y_obs_mask shape {tuple(obs.shape)} is incompatible with target shape {tuple(y.shape)}")
+        obs = obs & torch.isfinite(y)
+    obs = obs & entity_mask[..., None]  # [B,N,T]
     if obs.sum().item() == 0:
         return None
 
@@ -135,6 +151,39 @@ def _prepare_latent_batch(
 
     entity_pad = ~entity_mask
     return x_tok, y_clean, obs, entity_pad
+
+
+def _meta_y_obs_mask(meta: Dict[str, object], y: torch.Tensor) -> Optional[torch.Tensor]:
+    mask = meta.get("y_obs_mask")
+    if mask is None:
+        return None
+    return torch.as_tensor(mask, device=y.device)
+
+
+def _target_mask_health(loader: Iterable, *, max_batches: int = 8) -> Dict[str, object]:
+    missing = 0
+    all_false = 0
+    total = 0
+    observed = 0
+    for batch_idx, (_, yb, meta) in enumerate(loader):
+        total += 1
+        mask = meta.get("y_obs_mask")
+        if mask is None:
+            missing += 1
+        else:
+            mask_t = torch.as_tensor(mask, dtype=torch.bool)
+            count = int(mask_t.sum().item())
+            observed += count
+            if count == 0:
+                all_false += 1
+        if batch_idx + 1 >= int(max_batches):
+            break
+    return {
+        "checked_batches": total,
+        "missing_batches": missing,
+        "all_false_batches": all_false,
+        "observed_entries": observed,
+    }
 
 
 def _masked_mse(y_hat: torch.Tensor, y_true: torch.Tensor, obs: torch.Tensor) -> Tuple[torch.Tensor, int]:
@@ -177,8 +226,15 @@ def _epoch_pass(
     for (_, yb, meta) in loader:
         y = yb.to(device)
         entity_mask = meta["entity_mask"].to(device)
+        y_obs_mask = _meta_y_obs_mask(meta, y)
 
-        prepared = _prepare_latent_batch(y, entity_mask, p_drop=p_drop, noise_std=noise_std)
+        prepared = _prepare_latent_batch(
+            y,
+            entity_mask,
+            y_obs_mask=y_obs_mask,
+            p_drop=p_drop,
+            noise_std=noise_std,
+        )
         if prepared is None:
             continue
         x_tok, y_clean, obs, entity_pad = prepared
@@ -199,7 +255,13 @@ def _epoch_pass(
 
                 cons_loss = y_hat.new_tensor(0.0)
                 if cons_lambda and cons_lambda > 0:
-                    prepared2 = _prepare_latent_batch(y, entity_mask, p_drop=p_drop, noise_std=noise_std)
+                    prepared2 = _prepare_latent_batch(
+                        y,
+                        entity_mask,
+                        y_obs_mask=y_obs_mask,
+                        p_drop=p_drop,
+                        noise_std=noise_std,
+                    )
                     if prepared2 is not None:
                         x_tok2, _, _, entity_pad2 = prepared2
                         _, mu2, _ = model(x_tok2, entity_pad=entity_pad2)
@@ -343,7 +405,13 @@ def collect_latent_means(
         for batch_idx, (_, yb, meta) in enumerate(loader):
             y = yb.to(device)
             entity_mask = meta["entity_mask"].to(device)
-            prepared = _prepare_latent_batch(y, entity_mask, p_drop=0.0, noise_std=0.0)
+            prepared = _prepare_latent_batch(
+                y,
+                entity_mask,
+                y_obs_mask=_meta_y_obs_mask(meta, y),
+                p_drop=0.0,
+                noise_std=0.0,
+            )
             if prepared is None:
                 continue
             x_tok, _, _, entity_pad = prepared
@@ -452,8 +520,21 @@ def audit_checkpoint(
     test_metrics = evaluate_metrics(test_dl, model, device, beta, amp_enabled=amp_enabled)
     train_latents = collect_latent_means(train_dl, model, device, max_batches=max_latent_batches)
     val_latents = collect_latent_means(val_dl, model, device, max_batches=max_latent_batches)
+    target_mask_health = {
+        "train": _target_mask_health(train_dl),
+        "val": _target_mask_health(val_dl),
+        "test": _target_mask_health(test_dl),
+    }
 
     status = "pass"
+    for split_name, health in target_mask_health.items():
+        if health["missing_batches"]:
+            if status == "pass":
+                status = "warn"
+            messages.append(f"{split_name} y_obs_mask missing in {health['missing_batches']} checked batches")
+        if health["all_false_batches"]:
+            status = "fail"
+            messages.append(f"{split_name} y_obs_mask all-false in {health['all_false_batches']} checked batches")
     for split_name, metrics in (("val", val_metrics), ("test", test_metrics)):
         for metric_name, metric_value in metrics.items():
             if not torch.isfinite(torch.tensor(metric_value)):
@@ -491,6 +572,7 @@ def audit_checkpoint(
         "sizes": tuple(sizes) if sizes is not None else None,
         "val_metrics": val_metrics,
         "test_metrics": test_metrics,
+        "target_mask_health": target_mask_health,
         "latent_norm": {
             "train": train_norm,
             "val": val_norm,

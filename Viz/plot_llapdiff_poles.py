@@ -285,6 +285,7 @@ def _load_summarizer(cfg, train_dl, device: torch.device) -> LaplaceAE:
         irreg_residual_scale=float(getattr(cfg, "SUM_IRREG_RES_SCALE", 0.1)),
         t_token_mode=str(getattr(cfg, "SUM_T_TOKEN_MODE", "none")),
         t_token_scale=float(getattr(cfg, "SUM_T_TOKEN_SCALE", 0.1)),
+        pos_encoding=str(getattr(cfg, "SUM_POS_ENCODING", "learned_abs")),
     ).to(device)
     payload = torch.load(ckpt_path, map_location=device)
     state_dict = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
