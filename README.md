@@ -30,6 +30,13 @@ $$\frac{d}{dt}\mathbb{E}[H] = \mathbb{E}[\partial_{\psi}H\,\dot{\psi}_t] - \math
 
 In the forecasting setting, the context is updated at observation times and held fixed between updates. Without future external input and noise, the dissipative term makes the expected energy non-increasing between updates. LLapDiff uses this as a stability bias for the clean latent trajectory $x_t \equiv z_0(t)$, while diffusion variables $z_\tau(t)$ are denoised toward that trajectory.
 
+
+<p align="center">
+  <img src="imgs/llapdiff_complex_pole_trajectory.png" alt="LLapDiff complex-pole latent trajectory" width="900">
+</p>
+
+Blue context samples and an orange query path condition a green continuous latent trajectory; the pole panel shows the stable complex-conjugate poles that define the damped oscillatory basis.
+
 ## Installation
 
 Create a Python 3.11 environment and install the public dependencies:
