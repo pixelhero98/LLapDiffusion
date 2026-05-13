@@ -4,14 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Dict, Optional
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 
@@ -21,35 +16,15 @@ from configs.config_utils import clone_config, make_jsonable
 from configs.dataset_defaults import apply_dataset_preset, dataset_keys, default_horizons
 from configs.dataset_registry import resolve_run_experiment
 
-try:
-    from Latent_Space.latent_vae import LatentVAE
-except Exception:  # pragma: no cover
-    from latent_vae import LatentVAE
-
-try:
-    from Model.summarizer import LaplaceAE
-except Exception:  # pragma: no cover
-    from summarizer import LaplaceAE
-
-try:
-    from Model.llapdiff import LLapDiff
-except Exception:  # pragma: no cover
-    from llapdiff import LLapDiff
-
-try:
-    from Model.llapdiff_utils import (
-        decode_latents_with_vae,
-        encode_mu_norm,
-        pack_targets_tokens,
-        set_torch,
-    )
-except Exception:  # pragma: no cover
-    from llapdiff_utils import (
-        decode_latents_with_vae,
-        encode_mu_norm,
-        pack_targets_tokens,
-        set_torch,
-    )
+from Latent_Space.latent_vae import LatentVAE
+from Model.summarizer import LaplaceAE
+from Model.llapdiff import LLapDiff
+from Model.llapdiff_utils import (
+    decode_latents_with_vae,
+    encode_mu_norm,
+    pack_targets_tokens,
+    set_torch,
+)
 
 
 def build_eval_config(dataset_key: str, pred: int) -> SimpleNamespace:
@@ -121,13 +96,14 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
         irreg_residual_scale=float(getattr(cfg, "SUM_IRREG_RES_SCALE", 0.1)),
         t_token_mode=str(getattr(cfg, "SUM_T_TOKEN_MODE", "none")),
         t_token_scale=float(getattr(cfg, "SUM_T_TOKEN_SCALE", 0.1)),
-        pos_encoding=str(getattr(cfg, "SUM_POS_ENCODING", "learned_abs")),
+        pos_encoding=str(getattr(cfg, "SUM_POS_ENCODING", "continuous_rope")),
+        rope_base=float(getattr(cfg, "SUM_ROPE_BASE", 10000.0)),
     ).to(device)
     sum_state = torch.load(cfg.SUM_CKPT, map_location=device)
     tv._load_module_state(
         summarizer,
         sum_state["model"] if isinstance(sum_state, dict) and "model" in sum_state else sum_state,
-        strict=False,
+        strict=True,
     )
     summarizer.eval()
 
@@ -454,7 +430,7 @@ def _parse_args() -> argparse.Namespace:
         "--dataset-zip",
         type=str,
         default=None,
-        help="Optional zipped dataset cache. Defaults to Dataset/LLapDiff-evaluation-datasets.zip when present.",
+        help="Optional zipped dataset cache. Required when the preset cache directory is absent.",
     )
     parser.add_argument(
         "--dataset-extract-dir",

@@ -2,14 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from trainers import train_val_latent, train_val_summarizer
 from configs.config_utils import clone_config, make_jsonable
@@ -45,7 +40,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--summary-json",
         type=str,
-        default="/tmp/multidataset_artifact_prep_summary.json",
+        default="ldt/results/multidataset_artifact_prep_summary.json",
         help="Path to write the combined prep summary JSON.",
     )
     parser.add_argument(
@@ -57,7 +52,7 @@ def _parse_args() -> argparse.Namespace:
         "--dataset-zip",
         type=str,
         default=None,
-        help="Optional zipped dataset cache. Defaults to Dataset/LLapDiff-evaluation-datasets.zip when present.",
+        help="Optional zipped dataset cache. Required when the preset cache directory is absent.",
     )
     parser.add_argument(
         "--dataset-extract-dir",

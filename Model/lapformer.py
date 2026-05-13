@@ -3,14 +3,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-# Support multiple repository layouts (package, flat, legacy)
-try:
-    from .laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
-except Exception:  # pragma: no cover
-    try:
-        from Model.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
-    except Exception:
-        from laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
+from Model.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
 
 
 def _init_small_out_proj(layer: nn.Linear, *, std: float = 1e-2) -> None:

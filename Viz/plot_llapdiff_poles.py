@@ -4,13 +4,8 @@ from __future__ import annotations
 
 import argparse
 import re
-import sys
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 import matplotlib
 
@@ -285,11 +280,12 @@ def _load_summarizer(cfg, train_dl, device: torch.device) -> LaplaceAE:
         irreg_residual_scale=float(getattr(cfg, "SUM_IRREG_RES_SCALE", 0.1)),
         t_token_mode=str(getattr(cfg, "SUM_T_TOKEN_MODE", "none")),
         t_token_scale=float(getattr(cfg, "SUM_T_TOKEN_SCALE", 0.1)),
-        pos_encoding=str(getattr(cfg, "SUM_POS_ENCODING", "learned_abs")),
+        pos_encoding=str(getattr(cfg, "SUM_POS_ENCODING", "continuous_rope")),
+        rope_base=float(getattr(cfg, "SUM_ROPE_BASE", 10000.0)),
     ).to(device)
     payload = torch.load(ckpt_path, map_location=device)
     state_dict = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
-    tv._load_module_state(summarizer, state_dict, strict=False)
+    tv._load_module_state(summarizer, state_dict, strict=True)
     summarizer.eval()
     return summarizer
 

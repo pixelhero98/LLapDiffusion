@@ -6,10 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
-try:
-    from Model.time_utils import relative_time_offsets
-except ImportError:  # pragma: no cover - supports direct Model/ path imports
-    from time_utils import relative_time_offsets
+from Model.time_utils import relative_time_offsets
 
 __all__ = ["LaplaceTransformEncoder", "LaplacePseudoInverse"]
 

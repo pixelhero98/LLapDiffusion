@@ -9,21 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from .lapformer import LapFormer
-except Exception:  # pragma: no cover
-    try:
-        from Model.lapformer import LapFormer
-    except Exception:
-        from lapformer import LapFormer
-
-try:
-    from .llapdiff_utils import NoiseScheduler
-except Exception:  # pragma: no cover
-    try:
-        from Model.llapdiff_utils import NoiseScheduler
-    except Exception:
-        from llapdiff_utils import NoiseScheduler
+from Model.lapformer import LapFormer
+from Model.llapdiff_utils import NoiseScheduler
 
 class LLapDiff(nn.Module):
     """

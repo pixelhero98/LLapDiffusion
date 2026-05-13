@@ -53,6 +53,14 @@ def _summarizer_ckpt_path(config=config) -> Path:
     )
 
 
+def _select_vae_checkpoint(stats: Dict[str, object], fallback: Path) -> Path:
+    for key in ("loaded_checkpoint", "best_elbo_path", "checkpoint", "best_recon_path"):
+        value = stats.get(key)
+        if value not in (None, ""):
+            return Path(str(value))
+    return fallback
+
+
 def _resolve_sum_context_len(pred: int, *, config=config) -> int:
     fixed = getattr(config, "SUM_CONTEXT_LEN_FIXED", None)
     if fixed not in {None, "", False}:
@@ -75,9 +83,6 @@ def _update_config_for_pred(pred: int, config=config) -> None:
     config.SUM_CONTEXT_LEN = _resolve_sum_context_len(pred, config=config)
     config.SUM_CKPT = str(
         Path(config.SUM_DIR) / f"{pred}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
-    )
-    config.VAE_CKPT = str(
-        Path(config.VAE_DIR) / f"pred-{pred}_ch-{config.VAE_LATENT_CHANNELS}_elbo.pt"
     )
 
 
@@ -131,6 +136,8 @@ def run_single_pred(
     recompute_summarizer: bool = False,
     latent_plot_only: bool = False,
     use_shared_loaders: bool = True,
+    base_out_dir: Path | None = None,
+    base_ckpt_dir: Path | None = None,
     config=config,
 ) -> Dict[str, object]:
     """
@@ -139,6 +146,13 @@ def run_single_pred(
     Returns a dictionary with the combined stats from each stage.
     """
     _update_config_for_pred(pred, config=config)
+    if base_out_dir is not None and base_ckpt_dir is not None:
+        _apply_pred_output_dirs(
+            pred,
+            base_out_dir=base_out_dir,
+            base_ckpt_dir=base_ckpt_dir,
+            config=config,
+        )
 
     train_val_latent, train_val_summarizer, train_val_llapdiff = _import_trainers()
 
@@ -163,6 +177,7 @@ def run_single_pred(
             "reason": "checkpoint_exists",
             "checkpoint": str(vae_ckpt_path),
         }
+    config.VAE_CKPT = str(_select_vae_checkpoint(latent_stats, vae_ckpt_path))
 
     summ_ckpt_path = _summarizer_ckpt_path(config=config)
     if recompute_summarizer or not summ_ckpt_path.exists():
@@ -239,12 +254,6 @@ def run_preds(
 
     results: Dict[int, Dict[str, object]] = {}
     for pred in preds:
-        _apply_pred_output_dirs(
-            int(pred),
-            base_out_dir=base_out_dir,
-            base_ckpt_dir=base_ckpt_dir,
-            config=config,
-        )
         print(f"\n=== Running pipeline for pred={pred} ===")
         results[int(pred)] = run_single_pred(
             int(pred),
@@ -252,6 +261,8 @@ def run_preds(
             recompute_summarizer=recompute_summarizer,
             latent_plot_only=latent_plot_only,
             use_shared_loaders=use_shared_loaders,
+            base_out_dir=base_out_dir,
+            base_ckpt_dir=base_ckpt_dir,
             config=config,
         )
     return results
@@ -305,7 +316,7 @@ def _parse_args() -> argparse.Namespace:
         "--dataset-zip",
         type=str,
         default=None,
-        help="Optional zipped dataset cache. Defaults to Dataset/LLapDiff-evaluation-datasets.zip when present.",
+        help="Optional zipped dataset cache. Required when the preset cache directory is absent.",
     )
     parser.add_argument(
         "--dataset-extract-dir",
@@ -443,13 +454,14 @@ def main() -> Dict[int, Dict[str, object]]:
 
     results: Dict[int, Dict[str, object]] = {}
     for pred in preds:
-        _apply_pred_output_dirs(pred, base_out_dir=base_out_dir, base_ckpt_dir=base_ckpt_dir, config=config)
         results[int(pred)] = run_single_pred(
             int(pred),
             recompute_vae=args.recompute_vae,
             recompute_summarizer=args.recompute_summarizer,
             latent_plot_only=args.latent_plot_only,
             use_shared_loaders=not args.no_shared_loaders,
+            base_out_dir=base_out_dir,
+            base_ckpt_dir=base_ckpt_dir,
             config=config,
         )
 

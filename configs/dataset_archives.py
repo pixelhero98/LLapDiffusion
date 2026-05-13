@@ -41,7 +41,10 @@ def resolve_dataset_dir(expected_dir: Path, *, repo_root: Path) -> Path:
 
     archive_path = _archive_path(repo_root)
     if archive_path is None:
-        return expected_dir
+        raise FileNotFoundError(
+            f"Dataset cache directory is missing: {expected_dir}. "
+            f"Provide a dataset cache zip with --dataset-zip or set {DATASET_ZIP_ENV}."
+        )
 
     extract_root = _extract_root(repo_root)
     prefixes = tuple(_candidate_prefixes(expected_dir, repo_root=repo_root))
@@ -57,7 +60,9 @@ def resolve_dataset_dir(expected_dir: Path, *, repo_root: Path) -> Path:
         if candidate.exists():
             return candidate.resolve()
 
-    return expected_dir
+    raise FileNotFoundError(
+        f"Dataset archive {archive_path} did not contain the expected cache directory for {expected_dir}."
+    )
 
 
 def _archive_path(repo_root: Path) -> Path | None:
@@ -68,9 +73,6 @@ def _archive_path(repo_root: Path) -> Path | None:
             raise FileNotFoundError(f"{DATASET_ZIP_ENV} points to a missing file: {path}")
         return path
 
-    default_path = (repo_root / "Dataset" / DEFAULT_ARCHIVE_NAME).resolve()
-    if default_path.exists():
-        return default_path
     return None
 
 
@@ -130,20 +132,31 @@ def _extract_archive_once(
     if stamp_path.exists() and not force:
         return
 
-    extract_root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive_path) as archive:
-        for member in archive.infolist():
-            if prefixes is not None and not _matches_prefix(member.filename, prefixes):
-                continue
-            destination = _safe_destination(extract_root, member.filename)
-            if member.is_dir():
-                destination.mkdir(parents=True, exist_ok=True)
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(member) as src, destination.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
+        extract_zip_safely(archive, extract_root, prefixes=prefixes)
 
     stamp_path.write_text(str(archive_path.resolve()))
+
+
+def extract_zip_safely(
+    archive: zipfile.ZipFile,
+    extract_root: Path,
+    *,
+    prefixes: Sequence[str] | None = None,
+) -> None:
+    """Extract a ZIP archive while rejecting paths outside ``extract_root``."""
+
+    extract_root.mkdir(parents=True, exist_ok=True)
+    for member in archive.infolist():
+        if prefixes is not None and not _matches_prefix(member.filename, prefixes):
+            continue
+        destination = _safe_destination(extract_root, member.filename)
+        if member.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(member) as src, destination.open("wb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
 
 
 def _matches_prefix(member_name: str, prefixes: Sequence[str]) -> bool:

@@ -25,26 +25,15 @@ import numpy as np
 import pandas as pd
 import requests
 
-try:
-    from ._types import PathLike
-except Exception:  # pragma: no cover
-    from _types import PathLike
-try:
-    from ._normalization import NormalizationStatsAccumulator
-except Exception:  # pragma: no cover
-    from _normalization import NormalizationStatsAccumulator
-try:
-    from .fin_dataset import (
+from configs.dataset_archives import extract_zip_safely
+
+from Dataset._types import PathLike
+from Dataset._normalization import NormalizationStatsAccumulator
+from Dataset.fin_dataset import (
     CachePaths,
     load_dataloaders_with_ratio_split as _load_fin_ratio_split,
     rebuild_window_index_only as _rebuild_window_index_only,
-    )
-except Exception:  # pragma: no cover
-    from fin_dataset import (
-    CachePaths,
-    load_dataloaders_with_ratio_split as _load_fin_ratio_split,
-    rebuild_window_index_only as _rebuild_window_index_only,
-    )
+)
 # ---------------------------------------------------------------------------
 # Public constants & configuration helpers
 
@@ -157,7 +146,7 @@ def download_physionet_cinc_dataset(dest_path="./physionet_cinc_raw", subset="se
         tmp_path = tmp_file.name
     try:
         with zipfile.ZipFile(tmp_path) as zf:
-            zf.extractall(dest)
+            extract_zip_safely(zf, dest)
     finally:
         if os.path.exists(tmp_path): os.remove(tmp_path)
 

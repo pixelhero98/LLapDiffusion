@@ -6,7 +6,6 @@ import argparse
 import csv
 import json
 import math
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,10 +13,6 @@ from types import SimpleNamespace
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from configs.config_utils import clone_config, make_jsonable
 from Dataset.synthetic_regime_dataset import (
@@ -31,10 +26,7 @@ from tools.llapdiff_checkpoint_eval import _load_stack
 from trainers import train_val_latent, train_val_llapdiff, train_val_summarizer
 from trainers import train_val_llapdiff as tv
 
-try:
-    from Model.llapdiff_utils import set_torch
-except Exception:  # pragma: no cover
-    from llapdiff_utils import set_torch
+from Model.llapdiff_utils import set_torch
 
 
 TASK_SPECS: Mapping[str, Mapping[str, object]] = {

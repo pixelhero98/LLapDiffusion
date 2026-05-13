@@ -1,0 +1,33 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime outputs and model artifacts
+ldt/
+*.pt
+*.pth
+*.ckpt
+*.log
+
+# Generated dataset archives/caches
+Dataset/LLapDiff-evaluation-datasets.zip
+Dataset/LLapDiff-datasets/
+Dataset/fin_dataset/*/
+Dataset/bms_air/
+Dataset/uci_air/
+Dataset/physionet/
+Dataset/noaa_us/
+Dataset/noaa_uk/
+
+# Local OS/editor files
+.DS_Store
+Thumbs.db

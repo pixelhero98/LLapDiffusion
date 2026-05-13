@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llapdiffusion"
+version = "0.1.0"
+description = "Latent Laplace Diffusion for irregular multivariate time series"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "LLapDiffusion contributors" }]
+dependencies = [
+  "torch",
+  "numpy",
+  "pandas",
+  "matplotlib",
+  "pyarrow",
+  "fastparquet",
+  "yfinance",
+  "requests",
+  "tqdm",
+]
+
+[project.scripts]
+llapdiff-train = "train_val_pipeline:main"
+llapdiff-checkpoint-eval = "tools.llapdiff_checkpoint_eval:main"
+llapdiff-artifact-prep = "tools.run_multidataset_artifact_prep:main"
+llapdiff-synthetic-regime = "tools.run_synthetic_regime_shift:main"
+llapdiff-plot-poles = "Viz.plot_llapdiff_poles:main"
+
+[tool.setuptools]
+py-modules = ["train_val_pipeline"]
+
+[tool.setuptools.packages.find]
+include = [
+  "Dataset*",
+  "Latent_Space*",
+  "Model*",
+  "Viz*",
+  "configs*",
+  "tools*",
+  "trainers*",
+]
+
+[tool.setuptools.package-data]
+Dataset = ["*.txt"]

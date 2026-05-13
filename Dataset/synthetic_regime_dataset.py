@@ -12,26 +12,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-try:
-    from ._normalization import NormalizationStatsAccumulator
-except Exception:  # pragma: no cover
-    from _normalization import NormalizationStatsAccumulator
-try:
-    from ._types import PathLike
-except Exception:  # pragma: no cover
-    from _types import PathLike
-try:
-    from .fin_dataset import (
-        CachePaths,
-        rebuild_window_index_only,
-        load_dataloaders_with_ratio_split as _load_fin_ratio_split,
-    )
-except Exception:  # pragma: no cover
-    from fin_dataset import (
-        CachePaths,
-        rebuild_window_index_only,
-        load_dataloaders_with_ratio_split as _load_fin_ratio_split,
-    )
+from Dataset._normalization import NormalizationStatsAccumulator
+from Dataset._types import PathLike
+from Dataset.fin_dataset import (
+    CachePaths,
+    rebuild_window_index_only,
+    load_dataloaders_with_ratio_split as _load_fin_ratio_split,
+)
 
 
 DATASET_NAME = "synthetic_regime"

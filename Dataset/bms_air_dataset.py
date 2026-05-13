@@ -27,28 +27,17 @@ import numpy as np
 import pandas as pd
 import requests
 
+from configs.dataset_archives import extract_zip_safely
+
 from numpy.lib.stride_tricks import sliding_window_view
 
-try:
-    from ._normalization import NormalizationStatsAccumulator
-except Exception:  # pragma: no cover
-    from _normalization import NormalizationStatsAccumulator
-try:
-    from ._types import PathLike
-except Exception:  # pragma: no cover
-    from _types import PathLike
-try:
-    from .fin_dataset import (
+from Dataset._normalization import NormalizationStatsAccumulator
+from Dataset._types import PathLike
+from Dataset.fin_dataset import (
     CachePaths,
     load_dataloaders_with_ratio_split as _load_fin_ratio_split,
     rebuild_window_index_only as _rebuild_window_index_only,
-    )
-except Exception:  # pragma: no cover
-    from fin_dataset import (
-    CachePaths,
-    load_dataloaders_with_ratio_split as _load_fin_ratio_split,
-    rebuild_window_index_only as _rebuild_window_index_only,
-    )
+)
 # ---------------------------------------------------------------------------
 # Public constants & configuration helpers
 
@@ -103,7 +92,7 @@ def download_bms_air_dataset(
     response = requests.get(url, stream=True, timeout=60)
     response.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-        zf.extractall(dest)
+        extract_zip_safely(zf, dest)
     return extracted
 
 

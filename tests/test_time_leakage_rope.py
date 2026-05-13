@@ -1,10 +1,13 @@
 import inspect
+import io
+import zipfile
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from Model.laptrans import LaplaceTransformEncoder
-from Model.summarizer import LaplaceAE, PanelHistoryAE
+from Model.summarizer import LaplaceAE
 from Model.time_utils import relative_time_offsets
 
 
@@ -26,11 +29,137 @@ def test_irregular_relative_offset_dt_is_preserved():
     assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 4.0, 5.0]]))
 
 
-def test_summarizer_wrapper_uses_shared_time_offsets():
+def test_laplace_ae_uses_shared_time_offsets():
     dt = torch.tensor([[[0.0], [1.0], [4.0], [5.0]]])
-    rel_t = PanelHistoryAE._relative_time_from_dt(dt)
+    rel_t = LaplaceAE._relative_time_from_dt(dt)
     assert torch.allclose(rel_t, relative_time_offsets(dt))
 
+
+
+def test_summarizer_position_defaults_and_learned_abs_override():
+    from configs import config as cfg
+
+    assert cfg.SUM_POS_ENCODING == "continuous_rope"
+    assert float(cfg.SUM_ROPE_BASE) == 10000.0
+
+    kwargs = dict(
+        num_entities=2,
+        feat_dim=1,
+        window_size=4,
+        mix_dim=8,
+        tv_hidden=8,
+        out_len=2,
+        context_dim=16,
+        enc_layers=1,
+        n_heads=2,
+        dropout=0.0,
+        time2vec_dim=3,
+    )
+    default_model = LaplaceAE(**kwargs)
+    assert default_model.pos_encoding == "continuous_rope"
+    assert default_model.use_rope is True
+    assert default_model.use_learned_pos is False
+
+    learned_model = LaplaceAE(**kwargs, pos_encoding="learned_abs")
+    assert learned_model.pos_encoding == "learned_abs"
+    assert learned_model.use_rope is False
+    assert learned_model.use_learned_pos is True
+
+
+def test_summarizer_builder_passes_rope_base():
+    from trainers import train_val_summarizer as tvs
+
+    cfg = SimpleNamespace(
+        WINDOW=5,
+        SUM_MIX_DIM=8,
+        SUM_TV_HIDDEN=8,
+        SUM_CONTEXT_LEN=2,
+        SUM_CONTEXT_DIM=16,
+        SUM_DROPOUT=0.0,
+        SUM_TIME2VEC_DIM=3,
+        SUM_IRREG_POOLING="none",
+        SUM_IRREG_HIDDEN=8,
+        SUM_IRREG_RES_SCALE=0.1,
+        SUM_T_TOKEN_MODE="none",
+        SUM_T_TOKEN_SCALE=0.1,
+        SUM_POS_ENCODING="continuous_rope",
+        SUM_ROPE_BASE=256.0,
+    )
+    xb = (torch.zeros(1, 2, 5, 1), torch.zeros(1, 2, 5, 1))
+    yb = torch.zeros(1, 2, 2)
+    model = tvs._build_model([(xb, yb, {})], None, torch.device("cpu"), config=cfg, verbose=False)
+
+    attn = model.history_encoder.layers[0].self_attn
+    expected = 1.0 / (256.0 ** (torch.arange(0, attn.rope_dim, 2, dtype=torch.float32) / attn.rope_dim))
+    assert torch.allclose(attn.inv_freq.cpu(), expected)
+
+
+def test_vae_checkpoint_path_preserves_entity_suffix(tmp_path):
+    from trainers import train_val_latent as tvl
+
+    cfg = SimpleNamespace(
+        VAE_DIR=str(tmp_path),
+        PRED=20,
+        VAE_LATENT_CHANNELS=12,
+        VAE_ENTITY_CONDITION=True,
+    )
+
+    assert tvl._vae_checkpoint_path("elbo", config=cfg).name == "pred-20_ch-12_entity_elbo.pt"
+
+
+def test_run_single_pred_applies_output_dirs_after_pred_update(monkeypatch, tmp_path):
+    import train_val_pipeline as pipeline
+
+    vae_ckpt = tmp_path / "pred-20_ch-12_entity_elbo.pt"
+    sum_ckpt = tmp_path / "20-12-summarizer.pt"
+    vae_ckpt.write_text("vae")
+    sum_ckpt.write_text("sum")
+    cfg = SimpleNamespace(DATASET_KEY="crypto")
+
+    def fake_update(pred, config):
+        config.PRED = pred
+        config.VAE_LATENT_CHANNELS = 12
+        config.VAE_CKPT = str(vae_ckpt)
+        config.SUM_CKPT = str(sum_ckpt)
+        config.OUT_DIR = "preset-output"
+        config.CKPT_DIR = "preset-checkpoints"
+        config.POLE_PLOT_DIR = "preset-poles"
+
+    fake_latent = SimpleNamespace(run=lambda **kwargs: (_ for _ in ()).throw(AssertionError("latent should be skipped")))
+    fake_summarizer = SimpleNamespace(run=lambda **kwargs: (_ for _ in ()).throw(AssertionError("summarizer should be skipped")))
+    fake_llapdiff = SimpleNamespace(run=lambda **kwargs: {"eval_stats": {}, "loaded_checkpoint": "ok.pt"})
+
+    monkeypatch.setattr(pipeline, "_update_config_for_pred", fake_update)
+    monkeypatch.setattr(pipeline, "_import_trainers", lambda: (fake_latent, fake_summarizer, fake_llapdiff))
+    monkeypatch.setattr(pipeline, "prepare_dataloaders", lambda config: (None, None, None, (0, 0, 0)))
+
+    pipeline.run_single_pred(20, base_out_dir=tmp_path / "out", base_ckpt_dir=tmp_path / "ckpt", config=cfg)
+
+    assert cfg.VAE_CKPT == str(vae_ckpt)
+    assert cfg.OUT_DIR == str(tmp_path / "out" / "pred-20")
+    assert cfg.CKPT_DIR == str(tmp_path / "ckpt" / "pred-20")
+    assert cfg.POLE_PLOT_DIR == str(tmp_path / "out" / "pred-20" / "pole_plots")
+
+
+def test_missing_dataset_archive_fails_early(tmp_path, monkeypatch):
+    from configs import dataset_archives
+
+    monkeypatch.delenv(dataset_archives.DATASET_ZIP_ENV, raising=False)
+    with pytest.raises(FileNotFoundError, match="Provide a dataset cache zip"):
+        dataset_archives.resolve_dataset_dir(tmp_path / "Dataset" / "crypto", repo_root=tmp_path)
+
+
+def test_safe_zip_extraction_rejects_path_traversal(tmp_path):
+    from configs.dataset_archives import extract_zip_safely
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("../escape.txt", "bad")
+    payload.seek(0)
+
+    with zipfile.ZipFile(payload) as archive:
+        with pytest.raises(ValueError, match="Unsafe path"):
+            extract_zip_safely(archive, tmp_path / "extract")
 
 def test_laplace_relative_time_preserves_regular_offsets():
     dt = torch.tensor([[0.0, 1.0, 2.0, 3.0]])

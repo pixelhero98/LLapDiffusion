@@ -80,26 +80,13 @@ def _initialise_isd_backend() -> Tuple[Optional[object], Optional[str]]:
 
 isd, _isd_backend_name = _initialise_isd_backend()
 
-try:
-    from ._normalization import NormalizationStatsAccumulator
-except Exception:  # pragma: no cover
-    from _normalization import NormalizationStatsAccumulator
-try:
-    from ._types import PathLike
-except Exception:  # pragma: no cover
-    from _types import PathLike
-try:
-    from .fin_dataset import (
+from Dataset._normalization import NormalizationStatsAccumulator
+from Dataset._types import PathLike
+from Dataset.fin_dataset import (
     CachePaths,
     load_dataloaders_with_ratio_split as _load_fin_ratio_split,
     rebuild_window_index_only as _rebuild_window_index_only,
-    )
-except Exception:  # pragma: no cover
-    from fin_dataset import (
-    CachePaths,
-    load_dataloaders_with_ratio_split as _load_fin_ratio_split,
-    rebuild_window_index_only as _rebuild_window_index_only,
-    )
+)
 TARGET_COLUMN = "temperature"
 DEFAULT_FREQ = "h"  # Hourly sampling interval
 MAX_LOOKBACK = 336

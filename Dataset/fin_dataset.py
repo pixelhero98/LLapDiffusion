@@ -27,12 +27,8 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler as _Sampler
 
-try:
-    from ._types import PathLike
-    from ._normalization import NormalizationStatsAccumulator
-except Exception:  # pragma: no cover
-    from _types import PathLike
-    from _normalization import NormalizationStatsAccumulator
+from Dataset._types import PathLike
+from Dataset._normalization import NormalizationStatsAccumulator
 
 # --------------------- Public configs (kept compatible) ---------------------
 

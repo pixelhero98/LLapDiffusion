@@ -5,10 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from Model.time_utils import relative_time_offsets
-except ImportError:  # pragma: no cover - supports direct Model/ path imports
-    from time_utils import relative_time_offsets
+from Model.time_utils import relative_time_offsets
 
 
 class TVHead(nn.Module):
@@ -205,7 +202,7 @@ class ContinuousRoPEEncoder(nn.Module):
         return x
 
 
-class PanelHistoryAE(nn.Module):
+class LaplaceAE(nn.Module):
     """History summarizer (LaplaceAE) used to condition the diffusion model.
 
     Paper alignment (Section 5.1, Appendix F.2):
@@ -236,7 +233,7 @@ class PanelHistoryAE(nn.Module):
         irreg_residual_scale: float = 0.1,
         t_token_mode: str = "none",
         t_token_scale: float = 0.1,
-        pos_encoding: str = "learned_abs",
+        pos_encoding: str = "continuous_rope",
         rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
@@ -474,7 +471,7 @@ class PanelHistoryAE(nn.Module):
 
     @staticmethod
     def _relative_time_from_dt(dt_bkn: torch.Tensor) -> torch.Tensor:
-        """Compatibility wrapper for shared window-local time canonicalization."""
+        """Return shared window-local time offsets."""
 
         return relative_time_offsets(dt_bkn, time_dim=1)
 
@@ -654,53 +651,4 @@ class PanelHistoryAE(nn.Module):
             + w_t * loss_t
             + w_dt * loss_dt
             + w_obs * loss_obs
-        )
-
-
-class LaplaceAE(PanelHistoryAE):
-    """Compatibility wrapper expected by older scripts."""
-
-    def __init__(
-        self,
-        num_entities: int,
-        feat_dim: int,
-        window_size: int,
-        *,
-        mix_dim: int = 64,
-        tv_hidden: int = 32,
-        out_len: int = 16,
-        context_dim: int = 256,
-        enc_layers: int = 2,
-        n_heads: int = 4,
-        dropout: float = 0.1,
-        patch_kernel: int = 3,
-        time2vec_dim: int = 9,
-        irreg_pooling: str = "none",
-        irreg_hidden: int = 32,
-        irreg_residual_scale: float = 0.1,
-        t_token_mode: str = "none",
-        t_token_scale: float = 0.1,
-        pos_encoding: str = "learned_abs",
-        rope_base: float = 10000.0,
-    ) -> None:
-        super().__init__(
-            num_entities=num_entities,
-            feat_dim=feat_dim,
-            window_size=window_size,
-            mix_dim=mix_dim,
-            tv_hidden=tv_hidden,
-            out_len=out_len,
-            context_dim=context_dim,
-            enc_layers=enc_layers,
-            n_heads=n_heads,
-            dropout=dropout,
-            patch_kernel=patch_kernel,
-            time2vec_dim=time2vec_dim,
-            irreg_pooling=irreg_pooling,
-            irreg_hidden=irreg_hidden,
-            irreg_residual_scale=irreg_residual_scale,
-            t_token_mode=t_token_mode,
-            t_token_scale=t_token_scale,
-            pos_encoding=pos_encoding,
-            rope_base=rope_base,
         )

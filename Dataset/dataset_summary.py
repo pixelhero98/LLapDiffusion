@@ -15,90 +15,18 @@ Example:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
-import sys
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
-# Provide a clear dependency hint without wrapping imports in try/except.
-if importlib.util.find_spec("numpy") is None:
-    raise SystemExit("numpy is required to run this script. Please install numpy.")
-
 import numpy as np
 
-
-def _ensure_project_root_on_path() -> Path:
-    """Add the repository root to sys.path, so local package imports work.
-
-    We look upward from this file for a directory containing either:
-      - llapdiff_minA/   (new layout)
-      - Dataset/        (legacy layout)
-    """
-    here = Path(__file__).resolve()
-    for p in [here.parent, *here.parents]:
-        if (p / "llapdiff_minA").exists() or (p / "Dataset").exists():
-            if str(p) not in sys.path:
-                sys.path.insert(0, str(p))
-            return p
-    # Fallback: add current directory.
-    if str(here.parent) not in sys.path:
-        sys.path.insert(0, str(here.parent))
-    return here.parent
+from Dataset.fin_dataset import CachePaths, _normalize_to_day
 
 
-PROJECT_ROOT = _ensure_project_root_on_path()
-
-
-# --------------------------------------------------------------------
-# Import CachePaths + normalize helper in a layout-robust way.
-# We avoid try/except by using find_spec and a lightweight fallback.
-# --------------------------------------------------------------------
-
-def _has_deps_for_fin_dataset() -> bool:
-    # fin_dataset imports pandas + torch at module import time in this repo.
-    return (importlib.util.find_spec("pandas") is not None) and (importlib.util.find_spec("torch") is not None)
-
-
-_USING_MINIMAL_FALLBACK = False
-
-if _has_deps_for_fin_dataset() and importlib.util.find_spec("llapdiff_minA") is not None and importlib.util.find_spec("llapdiff_minA.fin_dataset") is not None:
-    from llapdiff_minA.fin_dataset import CachePaths, _normalize_to_day  # type: ignore
-elif _has_deps_for_fin_dataset() and importlib.util.find_spec("Dataset") is not None and importlib.util.find_spec("Dataset.fin_dataset") is not None:
-    from Dataset.fin_dataset import CachePaths, _normalize_to_day  # type: ignore
-elif _has_deps_for_fin_dataset() and importlib.util.find_spec("fin_dataset") is not None:
-    from fin_dataset import CachePaths, _normalize_to_day  # type: ignore
-else:
-    _USING_MINIMAL_FALLBACK = True
-
-    @dataclass(frozen=True)
-    class CachePaths:  # minimal compatibility shim
-        """Minimal cache path helper (used if fin_dataset cannot be imported)."""
-
-        data_dir: Path
-
-        @classmethod
-        def from_dir(cls, data_dir: str | Path) -> "CachePaths":
-            return cls(Path(data_dir).expanduser())
-
-        @property
-        def cache_root(self) -> Path:
-            return self.data_dir / "cache_ratio_index"
-
-        @property
-        def windows(self) -> Path:
-            return self.cache_root / "windows"
-
-        @property
-        def meta(self) -> Path:
-            return self.cache_root / "meta.json"
-
-    def _normalize_to_day(ts: np.ndarray) -> np.ndarray:
-        """Convert a datetime64 array to int-day keys safely."""
-        return ts.astype("datetime64[D]").astype(np.int64)
-
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 @dataclass(frozen=True)
 class CoverageSummary:
@@ -301,8 +229,6 @@ def summarize_dataset(
     print(f"Input channels : {len(feature_cols)}")
     print(f"Window/Horizon : {window}/{horizon}")
     print(f"Total windows  : {int(pairs.shape[0])}")
-    if _USING_MINIMAL_FALLBACK:
-        print("Note           : Using minimal CachePaths fallback (fin_dataset import unavailable).")
     print()
     print("Coverage per day (window end_times grouped to calendar day):")
     print(

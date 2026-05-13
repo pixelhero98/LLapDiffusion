@@ -38,7 +38,7 @@ Create a Python 3.11 environment and install the public dependencies:
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 If you need a specific CUDA build of PyTorch, install `torch` with the official PyTorch selector first, then install the remaining requirements.
@@ -53,7 +53,7 @@ Train and validate LLapDiff for one dataset with the public preset:
 cd /path/to/LLapDiff
 python train_val_pipeline.py \
   --dataset-key crypto \
-  --summary-json /tmp/crypto_pipeline_summary.json
+  --summary-json ldt/results/crypto_pipeline_summary.json
 ```
 
 Run a single forecasting horizon while refreshing the VAE and summarizer artifacts:
@@ -65,7 +65,7 @@ python train_val_pipeline.py \
   --preds 100 \
   --recompute-vae \
   --recompute-summarizer \
-  --summary-json /tmp/us_equity_pred100.json
+  --summary-json ldt/results/us_equity_pred100.json
 ```
 
 Available public dataset keys are:
@@ -87,15 +87,15 @@ done
 
 ## Evaluation datasets
 
-The repository includes:
+The cached evaluation datasets are distributed as an external ZIP archive, not stored directly in this Git repository. Provide that archive when a preset cache directory is absent:
 
-```text
-Dataset/LLapDiff-evaluation-datasets.zip
+```bash
+python train_val_pipeline.py \
+  --dataset-key crypto \
+  --dataset-zip /path/to/LLapDiff-evaluation-datasets.zip
 ```
 
-This archive contains the cached evaluation datasets used by the public presets. If a preset dataset directory is missing, the code automatically extracts the archive into `Dataset/` before building loaders.
-
-The archive contains seven cache roots:
+The archive must contain seven cache roots:
 
 ```text
 fin_dataset/crypto
@@ -107,14 +107,14 @@ uci_air
 physionet
 ```
 
-To use a separate dataset archive or extraction directory:
+You can also configure the archive and extraction directory through environment variables:
 
 ```bash
 export LLAPDIFF_DATASET_ZIP=/path/to/LLapDiff-evaluation-datasets.zip
-export LLAPDIFF_DATASET_EXTRACT_DIR=/tmp/llapdiff-datasets
+export LLAPDIFF_DATASET_EXTRACT_DIR=./Dataset/extracted
 ```
 
-The pipeline and evaluation CLIs also accept `--dataset-zip` and `--dataset-extract-dir`.
+The pipeline and evaluation CLIs also accept `--dataset-zip` and `--dataset-extract-dir`. If neither an existing preset cache directory nor an explicit archive is available, the run fails early with a clear dataset-cache error.
 
 ## Controlled synthetic shifts
 
@@ -161,7 +161,7 @@ Prepare VAE and summarizer artifacts for all public datasets:
 cd /path/to/LLapDiff
 python -m tools.run_multidataset_artifact_prep \
   --datasets bms_air uci_air physionet noaa_us noaa_uk us_equity crypto \
-  --summary-json /tmp/multidataset_artifact_prep_summary.json
+  --summary-json ldt/results/multidataset_artifact_prep_summary.json
 ```
 
 Evaluate a trained LLapDiff checkpoint on raw scale:
@@ -171,9 +171,9 @@ cd /path/to/LLapDiff
 python -m tools.llapdiff_checkpoint_eval \
   --dataset-key crypto \
   --pred 100 \
-  --dataset-zip Dataset/LLapDiff-evaluation-datasets.zip \
+  --dataset-zip /path/to/LLapDiff-evaluation-datasets.zip \
   --checkpoint /path/to/LLapDiff/ldt/output/crypto/llapdiff_pred-100_best_raw.pt \
-  --out-json /tmp/crypto_eval.json
+  --out-json ldt/results/crypto_eval.json
 ```
 
 Plot learned poles from a checkpoint:
@@ -184,8 +184,8 @@ python -m Viz.plot_llapdiff_poles \
   --dataset-key crypto \
   --pred 100 \
   --checkpoint /path/to/LLapDiff/ldt/output/crypto/llapdiff_pred-100_best_raw.pt \
-  --dataset-zip Dataset/LLapDiff-evaluation-datasets.zip \
-  --output-dir /tmp/pole_plot_smoke
+  --dataset-zip /path/to/LLapDiff-evaluation-datasets.zip \
+  --output-dir ldt/results/pole_plot_smoke
 ```
 
 The pole plot overlays global/base poles with conditioned effective poles built from real dataset context.
@@ -247,7 +247,7 @@ The summarizer uses the shared public baseline in `configs/config.py`, with one 
 
 ### Time and imputation settings
 
-The default summarizer position mode is `SUM_POS_ENCODING="learned_abs"`, which keeps existing checkpoints compatible. Optional ablations can set `SUM_POS_ENCODING="continuous_rope"` or `"learned_plus_continuous_rope"` to rotate attention queries and keys by context-window relative time.
+The default summarizer position mode is `SUM_POS_ENCODING="continuous_rope"`, which rotates attention queries and keys by context-window relative time. Ablations can set `SUM_POS_ENCODING="learned_abs"` or `"learned_plus_continuous_rope"`. `SUM_ROPE_BASE=10000.0` controls the RoPE frequency base.
 
 `IMPUTATION_TRAINING=True` means imputation-style target anchors are allowed by configuration, not active by default. Pure extrapolation remains clean because `TARGET_MASK_AUX_P=0.0`; set a positive value only when intentionally running dual-task or imputation-style training.
 

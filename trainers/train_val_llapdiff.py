@@ -1452,7 +1452,8 @@ def run(
         irreg_residual_scale=float(getattr(config, "SUM_IRREG_RES_SCALE", 0.1)),
         t_token_mode=str(getattr(config, "SUM_T_TOKEN_MODE", "none")),
         t_token_scale=float(getattr(config, "SUM_T_TOKEN_SCALE", 0.1)),
-        pos_encoding=str(getattr(config, "SUM_POS_ENCODING", "learned_abs")),
+        pos_encoding=str(getattr(config, "SUM_POS_ENCODING", "continuous_rope")),
+        rope_base=float(getattr(config, "SUM_ROPE_BASE", 10000.0)),
     ).to(device)
     sum_ckpt = Path(config.SUM_CKPT)
     if not sum_ckpt.exists():
@@ -1463,7 +1464,7 @@ def run(
         sum_state["model"]
         if isinstance(sum_state, dict) and "model" in sum_state
         else sum_state,
-        strict=False,
+        strict=True,
     )
     laplace_summarizer.eval()
 
