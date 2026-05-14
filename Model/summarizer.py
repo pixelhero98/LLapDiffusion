@@ -233,8 +233,9 @@ class LaplaceAE(nn.Module):
         irreg_residual_scale: float = 0.1,
         t_token_mode: str = "none",
         t_token_scale: float = 0.1,
-        pos_encoding: str = "continuous_rope",
+        pos_encoding: str = "learned_abs",
         rope_base: float = 10000.0,
+        channel_balanced_x_loss: bool = False,
     ) -> None:
         super().__init__()
 
@@ -257,6 +258,7 @@ class LaplaceAE(nn.Module):
         self.t_token_mode = str(t_token_mode)
         self.t_token_scale = float(t_token_scale)
         self.pos_encoding = pos_encoding
+        self.channel_balanced_x_loss = bool(channel_balanced_x_loss)
         self.use_learned_pos = self.pos_encoding in {"learned_abs", "learned_plus_continuous_rope"}
         self.use_rope = self.pos_encoding in {"continuous_rope", "learned_plus_continuous_rope"}
         self.rope_time_scale = float(max(self.window_size - 1, 1))
@@ -370,21 +372,54 @@ class LaplaceAE(nn.Module):
         self.obs_decoder = nn.Linear(self.Hc, self.window_size * self.N)
 
     @staticmethod
-    def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask_bn: torch.Tensor) -> torch.Tensor:
+    def _masked_mse(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask_bn: torch.Tensor,
+        *,
+        obs_mask: Optional[torch.Tensor] = None,
+        channel_balanced: bool = False,
+    ) -> torch.Tensor:
         """MSE loss only on valid entities.
 
         pred/target: [B, K, N, D] or [B, K, N]
         mask_bn: [B, N] boolean mask
+        obs_mask: optional observed-entry mask matching pred/target.
         """
-        if pred.ndim == 4:
-            m = mask_bn.to(dtype=pred.dtype).unsqueeze(1).unsqueeze(-1)  # [B,1,N,1]
-            denom = m.sum() * pred.size(1) * pred.size(3)
-        else:
-            m = mask_bn.to(dtype=pred.dtype).unsqueeze(1)  # [B,1,N]
-            denom = m.sum() * pred.size(1)
+        mask_bn = torch.as_tensor(mask_bn, device=pred.device, dtype=torch.bool)
 
+        if pred.ndim == 4:
+            m_bool = mask_bn[:, None, :, None].expand_as(pred)
+            if obs_mask is not None:
+                obs = torch.as_tensor(obs_mask, device=pred.device, dtype=torch.bool)
+                if obs.ndim == 3:
+                    obs = obs.unsqueeze(-1)
+                if obs.ndim != 4:
+                    raise ValueError(f"obs_mask must have 3 or 4 dims for 4D loss, got {tuple(obs.shape)}")
+                if obs.shape[-1] == 1 and pred.shape[-1] != 1:
+                    obs = obs.expand_as(pred)
+                if obs.shape != pred.shape:
+                    raise ValueError(f"obs_mask shape {tuple(obs.shape)} does not match prediction {tuple(pred.shape)}")
+                m_bool = m_bool & obs
+        else:
+            m_bool = mask_bn[:, None, :].expand_as(pred)
+            if obs_mask is not None:
+                obs = torch.as_tensor(obs_mask, device=pred.device, dtype=torch.bool)
+                if obs.ndim == 4 and obs.shape[-1] == 1:
+                    obs = obs.squeeze(-1)
+                if obs.shape != pred.shape:
+                    raise ValueError(f"obs_mask shape {tuple(obs.shape)} does not match prediction {tuple(pred.shape)}")
+                m_bool = m_bool & obs
+
+        m = m_bool.to(dtype=pred.dtype)
         se = (pred - target).pow(2) * m
-        return se.sum() / denom.clamp_min(1.0)
+        if channel_balanced and pred.ndim == 4:
+            denom_ch = m.sum(dim=(0, 1, 2))
+            valid = denom_ch > 0
+            if valid.any():
+                per_channel = se.sum(dim=(0, 1, 2))[valid] / denom_ch[valid].clamp_min(1.0)
+                return per_channel.mean()
+        return se.sum() / m.sum().clamp_min(1.0)
 
     @staticmethod
     def _canon_dt(dt: Optional[torch.Tensor], *, B: int, K: int, N: int, device, dtype) -> torch.Tensor:
@@ -611,6 +646,7 @@ class LaplaceAE(nn.Module):
         aux = {
             "x": x,
             "x_hat": x_hat,
+            "obs_mask": obs_bknd,
             "v_sig": v_sig,
             "v_hat": v_hat,
             "t_sig": t_sig,
@@ -640,7 +676,13 @@ class LaplaceAE(nn.Module):
         else:
             raise ValueError(f"Expected 3 or 5 summarizer loss weights, got {weights!r}")
 
-        loss_x = self._masked_mse(aux["x_hat"], aux["x"], entity_mask)
+        loss_x = self._masked_mse(
+            aux["x_hat"],
+            aux["x"],
+            entity_mask,
+            obs_mask=aux.get("obs_mask"),
+            channel_balanced=self.channel_balanced_x_loss,
+        )
         loss_v = self._masked_mse(aux["v_hat"], aux["v_sig"], entity_mask)
         loss_t = self._masked_mse(aux["t_hat"], aux["t_sig"], entity_mask)
         loss_dt = self._masked_mse(aux["dt_hat"], aux["rel_t_unit"], entity_mask)

@@ -186,12 +186,27 @@ def _target_mask_health(loader: Iterable, *, max_batches: int = 8) -> Dict[str, 
     }
 
 
-def _masked_mse(y_hat: torch.Tensor, y_true: torch.Tensor, obs: torch.Tensor) -> Tuple[torch.Tensor, int]:
+def _masked_mse(
+    y_hat: torch.Tensor,
+    y_true: torch.Tensor,
+    obs: torch.Tensor,
+    *,
+    balance_mode: str = "none",
+) -> Tuple[torch.Tensor, int]:
     """Compute mean squared error over observed entries only."""
     obs_f = obs.float()
     denom = int(obs_f.sum().item())
     if denom <= 0:
         return y_hat.new_tensor(0.0), 0
+
+    mode = str(balance_mode or "none").strip().lower()
+    if mode in {"coverage", "coverage_balanced"}:
+        coverage = obs_f.mean(dim=-1).clamp_min(1.0 / max(1, obs_f.size(-1)))
+        valid_series = obs.any(dim=-1)
+        inv_cov = torch.where(valid_series, 1.0 / coverage, torch.zeros_like(coverage))
+        mean_weight = inv_cov[valid_series].mean().clamp_min(1e-6) if valid_series.any() else inv_cov.new_tensor(1.0)
+        obs_f = (inv_cov / mean_weight).clamp(max=10.0).unsqueeze(-1) * obs_f
+
     sq = (y_hat - y_true).pow(2) * obs_f
     return sq.sum() / obs_f.sum().clamp(min=1.0), denom
 
@@ -208,6 +223,7 @@ def _epoch_pass(
     p_drop: float = 0.0,
     noise_std: float = 0.0,
     cons_lambda: float = 0.0,
+    recon_balance_mode: str = "none",
 ) -> Dict[str, float]:
     """Run one epoch step (train or eval) and accumulate statistics."""
 
@@ -247,11 +263,17 @@ def _epoch_pass(
                 y_hat_bt, mu, logvar = model(x_tok, entity_pad=entity_pad)  # [B,T,N,1]
                 y_hat = y_hat_bt.squeeze(-1).permute(0, 2, 1).contiguous()  # -> [B,N,T]
 
-                recon_loss, recon_count = _masked_mse(y_hat, y_clean, obs)
+                recon_loss, recon_count = _masked_mse(
+                    y_hat,
+                    y_clean,
+                    obs,
+                    balance_mode=recon_balance_mode,
+                )
 
                 kl_elem = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # [B,T,C]
                 kl_bt = kl_elem.sum(dim=-1)  # [B,T]
-                kl_loss = kl_bt.mean()
+                obs_any_bt = obs.any(dim=1)  # [B,T]
+                kl_loss = kl_bt[obs_any_bt].mean() if obs_any_bt.any() else kl_bt.new_tensor(0.0)
 
                 cons_loss = y_hat.new_tensor(0.0)
                 if cons_lambda and cons_lambda > 0:
@@ -265,7 +287,8 @@ def _epoch_pass(
                     if prepared2 is not None:
                         x_tok2, _, _, entity_pad2 = prepared2
                         _, mu2, _ = model(x_tok2, entity_pad=entity_pad2)
-                        cons_loss = (mu - mu2.detach()).pow(2).mean()
+                        cons_bt = (mu - mu2.detach()).pow(2).mean(dim=-1)
+                        cons_loss = cons_bt[obs_any_bt].mean() if obs_any_bt.any() else cons_bt.new_tensor(0.0)
 
                 loss = recon_loss + beta * kl_loss + cons_lambda * cons_loss
 
@@ -293,8 +316,9 @@ def _epoch_pass(
             totals["recon_sum"] += float(recon_loss.item() * recon_count)
             totals["recon_elems"] += int(recon_count)
 
-        totals["kl_sum"] += float(kl_bt.sum().item())
-        totals["kl_count"] += int(kl_bt.numel())
+        if obs_any_bt.any():
+            totals["kl_sum"] += float(kl_bt[obs_any_bt].sum().item())
+            totals["kl_count"] += int(obs_any_bt.sum().item())
 
         if cons_lambda and cons_lambda > 0:
             totals["cons_sum"] += float(cons_loss.item())
@@ -379,6 +403,7 @@ def evaluate_metrics(
     beta: float,
     *,
     amp_enabled: bool = False,
+    config=config,
 ) -> Dict[str, float]:
     totals = _epoch_pass(
         loader,
@@ -389,6 +414,7 @@ def evaluate_metrics(
         p_drop=0.0,
         noise_std=0.0,
         cons_lambda=0.0,
+        recon_balance_mode=str(getattr(config, "VAE_RECON_BALANCE", "none")),
     )
     return _metrics_dict_from_totals(totals, beta)
 
@@ -516,8 +542,8 @@ def audit_checkpoint(
             "messages": [f"failed to load checkpoint: {exc}"],
         }
 
-    val_metrics = evaluate_metrics(val_dl, model, device, beta, amp_enabled=amp_enabled)
-    test_metrics = evaluate_metrics(test_dl, model, device, beta, amp_enabled=amp_enabled)
+    val_metrics = evaluate_metrics(val_dl, model, device, beta, amp_enabled=amp_enabled, config=config)
+    test_metrics = evaluate_metrics(test_dl, model, device, beta, amp_enabled=amp_enabled, config=config)
     train_latents = collect_latent_means(train_dl, model, device, max_batches=max_latent_batches)
     val_latents = collect_latent_means(val_dl, model, device, max_batches=max_latent_batches)
     target_mask_health = {
@@ -620,6 +646,7 @@ def run(
     p_drop = float(getattr(config, "VAE_INPUT_DROPOUT", 0.20))
     noise_std = float(getattr(config, "VAE_NOISE_STD", 0.01))
     cons_lambda = float(getattr(config, "VAE_CONSIST_LAMBDA", 0.0))
+    recon_balance_mode = str(getattr(config, "VAE_RECON_BALANCE", "none"))
 
     model = _build_model(device, config=config)
 
@@ -666,6 +693,7 @@ def run(
                 p_drop=p_drop,
                 noise_std=noise_std,
                 cons_lambda=cons_lambda,
+                recon_balance_mode=recon_balance_mode,
             )
             val_totals = _epoch_pass(
                 val_dl,
@@ -676,6 +704,7 @@ def run(
                 p_drop=0.0,
                 noise_std=0.0,
                 cons_lambda=0.0,
+                recon_balance_mode=recon_balance_mode,
             )
 
             train_recon, train_kl, train_cons = _aggregate_metrics(train_totals)
@@ -759,8 +788,8 @@ def run(
     else:
         print("No latent means collected (empty dataloader batches?).")
 
-    final_val_metrics = evaluate_metrics(val_dl, vae, device, vae_beta, amp_enabled=amp_enabled)
-    final_test_metrics = evaluate_metrics(test_dl, vae, device, vae_beta, amp_enabled=amp_enabled)
+    final_val_metrics = evaluate_metrics(val_dl, vae, device, vae_beta, amp_enabled=amp_enabled, config=config)
+    final_test_metrics = evaluate_metrics(test_dl, vae, device, vae_beta, amp_enabled=amp_enabled, config=config)
 
     return {
         "train_loader": train_dl,

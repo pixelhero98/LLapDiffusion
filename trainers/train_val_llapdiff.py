@@ -86,14 +86,19 @@ def _sanitize_batch(
     mask_bn: torch.Tensor,
     device: torch.device,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Sanitize tensors and build a context-only entity mask.
+
+    Forecast training must not let future target values decide which entities
+    participate in conditioning. Target observation masks are consumed later by
+    the VAE packing/loss path; the entity mask here uses only context validity.
+    """
+
     V, T = xb
     V = _nan_to_num(V).to(device)
     T = _nan_to_num(T).to(device)
     yb = _nan_to_num(yb).to(device)
     mask = mask_bn.to(device=device, dtype=torch.bool)
-    mask = (
-        mask & _entity_finite_mask(V) & _entity_finite_mask(T) & _entity_finite_mask(yb)
-    )
+    mask = mask & _entity_finite_mask(V) & _entity_finite_mask(T)
     return (V, T), yb, mask
 
 
@@ -1452,8 +1457,9 @@ def run(
         irreg_residual_scale=float(getattr(config, "SUM_IRREG_RES_SCALE", 0.1)),
         t_token_mode=str(getattr(config, "SUM_T_TOKEN_MODE", "none")),
         t_token_scale=float(getattr(config, "SUM_T_TOKEN_SCALE", 0.1)),
-        pos_encoding=str(getattr(config, "SUM_POS_ENCODING", "continuous_rope")),
+        pos_encoding=str(getattr(config, "SUM_POS_ENCODING", "learned_abs")),
         rope_base=float(getattr(config, "SUM_ROPE_BASE", 10000.0)),
+        channel_balanced_x_loss=bool(getattr(config, "SUM_CHANNEL_BALANCED_X_LOSS", False)),
     ).to(device)
     sum_ckpt = Path(config.SUM_CKPT)
     if not sum_ckpt.exists():

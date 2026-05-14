@@ -39,7 +39,7 @@ def test_laplace_ae_uses_shared_time_offsets():
 def test_summarizer_position_defaults_and_learned_abs_override():
     from configs import config as cfg
 
-    assert cfg.SUM_POS_ENCODING == "continuous_rope"
+    assert cfg.SUM_POS_ENCODING == "learned_abs"
     assert float(cfg.SUM_ROPE_BASE) == 10000.0
 
     kwargs = dict(
@@ -56,14 +56,19 @@ def test_summarizer_position_defaults_and_learned_abs_override():
         time2vec_dim=3,
     )
     default_model = LaplaceAE(**kwargs)
-    assert default_model.pos_encoding == "continuous_rope"
-    assert default_model.use_rope is True
-    assert default_model.use_learned_pos is False
+    assert default_model.pos_encoding == "learned_abs"
+    assert default_model.use_rope is False
+    assert default_model.use_learned_pos is True
 
     learned_model = LaplaceAE(**kwargs, pos_encoding="learned_abs")
     assert learned_model.pos_encoding == "learned_abs"
     assert learned_model.use_rope is False
     assert learned_model.use_learned_pos is True
+
+    rope_model = LaplaceAE(**kwargs, pos_encoding="continuous_rope")
+    assert rope_model.pos_encoding == "continuous_rope"
+    assert rope_model.use_rope is True
+    assert rope_model.use_learned_pos is False
 
 
 def test_summarizer_builder_passes_rope_base():
@@ -92,6 +97,57 @@ def test_summarizer_builder_passes_rope_base():
     attn = model.history_encoder.layers[0].self_attn
     expected = 1.0 / (256.0 ** (torch.arange(0, attn.rope_dim, 2, dtype=torch.float32) / attn.rope_dim))
     assert torch.allclose(attn.inv_freq.cpu(), expected)
+
+
+def test_physionet_preset_applies_clean_repair_overrides(monkeypatch, tmp_path):
+    from configs import config as base_cfg
+    from configs import dataset_defaults as dd
+
+    monkeypatch.setattr(dd, "resolve_dataset_dir", lambda expected, repo_root: expected)
+
+    def make_cfg():
+        names = [
+            "VAE_ENTITY_CONDITION",
+            "VAE_INPUT_DROPOUT",
+            "VAE_NOISE_STD",
+            "VAE_CONSIST_LAMBDA",
+            "VAE_RECON_BALANCE",
+            "VAE_MAX_PATIENCE",
+            "SUM_POS_ENCODING",
+            "SUM_LOSS_W_DT",
+            "SUM_LOSS_W_OBS",
+            "SUM_CHANNEL_BALANCED_X_LOSS",
+            "SUM_IRREG_POOLING",
+            "SUM_T_TOKEN_MODE",
+            "SUM_T_TOKEN_SCALE",
+            "SUM_PATIENCE",
+            "SUM_TIME2VEC_DIM",
+            "PRIMARY_EVAL_METRIC",
+        ]
+        cfg = SimpleNamespace(**{name: getattr(base_cfg, name) for name in names})
+        cfg.ARTIFACT_ROOT = str(tmp_path / "ldt")
+        return cfg
+
+    physio = dd.apply_dataset_preset(make_cfg(), "physionet", pred=12)
+    assert physio.SUM_POS_ENCODING == "continuous_rope"
+    assert physio.VAE_INPUT_DROPOUT == 0.35
+    assert physio.VAE_NOISE_STD == 0.02
+    assert physio.VAE_CONSIST_LAMBDA == 0.05
+    assert physio.VAE_RECON_BALANCE == "coverage"
+    assert physio.SUM_LOSS_W_DT == 0.05
+    assert physio.SUM_LOSS_W_OBS == 0.05
+    assert physio.SUM_CHANNEL_BALANCED_X_LOSS is True
+    assert physio.SUM_IRREG_POOLING == "repair"
+    assert physio.SUM_T_TOKEN_MODE == "both"
+    assert physio.TARGET_MASK_AUX_P == 0.0
+
+    uci = dd.apply_dataset_preset(make_cfg(), "uci_air", pred=168)
+    assert uci.SUM_POS_ENCODING == "learned_abs"
+    assert uci.VAE_INPUT_DROPOUT == 0.20
+    assert uci.VAE_NOISE_STD == 0.01
+    assert uci.VAE_CONSIST_LAMBDA == 0.0
+    assert uci.VAE_RECON_BALANCE == "none"
+    assert uci.SUM_CHANNEL_BALANCED_X_LOSS is False
 
 
 def test_vae_checkpoint_path_preserves_entity_suffix(tmp_path):
@@ -160,6 +216,23 @@ def test_safe_zip_extraction_rejects_path_traversal(tmp_path):
     with zipfile.ZipFile(payload) as archive:
         with pytest.raises(ValueError, match="Unsafe path"):
             extract_zip_safely(archive, tmp_path / "extract")
+
+
+def test_bundled_dataset_archive_is_used_when_env_is_absent(tmp_path, monkeypatch):
+    from configs import dataset_archives
+
+    monkeypatch.delenv(dataset_archives.DATASET_ZIP_ENV, raising=False)
+    monkeypatch.delenv(dataset_archives.DATASET_EXTRACT_ENV, raising=False)
+    archive_path = tmp_path / "Dataset" / dataset_archives.DEFAULT_ARCHIVE_NAME
+    archive_path.parent.mkdir(parents=True)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("crypto/sample.txt", "ok")
+
+    resolved = dataset_archives.resolve_dataset_dir(tmp_path / "Dataset" / "crypto", repo_root=tmp_path)
+
+    assert resolved == (tmp_path / "Dataset" / "crypto").resolve()
+    assert (resolved / "sample.txt").read_text() == "ok"
+
 
 def test_laplace_relative_time_preserves_regular_offsets():
     dt = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
@@ -237,6 +310,65 @@ def test_vae_target_mask_excludes_zero_filled_missing_targets():
     loss, count = tvl._masked_mse(y_hat, y_clean, obs)
     assert count == 2
     assert loss.item() == 0.0
+
+
+def test_vae_coverage_balanced_loss_still_ignores_unobserved_targets():
+    from trainers import train_val_latent as tvl
+
+    y_true = torch.tensor([[[1.0, 0.0, 3.0]]])
+    y_hat = torch.tensor([[[1.0, 100.0, 3.0]]])
+    obs = torch.tensor([[[True, False, True]]])
+
+    loss, count = tvl._masked_mse(y_hat, y_true, obs, balance_mode="coverage")
+
+    assert count == 2
+    assert loss.item() == 0.0
+
+
+def test_summarizer_loss_x_respects_context_observation_mask():
+    model = LaplaceAE(
+        num_entities=1,
+        feat_dim=1,
+        window_size=2,
+        mix_dim=8,
+        tv_hidden=8,
+        out_len=1,
+        context_dim=16,
+        enc_layers=1,
+        n_heads=2,
+        dropout=0.0,
+        time2vec_dim=3,
+    )
+    aux = {
+        "x": torch.zeros(1, 2, 1, 1),
+        "x_hat": torch.tensor([[[[0.0]], [[100.0]]]]),
+        "obs_mask": torch.tensor([[[[True]], [[False]]]]),
+        "v_sig": torch.zeros(1, 2, 1),
+        "v_hat": torch.zeros(1, 2, 1),
+        "t_sig": torch.zeros(1, 2, 1),
+        "t_hat": torch.zeros(1, 2, 1),
+        "rel_t_unit": torch.zeros(1, 2, 1),
+        "dt_hat": torch.zeros(1, 2, 1),
+        "obs_frac": torch.zeros(1, 2, 1),
+        "obs_hat": torch.zeros(1, 2, 1),
+    }
+
+    loss = model.recon_loss(aux, torch.tensor([[True]]), weights=(1.0, 0.0, 0.0, 0.0, 0.0))
+
+    assert loss.item() == 0.0
+
+
+def test_sanitize_batch_entity_mask_does_not_inspect_future_targets():
+    from trainers import train_val_llapdiff as tv
+
+    xb = (torch.ones(1, 1, 2, 1), torch.zeros(1, 1, 2, 1))
+    yb = torch.tensor([[[float("nan"), float("nan")]]])
+    mask = torch.tensor([[True]])
+
+    (_, _), y_clean, clean_mask = tv._sanitize_batch(xb, yb, mask, torch.device("cpu"))
+
+    assert clean_mask.tolist() == [[True]]
+    assert torch.isfinite(y_clean).all()
 
 
 def test_default_config_allows_imputation_but_keeps_aux_inactive():

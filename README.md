@@ -94,7 +94,7 @@ done
 
 ## Evaluation datasets
 
-The cached evaluation datasets are distributed as an external ZIP archive, not stored directly in this Git repository. Provide that archive when a preset cache directory is absent:
+The cached evaluation datasets are included as `Dataset/LLapDiff-evaluation-datasets.zip`. The pipeline extracts the matching cache root automatically when a preset cache directory is absent. You can also provide an alternate archive:
 
 ```bash
 python train_val_pipeline.py \
@@ -102,7 +102,7 @@ python train_val_pipeline.py \
   --dataset-zip /path/to/LLapDiff-evaluation-datasets.zip
 ```
 
-The archive must contain seven cache roots:
+The included or alternate archive must contain seven cache roots:
 
 ```text
 fin_dataset/crypto
@@ -121,7 +121,7 @@ export LLAPDIFF_DATASET_ZIP=/path/to/LLapDiff-evaluation-datasets.zip
 export LLAPDIFF_DATASET_EXTRACT_DIR=./Dataset/extracted
 ```
 
-The pipeline and evaluation CLIs also accept `--dataset-zip` and `--dataset-extract-dir`. If neither an existing preset cache directory nor an explicit archive is available, the run fails early with a clear dataset-cache error.
+The pipeline and evaluation CLIs also accept `--dataset-zip` and `--dataset-extract-dir`. If neither an existing preset cache directory nor an available archive is present, the run fails early with a clear dataset-cache error.
 
 ## Controlled synthetic shifts
 
@@ -239,6 +239,7 @@ These are the public forward defaults in `configs/config.py`:
 | `VAE_MAX_PATIENCE` | `20` |
 | `VAE_INPUT_DROPOUT` | `0.20` |
 | `VAE_NOISE_STD` | `0.01` |
+| `VAE_RECON_BALANCE` | `none` |
 
 The trainer still supports latent consistency regularization for controlled experiments, but it is not part of the default public recipe.
 
@@ -249,12 +250,15 @@ The summarizer uses the shared public baseline in `configs/config.py`, with one 
 | Dataset | Override |
 | --- | --- |
 | `bms_air` | `SUM_LR = 1e-4`, `SUM_AMP = False` |
+| `physionet` | clean interim repair preset: continuous RoPE, observation/time auxiliary losses, irregular pooling repair, target-dynamics token mode, coverage-balanced VAE reconstruction, and VAE latent consistency |
 | all others | shared summarizer defaults |
 
 
 ### Time and imputation settings
 
-The default summarizer position mode is `SUM_POS_ENCODING="continuous_rope"`, which rotates attention queries and keys by context-window relative time. Ablations can set `SUM_POS_ENCODING="learned_abs"` or `"learned_plus_continuous_rope"`. `SUM_ROPE_BASE=10000.0` controls the RoPE frequency base.
+The default summarizer position mode is `SUM_POS_ENCODING="learned_abs"` for checkpoint-compatible public baselines. Ablations can set `SUM_POS_ENCODING="continuous_rope"` or `"learned_plus_continuous_rope"` to rotate attention queries and keys by context-window relative time. `SUM_ROPE_BASE=10000.0` controls the RoPE frequency base.
+
+The PhysioNet preset currently enables the clean repair settings because the clean comparison improved CRPS (`0.325845 -> 0.318394`) and MAE (`0.327513 -> 0.323948`), while MSE was slightly worse (`0.490903 -> 0.493135`). These settings are not globally promoted until the full public and synthetic clean comparison is complete.
 
 `IMPUTATION_TRAINING=True` means imputation-style target anchors are allowed by configuration, not active by default. Pure extrapolation remains clean because `TARGET_MASK_AUX_P=0.0`; set a positive value only when intentionally running dual-task or imputation-style training.
 

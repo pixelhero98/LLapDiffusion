@@ -20,6 +20,7 @@ ldt/
 
 # Generated dataset archives/caches
 Dataset/LLapDiff-evaluation-datasets.zip
+!Dataset/LLapDiff-evaluation-datasets.zip
 Dataset/LLapDiff-datasets/
 Dataset/fin_dataset/*/
 Dataset/bms_air/

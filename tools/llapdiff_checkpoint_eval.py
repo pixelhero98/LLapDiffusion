@@ -96,8 +96,9 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
         irreg_residual_scale=float(getattr(cfg, "SUM_IRREG_RES_SCALE", 0.1)),
         t_token_mode=str(getattr(cfg, "SUM_T_TOKEN_MODE", "none")),
         t_token_scale=float(getattr(cfg, "SUM_T_TOKEN_SCALE", 0.1)),
-        pos_encoding=str(getattr(cfg, "SUM_POS_ENCODING", "continuous_rope")),
+        pos_encoding=str(getattr(cfg, "SUM_POS_ENCODING", "learned_abs")),
         rope_base=float(getattr(cfg, "SUM_ROPE_BASE", 10000.0)),
+        channel_balanced_x_loss=bool(getattr(cfg, "SUM_CHANNEL_BALANCED_X_LOSS", False)),
     ).to(device)
     sum_state = torch.load(cfg.SUM_CKPT, map_location=device)
     tv._load_module_state(

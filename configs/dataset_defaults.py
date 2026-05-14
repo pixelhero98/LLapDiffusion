@@ -24,6 +24,7 @@ class DatasetPreset:
     epochs: int = 600
     sum_lr: float | None = None
     sum_amp: bool | None = None
+    model_overrides: Mapping[str, object] | None = None
 
     @property
     def data_dir(self) -> Path:
@@ -66,6 +67,21 @@ DATASET_PRESETS: Mapping[str, DatasetPreset] = {
         table_batch_size=5,
         vae_latent_channels=16,
         minsnr_gamma=5.0,
+        model_overrides={
+            "VAE_INPUT_DROPOUT": 0.35,
+            "VAE_NOISE_STD": 0.02,
+            "VAE_CONSIST_LAMBDA": 0.05,
+            "VAE_MAX_PATIENCE": 25,
+            "VAE_RECON_BALANCE": "coverage",
+            "SUM_LOSS_W_DT": 0.05,
+            "SUM_LOSS_W_OBS": 0.05,
+            "SUM_CHANNEL_BALANCED_X_LOSS": True,
+            "SUM_IRREG_POOLING": "repair",
+            "SUM_T_TOKEN_MODE": "both",
+            "SUM_T_TOKEN_SCALE": 0.1,
+            "SUM_POS_ENCODING": "continuous_rope",
+            "SUM_PATIENCE": 15,
+        },
     ),
     "noaa_us": DatasetPreset(
         key="noaa_us",
@@ -220,6 +236,9 @@ def apply_dataset_preset(cfg: object, dataset_key: str, *, pred: int | None = No
     setattr(cfg, "TARGET_MASK_AUX_KEEP_PROB", 0.5)
     setattr(cfg, "TARGET_MASK_AUX_KEEP_STRIDE", 4)
     setattr(cfg, "TARGET_MASK_AUX_START_EPOCH", 10)
+
+    for name, value in (preset.model_overrides or {}).items():
+        setattr(cfg, name, value)
 
     setattr(cfg, "TIMESTEPS", 1000)
     setattr(cfg, "SCHEDULE", "cosine")

@@ -73,6 +73,10 @@ def _archive_path(repo_root: Path) -> Path | None:
             raise FileNotFoundError(f"{DATASET_ZIP_ENV} points to a missing file: {path}")
         return path
 
+    bundled = (repo_root / "Dataset" / DEFAULT_ARCHIVE_NAME).resolve()
+    if bundled.exists():
+        return bundled
+
     return None
 
 
