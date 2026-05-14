@@ -260,7 +260,7 @@ The default summarizer position mode is `SUM_POS_ENCODING="learned_abs"` for che
 
 `IMPUTATION_TRAINING=True` means imputation-style target anchors are allowed by configuration, not active by default. Pure extrapolation-training remains clean by `TARGET_MASK_AUX_P=0.0`; set a positive value only when intentionally running dual-task or imputation-style training. Extrapolation and interpolation both support in either training setting by querying the same model.
 
-Context and target `delta_t` metadata are interpreted as window-local offsets when they start at zero and are monotone. Increment-style deltas are converted to offsets before use, so regular `[0, 1, 2, ...]` metadata is not accumulated twice.
+Context and target `delta_t` metadata are interpreted as window-local offsets when they start at zero and are monotone. Increment-style deltas are converted to offsets before use.
 
 ## Practical tuning guidance
 
