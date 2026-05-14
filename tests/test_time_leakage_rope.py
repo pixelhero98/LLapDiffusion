@@ -99,7 +99,7 @@ def test_summarizer_builder_passes_rope_base():
     assert torch.allclose(attn.inv_freq.cpu(), expected)
 
 
-def test_physionet_preset_applies_clean_repair_overrides(monkeypatch, tmp_path):
+def test_physionet_preset_applies_dataset_overrides(monkeypatch, tmp_path):
     from configs import config as base_cfg
     from configs import dataset_defaults as dd
 

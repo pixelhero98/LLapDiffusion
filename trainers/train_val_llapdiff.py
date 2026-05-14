@@ -1308,7 +1308,7 @@ def _effective_target_mask_aux_probability(config_obj: object) -> float:
         return aux_prob
     raise ValueError(
         "TARGET_MASK_AUX_P > 0 requires IMPUTATION_TRAINING=True; "
-        "set TARGET_MASK_AUX_P=0.0 for clean forecast training."
+        "set TARGET_MASK_AUX_P=0.0 for forecast-only training."
     )
 
 

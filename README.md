@@ -241,16 +241,14 @@ These are the public forward defaults in `configs/config.py`:
 | `VAE_NOISE_STD` | `0.01` |
 | `VAE_RECON_BALANCE` | `none` |
 
-The trainer still supports latent consistency regularization for controlled experiments, but it is not part of the default public recipe.
-
 ### Summarizer defaults
 
-The summarizer uses the shared public baseline in `configs/config.py`, with one dataset-specific override:
+The summarizer uses the shared public baseline in `configs/config.py`, with dataset-specific presets applied by the registry:
 
 | Dataset | Override |
 | --- | --- |
 | `bms_air` | `SUM_LR = 1e-4`, `SUM_AMP = False` |
-| `physionet` | clean interim repair preset: continuous RoPE, observation/time auxiliary losses, irregular pooling repair, target-dynamics token mode, coverage-balanced VAE reconstruction, and VAE latent consistency |
+| `physionet` | dataset-specific VAE and summarizer preset |
 | all others | shared summarizer defaults |
 
 

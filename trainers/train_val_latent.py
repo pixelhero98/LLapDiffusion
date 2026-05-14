@@ -5,7 +5,6 @@ This version trains a PDF-aligned *set-attention* VAE:
 - Token features are [value * obs_mask, obs_mask] (2 channels).
 - Loss is masked reconstruction (only where obs_mask==1) + β * KL.
 - Optional denoising corruption: random additional masking + small Gaussian noise.
-- Optional latent consistency regularization is supported for experiments but disabled in the public defaults.
 """
 
 from __future__ import annotations
