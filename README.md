@@ -256,11 +256,9 @@ The summarizer uses the shared public baseline in `configs/config.py`, with one 
 
 ### Time and imputation settings
 
-The default summarizer position mode is `SUM_POS_ENCODING="learned_abs"` for checkpoint-compatible public baselines. Ablations can set `SUM_POS_ENCODING="continuous_rope"` or `"learned_plus_continuous_rope"` to rotate attention queries and keys by context-window relative time. `SUM_ROPE_BASE=10000.0` controls the RoPE frequency base.
+The default summarizer position mode is `SUM_POS_ENCODING="learned_abs"` for checkpoint-compatible public baselines. Variants can set `SUM_POS_ENCODING="continuous_rope"` or `"learned_plus_continuous_rope"` to rotate attention queries and keys by context-window relative time. `SUM_ROPE_BASE=10000.0` controls the RoPE frequency base.
 
-The PhysioNet preset currently enables the clean repair settings because the clean comparison improved CRPS (`0.325845 -> 0.318394`) and MAE (`0.327513 -> 0.323948`), while MSE was slightly worse (`0.490903 -> 0.493135`). These settings are not globally promoted until the full public and synthetic clean comparison is complete.
-
-`IMPUTATION_TRAINING=True` means imputation-style target anchors are allowed by configuration, not active by default. Pure extrapolation remains clean because `TARGET_MASK_AUX_P=0.0`; set a positive value only when intentionally running dual-task or imputation-style training.
+`IMPUTATION_TRAINING=True` means imputation-style target anchors are allowed by configuration, not active by default. Pure extrapolation-training remains clean by `TARGET_MASK_AUX_P=0.0`; set a positive value only when intentionally running dual-task or imputation-style training. Extrapolation and interpolation both support in either training setting by querying the same model.
 
 Context and target `delta_t` metadata are interpreted as window-local offsets when they start at zero and are monotone. Increment-style deltas are converted to offsets before use, so regular `[0, 1, 2, ...]` metadata is not accumulated twice.
 
