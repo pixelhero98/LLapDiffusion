@@ -19,13 +19,15 @@ ldt/
 *.log
 
 # Extracted dataset caches
-Dataset/LLapDiff-datasets/
-Dataset/fin_dataset/*/
-Dataset/bms_air/
-Dataset/uci_air/
-Dataset/physionet/
-Dataset/noaa_us/
-Dataset/noaa_uk/
+llapdiffusion/datasets/.llapdiff_dataset_archive_*.stamp
+llapdiffusion/datasets/extracted/
+llapdiffusion/datasets/LLapDiff-datasets/
+llapdiffusion/datasets/fin_dataset/*/
+llapdiffusion/datasets/bms_air/
+llapdiffusion/datasets/uci_air/
+llapdiffusion/datasets/physionet/
+llapdiffusion/datasets/noaa_us/
+llapdiffusion/datasets/noaa_uk/
 
 # Local OS/editor files
 .DS_Store

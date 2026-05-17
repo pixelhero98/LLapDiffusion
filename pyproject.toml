@@ -22,26 +22,19 @@ dependencies = [
   "tqdm",
 ]
 
-[project.scripts]
-llapdiff-train = "train_val_pipeline:main"
-llapdiff-checkpoint-eval = "tools.llapdiff_checkpoint_eval:main"
-llapdiff-artifact-prep = "tools.run_multidataset_artifact_prep:main"
-llapdiff-synthetic-regime = "tools.run_synthetic_regime_shift:main"
-llapdiff-plot-poles = "Viz.plot_llapdiff_poles:main"
+[project.optional-dependencies]
+dev = ["pytest"]
+noaa-download = ["isd-fetch"]
 
-[tool.setuptools]
-py-modules = ["train_val_pipeline"]
+[project.scripts]
+llapdiff-train = "llapdiffusion.pipeline:main"
+llapdiff-checkpoint-eval = "llapdiffusion.tools.llapdiff_checkpoint_eval:main"
+llapdiff-artifact-prep = "llapdiffusion.tools.run_multidataset_artifact_prep:main"
+llapdiff-synthetic-regime = "llapdiffusion.tools.run_synthetic_regime_shift:main"
+llapdiff-plot-poles = "llapdiffusion.viz.plot_llapdiff_poles:main"
 
 [tool.setuptools.packages.find]
-include = [
-  "Dataset*",
-  "Latent_Space*",
-  "Model*",
-  "Viz*",
-  "configs*",
-  "tools*",
-  "trainers*",
-]
+include = ["llapdiffusion*"]
 
 [tool.setuptools.package-data]
-Dataset = ["*.txt"]
+"llapdiffusion.datasets" = ["*.txt", "*.zip"]

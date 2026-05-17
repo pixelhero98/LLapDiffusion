@@ -1,4 +1,3 @@
-import inspect
 import io
 import zipfile
 from types import SimpleNamespace
@@ -6,9 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from Model.laptrans import LaplaceTransformEncoder
-from Model.summarizer import LaplaceAE
-from Model.time_utils import relative_time_offsets
+from llapdiffusion.models.laptrans import LaplaceTransformEncoder
+from llapdiffusion.models.summarizer import LaplaceAE
+from llapdiffusion.models.time_utils import relative_time_offsets
 
 
 def test_relative_offset_dt_is_not_accumulated_twice():
@@ -43,7 +42,7 @@ def test_laplace_ae_uses_shared_time_offsets():
 
 
 def test_summarizer_position_defaults_and_learned_abs_override():
-    from configs import config as cfg
+    from llapdiffusion.configs import config as cfg
 
     assert cfg.SUM_POS_ENCODING == "learned_abs"
     assert float(cfg.SUM_ROPE_BASE) == 10000.0
@@ -78,7 +77,7 @@ def test_summarizer_position_defaults_and_learned_abs_override():
 
 
 def test_summarizer_builder_passes_rope_base():
-    from trainers import train_val_summarizer as tvs
+    from llapdiffusion.trainers import train_val_summarizer as tvs
 
     cfg = SimpleNamespace(
         WINDOW=5,
@@ -106,10 +105,10 @@ def test_summarizer_builder_passes_rope_base():
 
 
 def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
-    from configs import config as base_cfg
-    from configs import dataset_defaults as dd
+    from llapdiffusion.configs import config as base_cfg
+    from llapdiffusion.configs import dataset_defaults as dd
 
-    monkeypatch.setattr(dd, "resolve_dataset_dir", lambda expected, repo_root: expected)
+    monkeypatch.setattr(dd, "resolve_dataset_dir", lambda expected, **kwargs: expected)
 
     def make_cfg():
         names = [
@@ -176,7 +175,7 @@ def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
 
 
 def test_vae_checkpoint_path_preserves_entity_suffix(tmp_path):
-    from trainers import train_val_latent as tvl
+    from llapdiffusion.trainers import train_val_latent as tvl
 
     cfg = SimpleNamespace(
         VAE_DIR=str(tmp_path),
@@ -189,7 +188,7 @@ def test_vae_checkpoint_path_preserves_entity_suffix(tmp_path):
 
 
 def test_run_single_pred_applies_output_dirs_after_pred_update(monkeypatch, tmp_path):
-    import train_val_pipeline as pipeline
+    from llapdiffusion import pipeline as pipeline
 
     vae_ckpt = tmp_path / "pred-20_ch-12_entity_elbo.pt"
     sum_ckpt = tmp_path / "20-12-summarizer.pt"
@@ -208,7 +207,7 @@ def test_run_single_pred_applies_output_dirs_after_pred_update(monkeypatch, tmp_
 
     fake_latent = SimpleNamespace(run=lambda **kwargs: (_ for _ in ()).throw(AssertionError("latent should be skipped")))
     fake_summarizer = SimpleNamespace(run=lambda **kwargs: (_ for _ in ()).throw(AssertionError("summarizer should be skipped")))
-    fake_llapdiff = SimpleNamespace(run=lambda **kwargs: {"eval_stats": {}, "loaded_checkpoint": "ok.pt"})
+    fake_llapdiff = SimpleNamespace(run=lambda **kwargs: {"eval_stats": {}, "loaded_checkpoint": None})
 
     monkeypatch.setattr(pipeline, "_update_config_for_pred", fake_update)
     monkeypatch.setattr(pipeline, "_import_trainers", lambda: (fake_latent, fake_summarizer, fake_llapdiff))
@@ -223,15 +222,15 @@ def test_run_single_pred_applies_output_dirs_after_pred_update(monkeypatch, tmp_
 
 
 def test_missing_dataset_archive_fails_early(tmp_path, monkeypatch):
-    from configs import dataset_archives
+    from llapdiffusion.configs import dataset_archives
 
     monkeypatch.delenv(dataset_archives.DATASET_ZIP_ENV, raising=False)
     with pytest.raises(FileNotFoundError, match="Provide a dataset cache zip"):
-        dataset_archives.resolve_dataset_dir(tmp_path / "Dataset" / "crypto", repo_root=tmp_path)
+        dataset_archives.resolve_dataset_dir(tmp_path / "llapdiffusion" / "datasets" / "crypto", package_root=tmp_path / "llapdiffusion")
 
 
 def test_safe_zip_extraction_rejects_path_traversal(tmp_path):
-    from configs.dataset_archives import extract_zip_safely
+    from llapdiffusion.configs.dataset_archives import extract_zip_safely
 
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w") as archive:
@@ -244,20 +243,24 @@ def test_safe_zip_extraction_rejects_path_traversal(tmp_path):
 
 
 def test_bundled_dataset_archive_is_used_when_env_is_absent(tmp_path, monkeypatch):
-    from configs import dataset_archives
+    from llapdiffusion.configs import dataset_archives
 
+    package_root = tmp_path / "llapdiffusion"
+    extract_root = tmp_path / "cache"
     monkeypatch.delenv(dataset_archives.DATASET_ZIP_ENV, raising=False)
-    monkeypatch.delenv(dataset_archives.DATASET_EXTRACT_ENV, raising=False)
-    archive_path = tmp_path / "Dataset" / dataset_archives.DEFAULT_ARCHIVE_NAME
+    monkeypatch.setenv(dataset_archives.DATASET_EXTRACT_ENV, str(extract_root))
+    archive_path = package_root / "datasets" / dataset_archives.DEFAULT_ARCHIVE_NAME
     archive_path.parent.mkdir(parents=True)
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("crypto/sample.txt", "ok")
 
-    resolved = dataset_archives.resolve_dataset_dir(tmp_path / "Dataset" / "crypto", repo_root=tmp_path)
+    resolved = dataset_archives.resolve_dataset_dir(
+        package_root / "datasets" / "crypto",
+        package_root=package_root,
+    )
 
-    assert resolved == (tmp_path / "Dataset" / "crypto").resolve()
+    assert resolved == (extract_root / "crypto").resolve()
     assert (resolved / "sample.txt").read_text() == "ok"
-
 
 def test_laplace_relative_time_preserves_regular_offsets():
     dt = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
@@ -285,7 +288,7 @@ def test_laplace_relative_time_prefers_explicit_t():
 
 
 def test_target_dt_flatten_then_laplace_preserves_offsets():
-    from trainers import train_val_llapdiff as tv
+    from llapdiffusion.trainers import train_val_llapdiff as tv
 
     meta = {"delta_t_y": torch.tensor([[[0.0, 1.0, 4.0, 5.0], [0.0, 1.0, 4.0, 5.0]]])}
     mask = torch.tensor([[True, True]])
@@ -295,7 +298,7 @@ def test_target_dt_flatten_then_laplace_preserves_offsets():
 
 
 def test_target_dt_flatten_does_not_depend_on_target_values():
-    from trainers import train_val_llapdiff as tv
+    from llapdiffusion.trainers import train_val_llapdiff as tv
 
     meta = {
         "delta_t_y": torch.tensor(
@@ -310,7 +313,7 @@ def test_target_dt_flatten_does_not_depend_on_target_values():
 
 
 def test_vae_target_mask_excludes_zero_filled_missing_targets():
-    from trainers import train_val_latent as tvl
+    from llapdiffusion.trainers import train_val_latent as tvl
 
     y = torch.tensor([[[1.0, 0.0, 3.0]]])
     entity_mask = torch.tensor([[True]])
@@ -338,7 +341,7 @@ def test_vae_target_mask_excludes_zero_filled_missing_targets():
 
 
 def test_pack_targets_tokens_rejects_bad_y_obs_mask_shape():
-    from Model.llapdiff_utils import pack_targets_tokens
+    from llapdiffusion.models.llapdiff_utils import pack_targets_tokens
 
     y = torch.zeros(1, 2, 3)
     entity_mask = torch.tensor([[True, True]])
@@ -349,7 +352,7 @@ def test_pack_targets_tokens_rejects_bad_y_obs_mask_shape():
 
 
 def test_collect_latent_means_filters_unobserved_horizons():
-    from trainers import train_val_latent as tvl
+    from llapdiffusion.trainers import train_val_latent as tvl
 
     class FakeVAE(torch.nn.Module):
         def forward(self, x_tok, entity_pad=None):
@@ -374,7 +377,7 @@ def test_collect_latent_means_filters_unobserved_horizons():
 
 
 def test_vae_coverage_balanced_loss_still_ignores_unobserved_targets():
-    from trainers import train_val_latent as tvl
+    from llapdiffusion.trainers import train_val_latent as tvl
 
     y_true = torch.tensor([[[1.0, 0.0, 3.0]]])
     y_hat = torch.tensor([[[1.0, 100.0, 3.0]]])
@@ -387,7 +390,7 @@ def test_vae_coverage_balanced_loss_still_ignores_unobserved_targets():
 
 
 def test_summarizer_prepare_batch_accepts_3d_context_observation_mask():
-    from trainers import train_val_summarizer as tvs
+    from llapdiffusion.trainers import train_val_summarizer as tvs
 
     V = torch.ones(1, 2, 3, 1)
     T = torch.zeros(1, 2, 3, 1)
@@ -443,27 +446,27 @@ def test_summarizer_loss_x_respects_context_observation_mask():
 
 
 def test_sanitize_batch_entity_mask_does_not_inspect_future_targets():
-    from trainers import train_val_llapdiff as tv
+    from llapdiffusion.trainers import train_val_llapdiff as tv
 
     xb = (torch.ones(1, 1, 2, 1), torch.zeros(1, 1, 2, 1))
     yb = torch.tensor([[[float("nan"), float("nan")]]])
     mask = torch.tensor([[True]])
 
-    (_, _), y_clean, clean_mask = tv._sanitize_batch(xb, yb, mask, torch.device("cpu"))
+    (_, _), y_clean, clean_mask = tv._sanitize_batch(xb, yb, {"entity_mask": mask}, torch.device("cpu"))
 
     assert clean_mask.tolist() == [[True]]
     assert torch.isfinite(y_clean).all()
 
 
 def test_default_config_allows_imputation_but_keeps_aux_inactive():
-    from configs import config as cfg
+    from llapdiffusion.configs import config as cfg
 
     assert bool(getattr(cfg, "IMPUTATION_TRAINING")) is True
     assert float(getattr(cfg, "TARGET_MASK_AUX_P")) == 0.0
 
 
 def test_target_mask_aux_guard_requires_imputation_training_for_positive_probability():
-    from trainers import train_val_llapdiff as tv
+    from llapdiffusion.trainers import train_val_llapdiff as tv
 
     forecast_cfg = SimpleNamespace(TARGET_MASK_AUX_P=0.0, IMPUTATION_TRAINING=False)
     impute_cfg = SimpleNamespace(TARGET_MASK_AUX_P=0.2, IMPUTATION_TRAINING=True)
@@ -480,7 +483,7 @@ def test_target_mask_aux_guard_requires_imputation_training_for_positive_probabi
 
 
 def test_history_stat_tokens_preserve_context_offsets():
-    from trainers import train_val_llapdiff as tv
+    from llapdiffusion.trainers import train_val_llapdiff as tv
 
     V = torch.ones(1, 2, 4, 1)
     T = torch.zeros(1, 2, 4, 1)
@@ -493,7 +496,7 @@ def test_history_stat_tokens_preserve_context_offsets():
 
 
 def test_history_stat_tokens_use_valid_entity_denominators():
-    from trainers import train_val_llapdiff as tv
+    from llapdiffusion.trainers import train_val_llapdiff as tv
 
     V = torch.ones(1, 2, 2, 2)
     T = torch.ones(1, 2, 2, 2)
@@ -509,7 +512,7 @@ def test_history_stat_tokens_use_valid_entity_denominators():
 
 
 def test_llapdiff_builder_constructs_adapter_for_strict_checkpoint_load():
-    from trainers import train_val_llapdiff as tv
+    from llapdiffusion.trainers import train_val_llapdiff as tv
 
     cfg = SimpleNamespace(
         VAE_LATENT_CHANNELS=3,
@@ -543,7 +546,7 @@ def test_llapdiff_builder_constructs_adapter_for_strict_checkpoint_load():
 
 
 def test_forecast_generation_does_not_condition_on_target_values_or_masks():
-    from trainers import train_val_llapdiff as tv
+    from llapdiffusion.trainers import train_val_llapdiff as tv
 
     class FakeDiffModel:
         def __init__(self):
@@ -613,21 +616,67 @@ def test_forecast_generation_does_not_condition_on_target_values_or_masks():
     assert "obs_mask" not in call
 
 
-def test_imputation_generation_only_uses_intentionally_observed_target_tokens():
-    from tools import llapdiff_checkpoint_eval as ce
+def test_imputation_generation_only_uses_intentionally_observed_target_tokens(monkeypatch):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
 
-    source = inspect.getsource(ce._evaluate_impute_case)
-    generate_call = source[source.index("x0_norm = diff_model.generate("): source.index("all_samples.append")]
+    class FakeDiffModel:
+        def __init__(self):
+            self.calls = []
 
-    assert "y_obs = mu_norm * keep_mask.unsqueeze(-1).to(dtype=mu_norm.dtype)" in source
-    assert "hidden_valid = (obs & (~keep_mask.unsqueeze(-1)))" in source
-    assert "y_obs=y_obs" in generate_call
-    assert "obs_mask=keep_mask" in generate_call
-    assert "hidden_valid" not in generate_call
+        def generate(self, **kwargs):
+            self.calls.append(kwargs)
+            return torch.zeros(kwargs["shape"])
 
+    diff_model = FakeDiffModel()
+    mu_norm = torch.arange(12, dtype=torch.float32).view(1, 4, 3)
+
+    monkeypatch.setattr(ce.tv, "_sanitize_batch", lambda xb, yb, meta, device: (xb, yb.to(device), meta["entity_mask"].to(device)))
+    monkeypatch.setattr(
+        ce.tv,
+        "_build_cond_summary_pair",
+        lambda *args, **kwargs: (torch.zeros(1, 2, 4), torch.zeros(1, 2, 4)),
+    )
+    monkeypatch.setattr(ce.tv, "_flatten_dt", lambda *args, **kwargs: torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
+    monkeypatch.setattr(ce, "pack_targets_tokens", lambda *args, **kwargs: (
+        torch.zeros(1, 4, 1, 2),
+        torch.zeros(1, 1, dtype=torch.bool),
+        torch.ones(1, 4, 1, dtype=torch.bool),
+    ))
+    monkeypatch.setattr(ce, "encode_mu_norm", lambda *args, **kwargs: mu_norm.clone())
+    monkeypatch.setattr(ce, "decode_latents_with_vae", lambda *args, **kwargs: torch.zeros(1, 4, 1, 1))
+
+    xb = (torch.ones(1, 1, 3, 1), torch.zeros(1, 1, 3, 1))
+    yb = torch.ones(1, 1, 4)
+    meta = {
+        "entity_mask": torch.tensor([[True]]),
+        "delta_t": torch.zeros(1, 1, 3),
+        "delta_t_y": torch.tensor([[[0.0, 1.0, 2.0, 3.0]]]),
+        "x_obs_mask": torch.ones(1, 1, 3, 1, dtype=torch.bool),
+        "y_obs_mask": torch.ones(1, 1, 4, dtype=torch.bool),
+    }
+
+    ce._evaluate_impute_case(
+        [(xb, yb, meta)],
+        diff_model=diff_model,
+        vae=object(),
+        summarizer=object(),
+        device=torch.device("cpu"),
+        mu_mean=torch.zeros(3),
+        mu_std=torch.ones(3),
+        keep_fn=lambda obs_any: torch.tensor([[True, True, False, False]]),
+        num_samples=1,
+        steps=2,
+    )
+
+    call = diff_model.calls[0]
+    expected_keep = torch.tensor([[True, True, False, False]])
+    expected_y_obs = mu_norm * expected_keep.unsqueeze(-1).to(dtype=mu_norm.dtype)
+    assert torch.equal(call["obs_mask"], expected_keep)
+    assert torch.allclose(call["y_obs"], expected_y_obs)
+    assert torch.all(call["y_obs"][:, 2:] == 0)
 
 def test_random_imputation_keep_mask_generator_advances_between_batches():
-    from tools import llapdiff_checkpoint_eval as ce
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
 
     obs_any = torch.ones(4, 20, dtype=torch.bool)
     generator = torch.Generator(device=obs_any.device)
