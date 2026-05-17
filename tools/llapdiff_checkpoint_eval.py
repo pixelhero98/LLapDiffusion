@@ -18,7 +18,6 @@ from configs.dataset_registry import resolve_run_experiment
 
 from Latent_Space.latent_vae import LatentVAE
 from Model.summarizer import LaplaceAE
-from Model.llapdiff import LLapDiff
 from Model.llapdiff_utils import (
     decode_latents_with_vae,
     encode_mu_norm,
@@ -108,24 +107,7 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
     )
     summarizer.eval()
 
-    diff_model = LLapDiff(
-        data_dim=cfg.VAE_LATENT_CHANNELS,
-        hidden_dim=cfg.MODEL_WIDTH,
-        num_layers=cfg.NUM_LAYERS,
-        num_heads=cfg.NUM_HEADS,
-        predict_type=cfg.PREDICT_TYPE,
-        laplace_k=cfg.LAPLACE_K,
-        timesteps=cfg.TIMESTEPS,
-        schedule=cfg.SCHEDULE,
-        dropout=cfg.DROPOUT,
-        attn_dropout=cfg.ATTN_DROPOUT,
-        self_conditioning=cfg.SELF_COND,
-        summary_pool_mode=str(getattr(cfg, "COND_POOL_MODE", "mean")),
-        pole_pool_use_raw_summary=bool(getattr(cfg, "COND_POOL_USE_RAW", False)),
-        block_summary_adaln=bool(getattr(cfg, "BLOCK_SUMMARY_ADALN", False)),
-        analysis_summary_qk=bool(getattr(cfg, "ANALYSIS_SUMMARY_QK", False)),
-        analysis_qk_use_raw_summary=bool(getattr(cfg, "ANALYSIS_QK_USE_RAW", False)),
-    ).to(device)
+    diff_model = tv.build_llapdiff_model(cfg, device)
     payload = torch.load(ckpt_path, map_location=device)
     tv._load_module_state(diff_model, payload["model"], strict=True)
     diff_model.eval()

@@ -17,10 +17,16 @@ def test_relative_offset_dt_is_not_accumulated_twice():
     assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
 
 
-def test_increment_dt_falls_back_to_cumulative_offsets():
-    dt = torch.tensor([[[1.0], [1.0], [1.0], [1.0]]])
+def test_offset_dt_is_shifted_to_first_timestamp():
+    dt = torch.tensor([[[5.0], [6.0], [9.0], [10.0]]])
     rel_t = relative_time_offsets(dt)
-    assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
+    assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 4.0, 5.0]]))
+
+
+def test_relative_time_offsets_rejects_decreasing_clocks():
+    dt = torch.tensor([[[0.0], [2.0], [1.0], [3.0]]])
+    with pytest.raises(ValueError, match="nondecreasing"):
+        relative_time_offsets(dt)
 
 
 def test_irregular_relative_offset_dt_is_preserved():
@@ -99,7 +105,7 @@ def test_summarizer_builder_passes_rope_base():
     assert torch.allclose(attn.inv_freq.cpu(), expected)
 
 
-def test_physionet_preset_applies_dataset_overrides(monkeypatch, tmp_path):
+def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
     from configs import config as base_cfg
     from configs import dataset_defaults as dd
 
@@ -121,6 +127,8 @@ def test_physionet_preset_applies_dataset_overrides(monkeypatch, tmp_path):
             "SUM_T_TOKEN_MODE",
             "SUM_T_TOKEN_SCALE",
             "SUM_PATIENCE",
+            "SUM_LR",
+            "SUM_AMP",
             "SUM_TIME2VEC_DIM",
             "PRIMARY_EVAL_METRIC",
         ]
@@ -128,26 +136,43 @@ def test_physionet_preset_applies_dataset_overrides(monkeypatch, tmp_path):
         cfg.ARTIFACT_ROOT = str(tmp_path / "ldt")
         return cfg
 
-    physio = dd.apply_dataset_preset(make_cfg(), "physionet", pred=12)
-    assert physio.SUM_POS_ENCODING == "continuous_rope"
-    assert physio.VAE_INPUT_DROPOUT == 0.35
-    assert physio.VAE_NOISE_STD == 0.02
-    assert physio.VAE_CONSIST_LAMBDA == 0.05
-    assert physio.VAE_RECON_BALANCE == "coverage"
-    assert physio.SUM_LOSS_W_DT == 0.05
-    assert physio.SUM_LOSS_W_OBS == 0.05
-    assert physio.SUM_CHANNEL_BALANCED_X_LOSS is True
-    assert physio.SUM_IRREG_POOLING == "repair"
-    assert physio.SUM_T_TOKEN_MODE == "both"
-    assert physio.TARGET_MASK_AUX_P == 0.0
+    improved = {"physionet", "crypto"}
+    for key in dd.dataset_keys():
+        cfg = dd.apply_dataset_preset(make_cfg(), key, pred=dd.default_horizons(key)[-1])
+        if key in improved:
+            assert cfg.SUM_POS_ENCODING == "continuous_rope"
+            assert cfg.VAE_INPUT_DROPOUT == 0.35
+            assert cfg.VAE_NOISE_STD == 0.02
+            assert cfg.VAE_CONSIST_LAMBDA == 0.05
+            assert cfg.VAE_RECON_BALANCE == "coverage"
+            assert cfg.SUM_LOSS_W_DT == 0.05
+            assert cfg.SUM_LOSS_W_OBS == 0.05
+            assert cfg.SUM_CHANNEL_BALANCED_X_LOSS is True
+            assert cfg.SUM_IRREG_POOLING == "repair"
+            assert cfg.SUM_T_TOKEN_MODE == "both"
+        else:
+            assert cfg.SUM_POS_ENCODING == "learned_abs"
+            assert cfg.VAE_INPUT_DROPOUT == 0.20
+            assert cfg.VAE_NOISE_STD == 0.01
+            assert cfg.VAE_CONSIST_LAMBDA == 0.0
+            assert cfg.VAE_RECON_BALANCE == "none"
+            assert cfg.SUM_LOSS_W_DT == 0.0
+            assert cfg.SUM_LOSS_W_OBS == 0.0
+            assert cfg.SUM_CHANNEL_BALANCED_X_LOSS is False
+            assert cfg.SUM_IRREG_POOLING == "none"
+            assert cfg.SUM_T_TOKEN_MODE == "none"
+        if key == "bms_air":
+            assert cfg.SUM_LR == 1e-4
+            assert cfg.SUM_AMP is False
+        assert cfg.TARGET_MASK_AUX_P == 0.0
 
-    uci = dd.apply_dataset_preset(make_cfg(), "uci_air", pred=168)
-    assert uci.SUM_POS_ENCODING == "learned_abs"
-    assert uci.VAE_INPUT_DROPOUT == 0.20
-    assert uci.VAE_NOISE_STD == 0.01
-    assert uci.VAE_CONSIST_LAMBDA == 0.0
-    assert uci.VAE_RECON_BALANCE == "none"
-    assert uci.SUM_CHANNEL_BALANCED_X_LOSS is False
+    reused = make_cfg()
+    dd.apply_dataset_preset(reused, "physionet", pred=12)
+    dd.apply_dataset_preset(reused, "noaa_uk", pred=168)
+    assert reused.SUM_POS_ENCODING == "learned_abs"
+    assert reused.VAE_INPUT_DROPOUT == 0.20
+    assert reused.VAE_RECON_BALANCE == "none"
+    assert reused.SUM_CHANNEL_BALANCED_X_LOSS is False
 
 
 def test_vae_checkpoint_path_preserves_entity_suffix(tmp_path):
@@ -246,10 +271,10 @@ def test_laplace_relative_time_preserves_irregular_offsets():
     assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 4.0, 5.0]]))
 
 
-def test_laplace_relative_time_converts_increments():
-    dt = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+def test_laplace_relative_time_shifts_offset_clock():
+    dt = torch.tensor([[5.0, 6.0, 9.0, 10.0]])
     rel_t = LaplaceTransformEncoder.relative_time(1, 4, torch.float32, torch.device("cpu"), dt=dt)
-    assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
+    assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 4.0, 5.0]]))
 
 
 def test_laplace_relative_time_prefers_explicit_t():
@@ -312,6 +337,42 @@ def test_vae_target_mask_excludes_zero_filled_missing_targets():
     assert loss.item() == 0.0
 
 
+def test_pack_targets_tokens_rejects_bad_y_obs_mask_shape():
+    from Model.llapdiff_utils import pack_targets_tokens
+
+    y = torch.zeros(1, 2, 3)
+    entity_mask = torch.tensor([[True, True]])
+    bad_mask = torch.ones(1, 4, 2, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="y_obs_mask shape"):
+        pack_targets_tokens(y, entity_mask, torch.device("cpu"), y_obs_mask=bad_mask)
+
+
+def test_collect_latent_means_filters_unobserved_horizons():
+    from trainers import train_val_latent as tvl
+
+    class FakeVAE(torch.nn.Module):
+        def forward(self, x_tok, entity_pad=None):
+            B, T, _, _ = x_tok.shape
+            mu = torch.arange(B * T * 2, dtype=torch.float32).view(B, T, 2)
+            return torch.zeros(B, T, 1, 1), mu, torch.zeros_like(mu)
+
+    y = torch.tensor([[[1.0, 0.0, 3.0]]])
+    meta = {
+        "entity_mask": torch.tensor([[True]]),
+        "y_obs_mask": torch.tensor([[[True, False, True]]]),
+    }
+
+    latents = tvl.collect_latent_means(
+        [(None, y, meta)],
+        FakeVAE(),
+        torch.device("cpu"),
+    )
+
+    assert latents.shape == (2, 2)
+    assert torch.allclose(latents, torch.tensor([[0.0, 1.0], [4.0, 5.0]]))
+
+
 def test_vae_coverage_balanced_loss_still_ignores_unobserved_targets():
     from trainers import train_val_latent as tvl
 
@@ -323,6 +384,29 @@ def test_vae_coverage_balanced_loss_still_ignores_unobserved_targets():
 
     assert count == 2
     assert loss.item() == 0.0
+
+
+def test_summarizer_prepare_batch_accepts_3d_context_observation_mask():
+    from trainers import train_val_summarizer as tvs
+
+    V = torch.ones(1, 2, 3, 1)
+    T = torch.zeros(1, 2, 3, 1)
+    y = torch.zeros(1, 2, 1)
+    meta = {
+        "entity_mask": torch.tensor([[True, False]]),
+        "x_obs_mask": torch.tensor([[[True, False, True], [True, True, True]]]),
+    }
+
+    Vp, Tp, mask, elems, dt, obs_mask = tvs._prepare_batch(((V, T), y, meta), torch.device("cpu"))
+
+    assert Vp.shape == (1, 3, 2, 1)
+    assert Tp.shape == (1, 3, 2, 1)
+    assert mask.tolist() == [[True, False]]
+    assert elems == 3.0
+    assert dt is None
+    assert obs_mask.shape == (1, 3, 2, 1)
+    assert obs_mask[:, :, 1, :].sum().item() == 0
+    assert obs_mask[0, :, 0, 0].tolist() == [True, False, True]
 
 
 def test_summarizer_loss_x_respects_context_observation_mask():
@@ -406,6 +490,56 @@ def test_history_stat_tokens_preserve_context_offsets():
     stats = tv._history_stat_tokens(V, T, mask, torch.device("cpu"), dt=dt)
 
     assert torch.allclose(stats[0, :, 2], torch.tensor([0.0, 0.2, 0.8, 1.0]))
+
+
+def test_history_stat_tokens_use_valid_entity_denominators():
+    from trainers import train_val_llapdiff as tv
+
+    V = torch.ones(1, 2, 2, 2)
+    T = torch.ones(1, 2, 2, 2)
+    mask = torch.tensor([[True, False]])
+    obs_mask = torch.tensor(
+        [[[[True, False], [True, True]], [[True, True], [True, True]]]]
+    )
+
+    stats = tv._history_stat_tokens(V, T, mask, torch.device("cpu"), x_obs_mask=obs_mask)
+
+    assert torch.allclose(stats[0, :, 0], torch.tensor([1.0, 1.0]))
+    assert torch.allclose(stats[0, :, 1], torch.tensor([0.5, 1.0]))
+
+
+def test_llapdiff_builder_constructs_adapter_for_strict_checkpoint_load():
+    from trainers import train_val_llapdiff as tv
+
+    cfg = SimpleNamespace(
+        VAE_LATENT_CHANNELS=3,
+        MODEL_WIDTH=16,
+        NUM_LAYERS=1,
+        NUM_HEADS=2,
+        PREDICT_TYPE="v",
+        LAPLACE_K=4,
+        TIMESTEPS=8,
+        SCHEDULE="cosine",
+        DROPOUT=0.0,
+        ATTN_DROPOUT=0.0,
+        SELF_COND=False,
+        COND_POOL_MODE="mean",
+        COND_POOL_USE_RAW=False,
+        BLOCK_SUMMARY_ADALN=False,
+        ANALYSIS_SUMMARY_QK=False,
+        ANALYSIS_QK_USE_RAW=False,
+        SUM_CONTEXT_DIM=16,
+        COND_ADAPTER_MODE="stats",
+        COND_ADAPTER_HIDDEN=8,
+        COND_ADAPTER_DROPOUT=0.0,
+        COND_ADAPTER_SCALE=0.1,
+    )
+
+    model = tv.build_llapdiff_model(cfg, torch.device("cpu"))
+    loaded = tv.build_llapdiff_model(cfg, torch.device("cpu"))
+    tv._load_module_state(loaded, model.state_dict(), strict=True)
+
+    assert hasattr(loaded, "cond_adapter")
 
 
 def test_forecast_generation_does_not_condition_on_target_values_or_masks():

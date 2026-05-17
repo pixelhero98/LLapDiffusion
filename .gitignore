@@ -18,9 +18,7 @@ ldt/
 *.ckpt
 *.log
 
-# Generated dataset archives/caches
-Dataset/LLapDiff-evaluation-datasets.zip
-!Dataset/LLapDiff-evaluation-datasets.zip
+# Extracted dataset caches
 Dataset/LLapDiff-datasets/
 Dataset/fin_dataset/*/
 Dataset/bms_air/

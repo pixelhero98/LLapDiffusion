@@ -214,17 +214,17 @@ LLapDiff/
 
 ## Public presets
 
-The repository exposes one canonical latent channel setting per dataset. The horizon-wise winners below document the development evidence behind those defaults, while runtime configuration remains dataset-level and simple.
+The repository exposes one canonical latent channel setting per dataset.
 
-| Dataset | Horizons | Horizon best | Default latent channel |
-| --- | --- | --- | --- |
-| `bms_air` | `24, 48, 96, 168` | `32, 24, 32, 20` | `24` |
-| `uci_air` | `24, 48, 96, 168` | `16, 16, 12, 16` | `16` |
-| `physionet` | `4, 8, 10, 12` | `12, 20, 16, 16` | `16` |
-| `noaa_us` | `24, 48, 96, 168` | `24, 24, 32, 16` | `24` |
-| `noaa_uk` | `24, 48, 96, 168` | `12, 16, 20, 20` | `16` |
-| `us_equity` | `5, 20, 60, 100` | `8, 16, 8, 12` | `12` |
-| `crypto` | `5, 20, 60, 100` | `12, 16, 16, 20` | `16` |
+| Dataset | Horizons | Default latent channel |
+| --- | --- | --- |
+| `bms_air` | `24, 48, 96, 168` | `24` |
+| `uci_air` | `24, 48, 96, 168` | `16` |
+| `physionet` | `4, 8, 10, 12` | `16` |
+| `noaa_us` | `24, 48, 96, 168` | `24` |
+| `noaa_uk` | `24, 48, 96, 168` | `16` |
+| `us_equity` | `5, 20, 60, 100` | `12` |
+| `crypto` | `5, 20, 60, 100` | `16` |
 
 ### VAE defaults
 
@@ -249,6 +249,7 @@ The summarizer uses the shared public baseline in `configs/config.py`, with data
 | --- | --- |
 | `bms_air` | `SUM_LR = 1e-4`, `SUM_AMP = False` |
 | `physionet` | dataset-specific VAE and summarizer preset |
+| `crypto` | dataset-specific VAE and summarizer preset |
 | all others | shared summarizer defaults |
 
 
@@ -258,7 +259,7 @@ The default summarizer position mode is `SUM_POS_ENCODING="learned_abs"` for che
 
 `IMPUTATION_TRAINING=True` means imputation-style target anchors are allowed by configuration, not active by default. Pure extrapolation-training remains clean by `TARGET_MASK_AUX_P=0.0`; set a positive value only when intentionally running dual-task or imputation-style training. Extrapolation and interpolation both support in either training setting by querying the same model.
 
-Context and target `delta_t` metadata are interpreted as window-local offsets when they start at zero and are monotone. Increment-style deltas are converted to offsets before use.
+Context and target `delta_t` metadata are interpreted as nondecreasing window-local offsets and are shifted relative to the first timestamp before use.
 
 ## Practical tuning guidance
 

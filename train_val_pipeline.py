@@ -99,36 +99,6 @@ def _apply_pred_output_dirs(
         config.POLE_PLOT_DIR = str(pred_out / "pole_plots")
 
 
-def _extract_llapdiff_reporting_fields(
-    llapdiff_stats: Dict[str, object],
-) -> Tuple[Dict[str, object], object, object]:
-    """Normalize return payloads from different train_val_llapdiff.run versions."""
-    eval_stats = llapdiff_stats.get("eval_stats")
-    if not isinstance(eval_stats, dict):
-        alt_eval = llapdiff_stats.get("test_metrics")
-        eval_stats = alt_eval if isinstance(alt_eval, dict) else {}
-
-    best_val = llapdiff_stats.get("best_val")
-    if best_val is None:
-        val_history = llapdiff_stats.get("val_history")
-        if isinstance(val_history, list) and val_history:
-            crps_vals = [
-                row.get("crps")
-                for row in val_history
-                if isinstance(row, dict) and row.get("crps") is not None
-            ]
-            if crps_vals:
-                best_val = min(crps_vals)
-
-    loaded_checkpoint = llapdiff_stats.get("loaded_checkpoint")
-    if loaded_checkpoint is None:
-        loaded_checkpoint = llapdiff_stats.get("best_checkpoint") or llapdiff_stats.get(
-            "last_checkpoint"
-        )
-
-    return eval_stats, best_val, loaded_checkpoint
-
-
 def run_single_pred(
     pred: int,
     *,
@@ -203,11 +173,13 @@ def run_single_pred(
         config=config,
     )
 
-    eval_stats, best_val, loaded_checkpoint = _extract_llapdiff_reporting_fields(
-        llapdiff_stats
-    )
+    eval_stats = llapdiff_stats.get("eval_stats")
+    if not isinstance(eval_stats, dict):
+        raise ValueError("train_val_llapdiff.run must return an eval_stats dictionary.")
+    best_val = llapdiff_stats.get("best_val")
+    loaded_checkpoint = llapdiff_stats.get("loaded_checkpoint")
     balanced_evaluation = None
-    eval_ckpt = llapdiff_stats.get("best_checkpoint_raw") or llapdiff_stats.get("best_checkpoint")
+    eval_ckpt = loaded_checkpoint
     if eval_ckpt:
         try:
             from tools.llapdiff_checkpoint_eval import evaluate_checkpoint

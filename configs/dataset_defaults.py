@@ -11,6 +11,42 @@ from configs.dataset_registry import dataset_name_from_data_dir
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+_BASE_MODEL_SETTINGS: Mapping[str, object] = {
+    "VAE_MAX_PATIENCE": 20,
+    "VAE_INPUT_DROPOUT": 0.20,
+    "VAE_NOISE_STD": 0.01,
+    "VAE_CONSIST_LAMBDA": 0.0,
+    "VAE_RECON_BALANCE": "none",
+    "SUM_LR": 5e-4,
+    "SUM_AMP": True,
+    "SUM_PATIENCE": 10,
+    "SUM_LOSS_W_DT": 0.0,
+    "SUM_LOSS_W_OBS": 0.0,
+    "SUM_CHANNEL_BALANCED_X_LOSS": False,
+    "SUM_IRREG_POOLING": "none",
+    "SUM_T_TOKEN_MODE": "none",
+    "SUM_T_TOKEN_SCALE": 0.1,
+    "SUM_POS_ENCODING": "learned_abs",
+}
+
+
+_IRREGULAR_PUBLIC_PRESET: Mapping[str, object] = {
+    "VAE_INPUT_DROPOUT": 0.35,
+    "VAE_NOISE_STD": 0.02,
+    "VAE_CONSIST_LAMBDA": 0.05,
+    "VAE_MAX_PATIENCE": 25,
+    "VAE_RECON_BALANCE": "coverage",
+    "SUM_LOSS_W_DT": 0.05,
+    "SUM_LOSS_W_OBS": 0.05,
+    "SUM_CHANNEL_BALANCED_X_LOSS": True,
+    "SUM_IRREG_POOLING": "repair",
+    "SUM_T_TOKEN_MODE": "both",
+    "SUM_T_TOKEN_SCALE": 0.1,
+    "SUM_POS_ENCODING": "continuous_rope",
+    "SUM_PATIENCE": 15,
+}
+
+
 @dataclass(frozen=True)
 class DatasetPreset:
     key: str
@@ -67,21 +103,7 @@ DATASET_PRESETS: Mapping[str, DatasetPreset] = {
         table_batch_size=5,
         vae_latent_channels=16,
         minsnr_gamma=5.0,
-        model_overrides={
-            "VAE_INPUT_DROPOUT": 0.35,
-            "VAE_NOISE_STD": 0.02,
-            "VAE_CONSIST_LAMBDA": 0.05,
-            "VAE_MAX_PATIENCE": 25,
-            "VAE_RECON_BALANCE": "coverage",
-            "SUM_LOSS_W_DT": 0.05,
-            "SUM_LOSS_W_OBS": 0.05,
-            "SUM_CHANNEL_BALANCED_X_LOSS": True,
-            "SUM_IRREG_POOLING": "repair",
-            "SUM_T_TOKEN_MODE": "both",
-            "SUM_T_TOKEN_SCALE": 0.1,
-            "SUM_POS_ENCODING": "continuous_rope",
-            "SUM_PATIENCE": 15,
-        },
+        model_overrides=_IRREGULAR_PUBLIC_PRESET,
     ),
     "noaa_us": DatasetPreset(
         key="noaa_us",
@@ -122,6 +144,7 @@ DATASET_PRESETS: Mapping[str, DatasetPreset] = {
         table_batch_size=5,
         vae_latent_channels=16,
         minsnr_gamma=5.0,
+        model_overrides=_IRREGULAR_PUBLIC_PRESET,
     ),
 }
 
@@ -209,6 +232,8 @@ def apply_dataset_preset(cfg: object, dataset_key: str, *, pred: int | None = No
     setattr(cfg, "SUM_MIX_DIM", 64)
     setattr(cfg, "SUM_TV_HIDDEN", 32)
     setattr(cfg, "SUM_TIME2VEC_DIM", int(getattr(cfg, "SUM_TIME2VEC_DIM", 9)))
+    for name, value in _BASE_MODEL_SETTINGS.items():
+        setattr(cfg, name, value)
     if preset.sum_lr is not None:
         setattr(cfg, "SUM_LR", float(preset.sum_lr))
     if preset.sum_amp is not None:

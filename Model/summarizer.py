@@ -425,8 +425,7 @@ class LaplaceAE(nn.Module):
     def _canon_dt(dt: Optional[torch.Tensor], *, B: int, K: int, N: int, device, dtype) -> torch.Tensor:
         """Canonicalize dt to shape [B, K, N] (float)."""
         if dt is None:
-            # Regular sampling fallback: dt=1, relative time = 0..K-1
-            dt_bk = torch.ones((B, K), device=device, dtype=dtype)
+            dt_bk = torch.arange(K, device=device, dtype=dtype).view(1, K).expand(B, K)
             return dt_bk.unsqueeze(-1).expand(B, K, N)
 
         dt = torch.as_tensor(dt, device=device, dtype=dtype)
@@ -499,7 +498,7 @@ class LaplaceAE(nn.Module):
 
     @staticmethod
     def _normalize_rel_t(rel_t: torch.Tensor) -> torch.Tensor:
-        """Scale cumulative relative time to [0, 1] per series for stable reconstruction."""
+        """Scale relative time to [0, 1] per series for stable reconstruction."""
 
         scale = rel_t.amax(dim=1, keepdim=True).clamp_min(1.0)
         return rel_t / scale

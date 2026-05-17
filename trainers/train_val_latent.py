@@ -439,9 +439,11 @@ def collect_latent_means(
             )
             if prepared is None:
                 continue
-            x_tok, _, _, entity_pad = prepared
+            x_tok, _, obs, entity_pad = prepared
             _, mu, _ = model(x_tok, entity_pad=entity_pad)
-            all_mu.append(mu.detach().cpu())
+            obs_any = obs.any(dim=1)
+            if obs_any.any():
+                all_mu.append(mu[obs_any].detach().cpu())
             if max_batches is not None and (batch_idx + 1) >= max_batches:
                 break
     if not all_mu:
@@ -452,8 +454,12 @@ def collect_latent_means(
 def _compute_per_dim_stats(all_mu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if all_mu.numel() == 0:
         raise ValueError("Cannot compute latent statistics from an empty tensor.")
-    mu_per_dim = all_mu.mean(dim=(0, 1))
-    std_per_dim = all_mu.std(dim=(0, 1)).clamp(min=1e-6)
+    if all_mu.dim() == 2:
+        mu_per_dim = all_mu.mean(dim=0)
+        std_per_dim = all_mu.std(dim=0, unbiased=False).clamp(min=1e-6)
+    else:
+        mu_per_dim = all_mu.mean(dim=(0, 1))
+        std_per_dim = all_mu.std(dim=(0, 1), unbiased=False).clamp(min=1e-6)
     return mu_per_dim, std_per_dim
 
 
@@ -477,8 +483,9 @@ def summarize_normalized_latents(
 
     if ref_mean is None or ref_std is None:
         ref_mean, ref_std = _compute_per_dim_stats(all_mu)
-    mu_b = ref_mean.view(1, 1, -1)
-    std_b = ref_std.view(1, 1, -1)
+    view_shape = (1, -1) if all_mu.dim() == 2 else (1, 1, -1)
+    mu_b = ref_mean.view(*view_shape)
+    std_b = ref_std.view(*view_shape)
     norm = (all_mu - mu_b) / std_b
     flat = norm.reshape(-1)
     finite = torch.isfinite(flat)

@@ -232,7 +232,7 @@ def _history_stat_tokens(
     mask = mask_bn.to(device=device, dtype=torch.bool)
     entity_feat_mask = mask[:, :, None, None].to(dtype=V.dtype)
 
-    denom_feat = entity_feat_mask.sum(dim=(1, 3)).clamp_min(1.0)  # [B,K]
+    denom_feat = (mask.to(dtype=V.dtype).sum(dim=1, keepdim=True) * float(Fdim)).clamp_min(1.0)
     abs_t = (T.abs() * entity_feat_mask).sum(dim=(1, 3)) / denom_feat
 
     if x_obs_mask is None:
@@ -247,8 +247,10 @@ def _history_stat_tokens(
             else:
                 raise ValueError(f"Unrecognized x_obs_mask shape: {tuple(obs.shape)}")
             obs = obs.to(dtype=V.dtype)
-            obs = obs * mask[:, None, :, None].to(dtype=obs.dtype)
-            obs_frac = obs.mean(dim=(2, 3))
+            valid = mask[:, None, :, None].to(dtype=obs.dtype).expand(B, K, N, obs.size(-1))
+            obs = obs * valid
+            denom = valid.sum(dim=(2, 3)).clamp_min(1.0)
+            obs_frac = obs.sum(dim=(2, 3)) / denom
         elif obs.dim() == 3:
             if obs.size(1) == N and obs.size(2) == K:
                 obs = obs.permute(0, 2, 1).contiguous()
@@ -257,8 +259,10 @@ def _history_stat_tokens(
             else:
                 raise ValueError(f"Unrecognized x_obs_mask shape: {tuple(obs.shape)}")
             obs = obs.to(dtype=V.dtype)
-            obs = obs * mask[:, None, :].to(dtype=obs.dtype)
-            obs_frac = obs.mean(dim=2)
+            valid = mask[:, None, :].to(dtype=obs.dtype).expand(B, K, N)
+            obs = obs * valid
+            denom = valid.sum(dim=2).clamp_min(1.0)
+            obs_frac = obs.sum(dim=2) / denom
         else:
             raise ValueError(f"x_obs_mask must have 3 or 4 dims, got {tuple(obs.shape)}")
 
@@ -1106,7 +1110,7 @@ def _save_checkpoint(out_path: Path, payload: Dict[str, object]) -> None:
     print(f"[saved] {out_path}")
 
 
-def _llapdiff_model_config(config_obj: object) -> Dict[str, object]:
+def _llapdiff_model_kwargs(config_obj: object) -> Dict[str, object]:
     return {
         "data_dim": int(getattr(config_obj, "VAE_LATENT_CHANNELS")),
         "hidden_dim": int(getattr(config_obj, "MODEL_WIDTH")),
@@ -1125,6 +1129,41 @@ def _llapdiff_model_config(config_obj: object) -> Dict[str, object]:
         "analysis_summary_qk": bool(getattr(config_obj, "ANALYSIS_SUMMARY_QK", False)),
         "analysis_qk_use_raw_summary": bool(getattr(config_obj, "ANALYSIS_QK_USE_RAW", False)),
     }
+
+
+def _cond_adapter_config(config_obj: object) -> Dict[str, object]:
+    mode = str(getattr(config_obj, "COND_ADAPTER_MODE", "none")).strip().lower()
+    if mode not in {"none", "stats"}:
+        raise ValueError(f"Unknown COND_ADAPTER_MODE '{mode}'. Use 'none' or 'stats'.")
+    return {
+        "mode": mode,
+        "hidden_dim": int(getattr(config_obj, "SUM_CONTEXT_DIM")),
+        "stat_dim": 3,
+        "adapter_dim": int(getattr(config_obj, "COND_ADAPTER_HIDDEN", 128)),
+        "dropout": float(getattr(config_obj, "COND_ADAPTER_DROPOUT", 0.0)),
+        "residual_scale": float(getattr(config_obj, "COND_ADAPTER_SCALE", 0.1)),
+    }
+
+
+def _llapdiff_model_config(config_obj: object) -> Dict[str, object]:
+    return {
+        "llapdiff": _llapdiff_model_kwargs(config_obj),
+        "cond_adapter": _cond_adapter_config(config_obj),
+    }
+
+
+def build_llapdiff_model(config_obj: object, device: torch.device) -> LLapDiff:
+    model = LLapDiff(**_llapdiff_model_kwargs(config_obj)).to(device)
+    adapter_cfg = _cond_adapter_config(config_obj)
+    if adapter_cfg["mode"] == "stats":
+        model.cond_adapter = ContextStatsAdapter(
+            hidden_dim=int(adapter_cfg["hidden_dim"]),
+            stat_dim=int(adapter_cfg["stat_dim"]),
+            adapter_dim=int(adapter_cfg["adapter_dim"]),
+            dropout=float(adapter_cfg["dropout"]),
+            residual_scale=float(adapter_cfg["residual_scale"]),
+        ).to(device)
+    return model
 
 
 def _load_eval_checkpoint(
@@ -1490,42 +1529,9 @@ def run(
     sum_ft_param_count = sum(param.numel() for _, param in sum_ft_named_params)
 
     # ---------------- Diffusion model ----------------
-    cond_pool_mode = str(getattr(config, "COND_POOL_MODE", "mean")).strip().lower()
-    cond_pool_use_raw = bool(getattr(config, "COND_POOL_USE_RAW", False))
-    block_summary_adaln = bool(getattr(config, "BLOCK_SUMMARY_ADALN", False))
-    analysis_summary_qk = bool(getattr(config, "ANALYSIS_SUMMARY_QK", False))
-    analysis_qk_use_raw = bool(getattr(config, "ANALYSIS_QK_USE_RAW", False))
-    diff_model = LLapDiff(
-        data_dim=config.VAE_LATENT_CHANNELS,
-        hidden_dim=config.MODEL_WIDTH,
-        num_layers=config.NUM_LAYERS,
-        num_heads=config.NUM_HEADS,
-        predict_type=config.PREDICT_TYPE,
-        laplace_k=config.LAPLACE_K,
-        timesteps=config.TIMESTEPS,
-        schedule=config.SCHEDULE,
-        dropout=config.DROPOUT,
-        attn_dropout=config.ATTN_DROPOUT,
-        self_conditioning=config.SELF_COND,
-        summary_pool_mode=cond_pool_mode,
-        pole_pool_use_raw_summary=cond_pool_use_raw,
-        block_summary_adaln=block_summary_adaln,
-        analysis_summary_qk=analysis_summary_qk,
-        analysis_qk_use_raw_summary=analysis_qk_use_raw,
-    ).to(device)
-    cond_adapter_mode = str(getattr(config, "COND_ADAPTER_MODE", "none")).strip().lower()
-    if cond_adapter_mode not in {"none", "stats"}:
-        raise ValueError(
-            f"Unknown COND_ADAPTER_MODE '{cond_adapter_mode}'. Use 'none' or 'stats'."
-        )
-    if cond_adapter_mode == "stats":
-        diff_model.cond_adapter = ContextStatsAdapter(
-            hidden_dim=int(config.SUM_CONTEXT_DIM),
-            stat_dim=3,
-            adapter_dim=int(getattr(config, "COND_ADAPTER_HIDDEN", 128)),
-            dropout=float(getattr(config, "COND_ADAPTER_DROPOUT", 0.0)),
-            residual_scale=float(getattr(config, "COND_ADAPTER_SCALE", 0.1)),
-    ).to(device)
+    adapter_cfg = _cond_adapter_config(config)
+    cond_adapter_mode = str(adapter_cfg["mode"])
+    diff_model = build_llapdiff_model(config, device)
 
     init_ckpt_raw = getattr(config, "DIFF_INIT_CKPT", None)
     init_ckpt_path = None
@@ -2425,8 +2431,7 @@ def run(
         "raw_val_history": raw_val_history,
         "ema_val_history": ema_val_history,
         "pole_probe_history": pole_probe_history,
-        "test_metrics": test_metrics,
-        "eval_stats": test_metrics,  # backward/forward compatibility with pipeline callers
+        "eval_stats": test_metrics,
         "best_val": best_val,
         "best_val_by_source": {
             "raw": _finite_or_none(best_val_crps_by_source["raw"]),

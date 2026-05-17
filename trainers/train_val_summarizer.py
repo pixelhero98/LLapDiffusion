@@ -182,10 +182,15 @@ def _prepare_batch(
 
     obs_mask = meta.get("x_obs_mask")
     if obs_mask is not None:
-        obs_mask = torch.as_tensor(obs_mask, device=device, dtype=torch.bool)
-        # expected [B, N, K, F] -> [B, K, N, F]
-        if obs_mask.dim() == 4 and obs_mask.size(1) == mask.size(1):
-            obs_mask = _permute_to_seq_first(obs_mask)
+        obs_mask = LaplaceAE._canon_obs_mask(
+            obs_mask,
+            x=V,
+            B=V.size(0),
+            K=V.size(1),
+            N=V.size(2),
+            D=V.size(3),
+            device=device,
+        )
         obs_mask = obs_mask & mask[:, None, :, None]
 
     # 3. Apply the combined mask

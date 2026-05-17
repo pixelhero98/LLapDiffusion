@@ -532,8 +532,10 @@ def pack_targets_tokens(
         if yom.shape == (B, N, H):
             yom = yom.permute(0, 2, 1).contiguous()
         elif yom.shape != (B, H, N):
-            yom = None
-        obs = yom
+            raise ValueError(
+                f"y_obs_mask shape {tuple(yom.shape)} is incompatible with target shape {(B, N, H)}"
+            )
+        obs = yom & torch.isfinite(y)
 
     if obs is None:
         if torch.is_floating_point(y):
@@ -977,6 +979,10 @@ def calculate_v_variance(
             if x_tok is None or not obs.any():
                 continue
             x0 = encode_mu_norm(vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std)
+            obs_any = obs.any(dim=2)
+            if not obs_any.any():
+                continue
+            x0 = x0[obs_any]
         else:
             y_in, _ = flatten_targets(yb, mask_bn, device)
             if y_in is None:
