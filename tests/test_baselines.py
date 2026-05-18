@@ -20,6 +20,7 @@ def test_baseline_registry_records_public_contracts():
         "patchtst",
         "timegrad",
         "mtan",
+        "mr-diff",
         "t_patchgnn",
         "contiformer",
     }
@@ -30,6 +31,104 @@ def test_baseline_registry_records_public_contracts():
     assert "context-window imputation" in BASELINES["csdi"].dependency_caveat
     assert BASELINES["mtan"].probabilistic is True
     assert BASELINES["contiformer"].dependency_sources == (("physiopro", "5486d1ccaff8f33d635753e3debd7465234b09f1"),)
+
+
+def _require_mr_diff_adapter():
+    module = pytest.importorskip("llapdiffusion.baselines.adapters.mr_diff")
+    return module.MRDiffAdapter
+
+
+def _sample_baseline_batch(batch_size: int = 2, entities: int = 3, context: int = 5, horizon: int = 4):
+    values = torch.randn(batch_size, entities, context, 1)
+    times = torch.zeros_like(values)
+    target = torch.randn(batch_size, entities, horizon)
+    meta = {
+        "x_obs_mask": torch.ones(batch_size, entities, context, 1, dtype=torch.bool),
+        "y_obs_mask": torch.ones(batch_size, entities, horizon, dtype=torch.bool),
+        "entity_mask": torch.ones(batch_size, entities, dtype=torch.bool),
+        "delta_t": torch.arange(context, dtype=torch.float32).view(1, 1, context).expand(batch_size, entities, -1),
+        "delta_t_y": torch.arange(1, horizon + 1, dtype=torch.float32).view(1, 1, horizon).expand(batch_size, entities, -1),
+    }
+    return (values, times), target, meta
+
+
+def _sample_dataset_info(context: int = 5, horizon: int = 4):
+    return {
+        "dataset": "demo",
+        "window": context,
+        "horizon": horizon,
+        "feature_cols": ["target"],
+        "target_col": "target",
+    }
+
+
+def test_mr_diff_registry_declares_first_party_contract():
+    _require_mr_diff_adapter()
+    assert "mr-diff" in EXTRAPOLATION_BASELINES
+    assert "mr-diff" in BASELINES
+    spec = BASELINES["mr-diff"]
+    assert spec.placement == "extrapolation/mr-diff"
+    assert spec.metric_type == "probabilistic_crps_mse"
+    assert spec.source_name == "LLapDiffusion"
+    assert spec.source_sha == "first-party-paper-derived"
+    assert "ICLR 2024" in spec.official_reference
+    assert spec.probabilistic is True
+    assert spec.first_party is True
+    assert spec.dependency_sources == ()
+    assert "first-party" in spec.dependency_caveat
+
+
+def test_source_manager_allows_first_party_without_external_root():
+    source = SourceManager(None).validate(BASELINES["mr-diff"])
+    assert source["source_name"] == "LLapDiffusion"
+    assert source["source_sha"] == "first-party-paper-derived"
+    assert source["source_clean"] is True
+    with pytest.raises(ValueError, match="baseline-source-root"):
+        SourceManager(None).validate(BASELINES["dlinear"])
+
+
+def test_build_adapter_dispatches_mr_diff(monkeypatch):
+    _require_mr_diff_adapter()
+    from llapdiffusion.baselines.adapters import builder
+
+    seen = {}
+
+    class FakeMRDiffAdapter(torch.nn.Module):
+        def __init__(self, dataset_info, sample_batch, *, num_samples=4):
+            super().__init__()
+            seen["dataset_info"] = dataset_info
+            seen["sample_batch"] = sample_batch
+            seen["num_samples"] = num_samples
+
+    monkeypatch.setattr(builder, "MRDiffAdapter", FakeMRDiffAdapter)
+    dataset_info = _sample_dataset_info()
+    sample_batch = _sample_baseline_batch()
+    adapter = builder.build_adapter(
+        "mr-diff",
+        dataset_info,
+        sample_batch,
+        SourceManager(None),
+        torch.device("cpu"),
+        num_samples=7,
+    )
+    assert isinstance(adapter, FakeMRDiffAdapter)
+    assert seen == {
+        "dataset_info": dataset_info,
+        "sample_batch": sample_batch,
+        "num_samples": 7,
+    }
+
+
+def test_mr_diff_adapter_loss_and_samples_shape():
+    MRDiffAdapter = _require_mr_diff_adapter()
+    dataset_info = _sample_dataset_info()
+    sample_batch = _sample_baseline_batch()
+    adapter = MRDiffAdapter(dataset_info, sample_batch, num_samples=3, stages=2, kernels=(3,), width=8, diffusion_steps=2)
+    loss, samples = adapter.loss_and_samples(sample_batch, dataset_info)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    assert samples.shape == (3, 2, 3, 4)
+    assert torch.isfinite(samples).all()
 
 
 def test_target_index_fails_if_target_column_is_missing():

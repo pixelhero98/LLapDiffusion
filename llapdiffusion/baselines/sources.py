@@ -68,12 +68,23 @@ def load_module_from_file(module_name: str, path: Path) -> ModuleType:
 
 class SourceManager:
     def __init__(self, source_root: str | os.PathLike[str] | None):
-        self.root = resolve_source_root(source_root)
+        self.root = resolve_source_root(source_root) if source_root or os.environ.get("LLAPDIFF_BASELINE_SOURCE_ROOT") else None
 
     def path(self, name: str) -> Path:
+        if self.root is None:
+            raise ValueError("Provide --baseline-source-root or LLAPDIFF_BASELINE_SOURCE_ROOT for external baselines.")
         return self.root / name
 
     def validate(self, spec: BaselineSpec) -> dict[str, object]:
+        if spec.first_party:
+            return {
+                "source_name": spec.source_name,
+                "source_sha": spec.source_sha,
+                "source_clean": True,
+                "official_reference": spec.official_reference,
+                "dependency_caveat": spec.dependency_caveat,
+                "dependency_sources": {},
+            }
         source_path = self.path(spec.source_name)
         actual = git_sha(source_path)
         clean = git_status_clean(source_path)

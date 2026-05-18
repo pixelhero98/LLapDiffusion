@@ -13,6 +13,7 @@ EXTRAPOLATION_BASELINES = (
     "patchtst",
     "timegrad",
     "mtan",
+    "mr-diff",
     "t_patchgnn",
     "contiformer",
 )
@@ -31,6 +32,7 @@ class BaselineSpec:
     probabilistic: bool = False
     dependency_caveat: str = "none"
     dependency_sources: tuple[tuple[str, str], ...] = ()
+    first_party: bool = False
 
 
 BASELINES: Mapping[str, BaselineSpec] = {
@@ -88,6 +90,24 @@ BASELINES: Mapping[str, BaselineSpec] = {
             "Gaussian likelihood is supplied by the runner: official mTAN encoder/decoder "
             "produce the mean path and a learned scalar std provides probabilistic CRPS"
         ),
+    ),
+    "mr-diff": BaselineSpec(
+        "mr-diff",
+        "extrapolation/mr-diff",
+        "probabilistic_crps_mse",
+        "LLapDiffusion",
+        "first-party-paper-derived",
+        "ICLR 2024 Multi-Resolution Diffusion Models for Time Series Forecasting",
+        (
+            "paper-derived multi-resolution diffusion with TimeGrad-style normalized timestamps, "
+            "gap features, observation masks, and future timestamp encodings"
+        ),
+        probabilistic=True,
+        dependency_caveat=(
+            "MR-Diff has no official public implementation; this adapter is a first-party "
+            "implementation from the ICLR 2024 paper."
+        ),
+        first_party=True,
     ),
     "t_patchgnn": BaselineSpec(
         "t_patchgnn",

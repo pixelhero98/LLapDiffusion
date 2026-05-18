@@ -7,6 +7,7 @@ from llapdiffusion.baselines.adapters.contiformer import ContiFormerAdapter
 from llapdiffusion.baselines.adapters.csdi import CSDIAdapter
 from llapdiffusion.baselines.adapters.dlinear import DLinearAdapter
 from llapdiffusion.baselines.adapters.mtan import MTANAdapter
+from llapdiffusion.baselines.adapters.mr_diff import MRDiffAdapter
 from llapdiffusion.baselines.adapters.neuralcde import NeuralCDEAdapter
 from llapdiffusion.baselines.adapters.patchtst import PatchTSTAdapter
 from llapdiffusion.baselines.adapters.t_patchgnn import TPatchGNNAdapter
@@ -33,6 +34,8 @@ def build_adapter(
         return MTANAdapter(dataset_info, sample_batch, source_manager, device, num_samples=num_samples)
     if key == "timegrad":
         return TimeGradAdapter(dataset_info, sample_batch, source_manager, num_samples=num_samples)
+    if key == "mr-diff":
+        return MRDiffAdapter(dataset_info, sample_batch, num_samples=num_samples)
     if key == "t_patchgnn":
         return TPatchGNNAdapter(dataset_info, sample_batch, source_manager, device)
     if key == "contiformer":

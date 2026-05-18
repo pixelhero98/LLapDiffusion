@@ -35,7 +35,7 @@ from llapdiffusion.baselines.sources import SourceManager
 
 @dataclass(frozen=True)
 class SmokeConfig:
-    source_root: Path | str
+    source_root: Path | str | None
     output_dir: Path | str | None = None
     work_cache_dir: Path | str | None = None
     device: str = "cuda"
@@ -109,7 +109,7 @@ def _source_row(source: dict[str, object]) -> dict[str, object]:
 
 
 def _loss_for_training(model, key: str, batch, dataset_info: dict[str, object]) -> torch.Tensor:
-    if key in {"timegrad", "mtan", "csdi"}:
+    if key in {"timegrad", "mtan", "mr-diff", "csdi"}:
         return model.loss(batch, dataset_info)
     pred = model(batch, dataset_info)
     _, _, y_clean, valid = target_context(batch, dataset_info)
@@ -127,7 +127,7 @@ def _evaluate_batch(model, key: str, batch, dataset_info: dict[str, object]):
     metric_crps = None
     metric_mae = None
 
-    if key == "timegrad":
+    if key in {"timegrad", "mr-diff"}:
         loss, samples = model.loss_and_samples(batch, dataset_info)
         sample_shape = list(samples.shape)
         crps, mse = sample_crps(samples, torch.nan_to_num(y, nan=0.0), valid)

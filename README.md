@@ -197,9 +197,9 @@ llapdiff-plot-poles \
 
 The pole plot overlays global/base poles with conditioned effective poles built from real dataset context.
 
-## External baselines
+## Baselines
 
-Baseline adapters are packaged under `llapdiffusion.baselines`, but the official upstream repositories remain external. Clone the pinned sources outside this repository and pass their parent directory explicitly:
+Baseline adapters are packaged under `llapdiffusion.baselines`. DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, t-PatchGNN, ContiFormer, and CSDI use pinned external upstream repositories; clone those sources outside this repository and pass their parent directory explicitly. MR-Diff is implemented first-party in this repository from the ICLR 2024 paper and is not cloned from an external repository:
 
 ```bash
 mkdir -p /path/to/baseline-sources
@@ -225,7 +225,9 @@ llapdiff-baselines smoke \
   --work-cache-dir ldt/cache_work
 ```
 
-The baseline pool includes extrapolation adapters for DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, t-PatchGNN, and ContiFormer, plus CSDI under imputation. Smoke results are one-batch source/import/forward/loss/backward checks, not benchmark scores. CSDI is reported as `context_imputation_holdout`; it is not a forecast-horizon extrapolation result.
+The baseline pool includes extrapolation adapters for DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, t-PatchGNN, ContiFormer, and MR-Diff, plus CSDI under imputation. Smoke results are one-batch source/import/forward/loss/backward checks, not benchmark scores. CSDI is reported as `context_imputation_holdout`; it is not a forecast-horizon extrapolation result.
+
+MR-Diff can be selected with `--baseline mr-diff` without `--baseline-source-root`. For paper-style stochastic evaluation, set `--num-samples 10`; smoke checks can use fewer samples for runtime.
 
 Bounded practical runs use the same LLapDiffusion dataset presets and longest horizons:
 
@@ -248,7 +250,7 @@ llapdiff-baselines csdi-imputation \
 LLapDiffusion/
 |-- llapdiffusion/
 |   |-- pipeline.py            # Main training and validation entrypoint
-|   |-- baselines/             # External baseline adapters, metrics, and runners
+|   |-- baselines/             # Baseline adapters, metrics, and runners
 |   |-- configs/               # Generic config, dataset presets, and config helpers
 |   |-- trainers/              # VAE, summarizer, and LLapDiff trainers
 |   |-- tools/                 # Artifact preparation and checkpoint evaluation CLIs
