@@ -208,7 +208,7 @@ The pole plot overlays global/base poles with conditioned effective poles built 
 
 ## Baselines
 
-Baseline adapters are packaged under `llapdiffusion.baselines`. DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, t-PatchGNN, ContiFormer, and CSDI use pinned external upstream repositories; clone those sources outside this repository and pass their parent directory explicitly. MR-Diff is implemented first-party in this repository from the ICLR 2024 paper and is not cloned from an external repository:
+Baseline adapters are packaged under `llapdiffusion.baselines`. DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, t-PatchGNN, ContiFormer, and CSDI use pinned external upstream repositories; clone those sources outside this repository and pass their parent directory explicitly. `MR-Diff is implemented first-party in this repository from the ICLR 2024 paper, and it has no GitHub repo or official implementation`:
 
 ```bash
 mkdir -p /path/to/baseline-sources
