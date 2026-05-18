@@ -56,6 +56,7 @@ VAE_NOISE_STD = 0.01
 VAE_CONSIST_LAMBDA = 0.0
 VAE_RECON_BALANCE = "none"
 VAE_PLOT_LATENTS = False
+VAE_AMP = False
 
 
 # ======================= Summarizer (LaplaceAE) =======================

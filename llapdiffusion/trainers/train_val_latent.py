@@ -663,6 +663,12 @@ def _beta_for_epoch(
     ramp = min(1.0, ramp_step / float(int(anneal_epochs)))
     return float(target_beta * ramp)
 
+
+def _vae_amp_enabled(device: torch.device, config=config) -> bool:
+    """Return whether the VAE stage should use CUDA AMP."""
+    return device.type == "cuda" and bool(getattr(config, "VAE_AMP", False))
+
+
 def run(
     train_dl: Optional[DataLoader] = None,
     val_dl: Optional[DataLoader] = None,
@@ -676,7 +682,7 @@ def run(
     _log_dataset_summary(train_dl, sizes)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp_enabled = device.type == "cuda"
+    amp_enabled = _vae_amp_enabled(device, config=config)
     print(f"Using device: {device}")
     grad_clip = getattr(config, "GRAD_CLIP", 1.0)
 

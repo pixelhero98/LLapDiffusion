@@ -288,6 +288,15 @@ def test_vae_checkpoint_path_preserves_entity_suffix(tmp_path):
     assert tvl._vae_checkpoint_path("elbo", config=cfg).name == "pred-20_ch-12_entity_elbo.pt"
 
 
+def test_vae_amp_flag_controls_cuda_autocast():
+    from llapdiffusion.trainers import train_val_latent as tvl
+
+    assert tvl._vae_amp_enabled(torch.device("cpu"), config=SimpleNamespace(VAE_AMP=True)) is False
+    assert tvl._vae_amp_enabled(torch.device("cuda"), config=SimpleNamespace(VAE_AMP=False)) is False
+    assert tvl._vae_amp_enabled(torch.device("cuda"), config=SimpleNamespace(VAE_AMP=True)) is True
+    assert tvl._vae_amp_enabled(torch.device("cuda"), config=SimpleNamespace()) is False
+
+
 def test_run_single_pred_applies_output_dirs_after_pred_update(monkeypatch, tmp_path):
     from llapdiffusion import pipeline as pipeline
 
