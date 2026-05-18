@@ -505,7 +505,8 @@ def _print_summary_table(results: Dict[int, Dict[str, object]]) -> None:
 def main() -> Dict[int, Dict[str, object]]:
     args = _parse_args()
     configure_dataset_archive(args.dataset_zip, args.dataset_extract_dir)
-    apply_dataset_preset(config, args.dataset_key)
+    initial_pred = int(args.preds[0]) if args.preds else None
+    apply_dataset_preset(config, args.dataset_key, pred=initial_pred)
     training_overrides = _training_overrides_from_args(args)
     preds = tuple(args.preds) if args.preds else _pred_list_from_config(config=config)
     if not preds:

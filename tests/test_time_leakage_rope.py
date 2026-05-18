@@ -372,6 +372,44 @@ def test_llapdiff_train_target_mask_aux_cli_overrides(monkeypatch):
     assert cfg.TARGET_MASK_AUX_START_EPOCH == 7
 
 
+def test_llapdiff_train_main_applies_dataset_preset_with_requested_pred(monkeypatch):
+    from llapdiffusion import pipeline
+
+    calls = {"preset": [], "preds": []}
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llapdiff-train",
+            "--dataset-key",
+            "crypto",
+            "--preds",
+            "100",
+        ],
+    )
+    monkeypatch.setattr(pipeline, "configure_dataset_archive", lambda *args, **kwargs: None)
+
+    def fake_apply(config, dataset_key, pred=None):
+        calls["preset"].append((dataset_key, pred))
+        config.OUT_DIR = "out"
+        config.CKPT_DIR = "ckpt"
+
+    def fake_run_single_pred(pred, **kwargs):
+        calls["preds"].append(pred)
+        return {"eval_stats": {}}
+
+    monkeypatch.setattr(pipeline, "apply_dataset_preset", fake_apply)
+    monkeypatch.setattr(pipeline, "run_single_pred", fake_run_single_pred)
+    monkeypatch.setattr(pipeline, "_print_summary_table", lambda results: None)
+
+    result = pipeline.main()
+
+    assert calls["preset"] == [("crypto", 100)]
+    assert calls["preds"] == [100]
+    assert result == {100: {"eval_stats": {}}}
+
+
 def test_missing_dataset_archive_fails_early(tmp_path, monkeypatch):
     from llapdiffusion.configs import dataset_archives
 
