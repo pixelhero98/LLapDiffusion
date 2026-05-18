@@ -7,7 +7,7 @@ from llapdiffusion.baselines.registry import (
     IMPUTATION_BASELINES,
     BaselineSpec,
 )
-from llapdiffusion.baselines.runner import SmokeConfig, run_baseline_matrix, run_baseline_smoke
+from llapdiffusion.baselines.runner import TrainConfig, run_practical_matrix, run_practical_one
 
 __all__ = [
     "BASELINES",
@@ -15,7 +15,7 @@ __all__ = [
     "EXTRAPOLATION_BASELINES",
     "IMPUTATION_BASELINES",
     "BaselineSpec",
-    "SmokeConfig",
-    "run_baseline_matrix",
-    "run_baseline_smoke",
+    "TrainConfig",
+    "run_practical_matrix",
+    "run_practical_one",
 ]

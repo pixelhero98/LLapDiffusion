@@ -24,7 +24,6 @@ def build_adapter(
     *,
     num_samples: int = 4,
     imputation_random_mask_ratio: float = 0.30,
-    csdi_imputation_target: str = "target",
 ) -> nn.Module:
     if key == "dlinear":
         return DLinearAdapter(dataset_info, sample_batch, source_manager)
@@ -50,6 +49,5 @@ def build_adapter(
             device,
             num_samples=num_samples,
             imputation_random_mask_ratio=imputation_random_mask_ratio,
-            imputation_target=csdi_imputation_target,
         )
     raise KeyError(key)

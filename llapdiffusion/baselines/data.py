@@ -6,7 +6,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 
@@ -22,7 +22,6 @@ def load_dataset_loaders(
     *,
     allow_cache_copy: bool,
     work_cache_dir: Path | None,
-    split: str = "all",
     horizon: int | None = None,
 ):
     preset = get_dataset_preset(dataset_key)
@@ -88,12 +87,6 @@ def load_dataset_loaders(
         "feature_cols": meta.get("feature_cols", []),
         "target_col": meta.get("target_col", ""),
     }
-    if split == "train":
-        return train_dl, info
-    if split == "val":
-        return val_dl, info
-    if split == "test":
-        return test_dl, info
     return (train_dl, val_dl, test_dl), info
 
 
@@ -142,123 +135,16 @@ def context_target_mask(meta: dict[str, Any], V: torch.Tensor, dataset_info: dic
     return entity & x_obs[..., idx].any(dim=-1)
 
 
-def slice_entities(batch, indices: Sequence[int]):
-    (V, T), y, meta = batch
-    B, N = V.shape[:2]
-    idx = torch.as_tensor(list(indices), dtype=torch.long, device=V.device)
-    if idx.numel() == 0:
-        raise ValueError("At least one entity index is required")
-    if bool((idx < 0).any()) or bool((idx >= N).any()):
-        raise IndexError(f"Entity indices {indices} outside batch entity dimension {N}")
-
-    def maybe_slice(value):
-        if torch.is_tensor(value) and value.dim() >= 2 and value.shape[0] == B and value.shape[1] == N:
-            return value.index_select(1, idx.to(value.device))
-        return value
-
-    sliced_meta = {k: maybe_slice(v) for k, v in meta.items()}
-    return (
-        (V.index_select(1, idx), T.index_select(1, idx.to(T.device))),
-        y.index_select(1, idx.to(y.device)),
-        sliced_meta,
-    )
-
-
-def normalize_cap(value: int | None, name: str) -> int | None:
-    if value is None:
-        return None
-    cap = int(value)
-    if cap < 0:
-        raise ValueError(f"{name} must be non-negative; use 0 for no cap")
-    return None if cap == 0 else cap
-
-
-def select_entities(batch, max_entities: int | None):
-    max_entities = normalize_cap(max_entities, "max_entities")
-    if max_entities is None:
-        return batch, None
-    (V, T), y, meta = batch
-    _, N = V.shape[:2]
-    cap = min(int(max_entities), N)
-    if cap == N:
-        return batch, list(range(N))
-    x_obs = canonical_x_obs(meta, V)
-    entity = meta["entity_mask"].to(dtype=torch.bool, device=V.device)
-    counts = x_obs.sum(dim=tuple(i for i in range(x_obs.dim()) if i != 1))
-    counts = counts * entity.to(dtype=counts.dtype).sum(dim=0).clamp(max=1)
-    idx = torch.topk(counts, k=cap, largest=True).indices.sort().values
-    selected = [int(i) for i in idx.detach().cpu().tolist()]
-    return slice_entities(batch, selected), selected
-
-
-def select_stable_entities(
-    loaders,
-    dataset_info: dict[str, Any],
-    device: torch.device,
-    max_entities: int | None,
-    max_batches: int | None,
-) -> list[int] | None:
-    max_entities = normalize_cap(max_entities, "max_entities")
-    max_batches = normalize_cap(max_batches, "max_batches")
-    if max_entities is None:
-        return None
-    split_counts = []
-    for loader in loaders:
-        counts = None
-        for i, raw in enumerate(loader):
-            if max_batches is not None and i >= max_batches:
-                break
-            batch = batch_to_device(raw, device)
-            (V, _), _, meta = batch
-            valid_context = context_target_mask(meta, V, dataset_info)
-            current = valid_context.sum(dim=0).to(dtype=torch.float32)
-            counts = current if counts is None else counts + current
-        if counts is not None:
-            split_counts.append(counts)
-
-    if not split_counts:
-        raise RuntimeError(f"{dataset_info['dataset']}: no batches available for stable entity selection")
-
-    cap = min(int(max_entities), split_counts[0].numel())
-    common_scores = torch.stack(split_counts).amin(dim=0)
-    candidate = torch.nonzero(common_scores > 0, as_tuple=False).flatten()
-    if candidate.numel() >= cap:
-        local = torch.topk(common_scores.index_select(0, candidate), k=cap, largest=True).indices
-        idx = candidate.index_select(0, local).sort().values
-    else:
-        aggregate = torch.stack(split_counts).sum(dim=0)
-        idx = torch.topk(aggregate, k=cap, largest=True).indices.sort().values
-    return [int(i) for i in idx.detach().cpu().tolist()]
-
-
 def find_batch(
     loader,
     dataset_info: dict[str, Any],
     device: torch.device,
-    max_entities: int | None,
-    max_batches: int | None,
-    *,
-    require_future_target: bool = True,
-    selected_entities: Sequence[int] | None = None,
 ):
-    max_entities = normalize_cap(max_entities, "max_entities")
-    max_batches = normalize_cap(max_batches, "max_batches")
     skipped = 0
-    for i, raw in enumerate(loader):
-        if max_batches is not None and i >= max_batches:
-            break
+    for raw in loader:
         batch = batch_to_device(raw, device)
-        if selected_entities is None and max_entities is not None:
-            batch, selected = select_entities(batch, max_entities)
-        else:
-            if selected_entities is None:
-                selected = None
-            else:
-                batch = slice_entities(batch, selected_entities)
-                selected = list(selected_entities)
-        valid = target_mask(batch[2], batch[1]) if require_future_target else context_target_mask(batch[2], batch[0][0], dataset_info)
+        valid = target_mask(batch[2], batch[1])
         if valid.any():
-            return batch, selected, skipped
+            return batch, skipped
         skipped += 1
-    scanned = "all" if max_batches is None else str(max_batches)
-    raise RuntimeError(f"{dataset_info['dataset']}: no valid batch found in first {scanned} batches")
+    raise RuntimeError(f"{dataset_info['dataset']}: no valid batch found")

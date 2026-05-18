@@ -238,7 +238,7 @@ llapdiff-baselines practical-extrapolation \
   --work-cache-dir ldt/cache_work
 ```
 
-CSDI is an imputation baseline, not a forecast-horizon extrapolator. Its comparable default is target-horizon imputation: the model conditions on the context plus retained target-horizon tokens, randomly hides the configured fraction of observed target-horizon tokens, and scores only those hidden target tokens:
+CSDI is an imputation baseline, not a forecast-horizon extrapolator. It runs target-horizon imputation: the model conditions on the context plus retained target-horizon tokens, randomly hides the configured fraction of observed target-horizon tokens, and scores only those hidden target tokens:
 
 ```bash
 llapdiff-baselines csdi-imputation \
@@ -250,20 +250,7 @@ llapdiff-baselines csdi-imputation \
   --work-cache-dir ldt/cache_work
 ```
 
-The older context-window CSDI diagnostic remains available with `--csdi-imputation-target context`, but it should not be mixed with target-horizon LLapDiff imputation comparisons.
-
-For small debug probes, use `--quick`. This restores the bounded legacy settings: up to 4 entities, 30 scan batches, 256 train/eval batches, 50 epochs, 8 patience, and 4 probabilistic samples. Treat these as sanity checks, not comparison numbers:
-
-```bash
-llapdiff-baselines practical-extrapolation \
-  --baseline dlinear \
-  --dataset crypto \
-  --quick \
-  --baseline-source-root /path/to/baseline-sources \
-  --output-dir ldt/results/baseline_runs
-```
-
-MR-Diff can be selected with `--baseline mr-diff` without `--baseline-source-root`. Use explicit caps such as `--max-entities`, `--max-train-batches`, or `--max-eval-batches` only for debugging; passing `0` to these cap flags means no cap.
+MR-Diff can be selected with `--baseline mr-diff` without `--baseline-source-root`. For resource scheduling, select one baseline, dataset, or horizon explicitly; the selected scope still uses the full entity panel and full loaders.
 
 ## Repository layout
 

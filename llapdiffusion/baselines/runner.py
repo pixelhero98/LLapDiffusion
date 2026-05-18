@@ -17,52 +17,33 @@ from llapdiffusion.baselines.data import (
     context_target_mask,
     find_batch,
     load_dataset_loaders,
-    normalize_cap,
-    select_stable_entities,
-    slice_entities,
     target_mask,
 )
 from llapdiffusion.baselines.features import target_context
-from llapdiffusion.baselines.metrics import finite_or_none, masked_error_sums, masked_mse, sample_crps_sums
+from llapdiffusion.baselines.metrics import masked_error_sums, masked_mse, sample_crps_sums
 from llapdiffusion.baselines.registry import (
     BASELINES,
     DATASET_KEYS,
     EXTRAPOLATION_BASELINES,
-    IMPUTATION_BASELINES,
-    BaselineSpec,
 )
 from llapdiffusion.baselines.sources import SourceManager
 from llapdiffusion.configs.dataset_defaults import default_horizons
 
 
 @dataclass(frozen=True)
-class SmokeConfig:
+class TrainConfig:
     source_root: Path | str | None
     output_dir: Path | str | None = None
     work_cache_dir: Path | str | None = None
     device: str = "cuda"
-    max_entities: int | None = 4
-    max_batches: int | None = 30
     seed: int = 42
-    num_samples: int = 4
-    imputation_random_mask_ratio: float = 0.30
-    csdi_imputation_target: str = "target"
-    allow_cache_copy: bool = False
-    keep_going: bool = True
-
-
-@dataclass(frozen=True)
-class TrainConfig(SmokeConfig):
-    max_entities: int | None = None
-    max_batches: int | None = None
     num_samples: int = 25
+    imputation_random_mask_ratio: float = 0.30
+    allow_cache_copy: bool = False
     epochs: int = 600
     patience: int = 50
     lr: float = 1e-3
-    max_train_batches: int | None = None
-    max_eval_batches: int | None = None
     horizons: tuple[int, ...] | str | None = "all"
-    csdi_imputation_target: str = "target"
 
 
 def set_seed(seed: int) -> None:
@@ -95,7 +76,7 @@ def _selected_horizons(dataset: str, config: TrainConfig) -> tuple[int, ...]:
     supported = tuple(int(h) for h in default_horizons(dataset))
     requested = config.horizons
     if requested is None:
-        return (max(supported),)
+        return supported
     if isinstance(requested, str):
         if requested != "all":
             raise ValueError("horizons must be 'all' or a sequence of supported integers")
@@ -154,15 +135,11 @@ def _has_supervision(
     key: str,
     batch,
     dataset_info: dict[str, object],
-    *,
-    csdi_imputation_target: str = "target",
 ) -> bool:
     if key == "csdi":
         has_context = bool(context_target_mask(batch[2], batch[0][0], dataset_info).any().detach().cpu().item())
-        if csdi_imputation_target == "target":
-            has_target = bool(target_mask(batch[2], batch[1]).any().detach().cpu().item())
-            return has_context and has_target
-        return has_context
+        has_target = bool(target_mask(batch[2], batch[1]).any().detach().cpu().item())
+        return has_context and has_target
     return bool(target_mask(batch[2], batch[1]).any().detach().cpu().item())
 
 
@@ -200,7 +177,7 @@ def _evaluate_batch(model, key: str, batch, dataset_info: dict[str, object]):
         sample_shape = list(samples.shape)
         target_shape = list(observed.shape)
         metric_valid = target_mask_csdi.to(dtype=torch.bool)
-        metric_target_type = getattr(model, "metric_target_type", "context_imputation_holdout")
+        metric_target_type = getattr(model, "metric_target_type", "target_horizon_imputation")
         metric_sums = sample_crps_sums(samples, observed, metric_valid)
         crps = metric_sums["crps_sum"] / metric_sums["count"].clamp_min(1.0)
         mse = metric_sums["sq_sum"] / metric_sums["count"].clamp_min(1.0)
@@ -230,100 +207,11 @@ def _evaluate_batch(model, key: str, batch, dataset_info: dict[str, object]):
     }
 
 
-def run_baseline_smoke(baseline: str, dataset: str, config: SmokeConfig) -> dict[str, object]:
-    set_seed(config.seed)
-    device = resolve_device(config.device)
-    source_manager = SourceManager(config.source_root)
-    spec = BASELINES[baseline]
-    source = source_manager.validate(spec)
-    loader, dataset_info = load_dataset_loaders(
-        dataset,
-        split="train",
-        allow_cache_copy=config.allow_cache_copy,
-        work_cache_dir=Path(config.work_cache_dir).expanduser().resolve() if config.work_cache_dir else None,
-    )
-    batch, selected_entities, skipped = find_batch(
-        loader,
-        dataset_info,
-        device,
-        config.max_entities,
-        config.max_batches,
-        require_future_target=baseline != "csdi" or config.csdi_imputation_target == "target",
-    )
-
-    start = time.time()
-    model = build_adapter(
-        baseline,
-        dataset_info,
-        batch,
-        source_manager,
-        device,
-        num_samples=config.num_samples,
-        imputation_random_mask_ratio=_validate_imputation_random_mask_ratio(config.imputation_random_mask_ratio),
-        csdi_imputation_target=config.csdi_imputation_target,
-    ).to(device)
-    model.train()
-    eval_row = _evaluate_batch(model, baseline, batch, dataset_info)
-    loss = eval_row.pop("loss_tensor")
-    if not torch.isfinite(loss):
-        raise RuntimeError(f"{baseline}/{dataset}: non-finite smoke loss")
-    loss.backward()
-    grad_ok = any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters() if p.requires_grad)
-    if not grad_ok:
-        raise RuntimeError(f"{baseline}/{dataset}: no finite gradient")
-
-    return {
-        "status": "ok",
-        "baseline": baseline,
-        "placement": spec.placement,
-        "dataset": dataset,
-        "metric_type": spec.metric_type,
-        "time_handling": spec.time_handling,
-        "probabilistic": spec.probabilistic,
-        **_source_row(source),
-        "window": dataset_info["window"],
-        "horizon": dataset_info["horizon"],
-        "dataset_lengths": dataset_info["lengths"],
-        "copied_cache": dataset_info["copied_cache"],
-        "selected_entities": selected_entities,
-        "num_entities_used": int(batch[0][0].shape[1]) if selected_entities is None else len(selected_entities),
-        "skipped_zero_valid_batches": skipped,
-        **eval_row,
-        "loss": finite_or_none(loss.detach().cpu().item()),
-        "mse": finite_or_none(eval_row["mse_tensor"].detach().cpu().item()) if torch.is_tensor(eval_row["mse_tensor"]) else None,
-        "mae": finite_or_none(eval_row["mae_tensor"].detach().cpu().item()) if torch.is_tensor(eval_row["mae_tensor"]) else None,
-        "crps": finite_or_none(eval_row["crps_tensor"].detach().cpu().item()) if torch.is_tensor(eval_row["crps_tensor"]) else None,
-        "runtime_seconds": time.time() - start,
-        "device": str(device),
-    } | {k: v for k, v in eval_row.items() if not k.endswith("_tensor")}
-
-
-def run_baseline_matrix(baselines: Sequence[str], datasets: Sequence[str], config: SmokeConfig) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    failures: list[dict[str, object]] = []
-    for dataset in datasets:
-        for baseline in baselines:
-            try:
-                row = run_baseline_smoke(baseline, dataset, config)
-                print(f"OK {baseline}/{dataset} loss={row['loss']} mse={row['mse']} crps={row['crps']}", flush=True)
-            except Exception as exc:
-                row = {"status": "failed", "baseline": baseline, "dataset": dataset, "error": f"{type(exc).__name__}: {exc}"}
-                failures.append(row)
-                print(f"FAIL {baseline}/{dataset}: {row['error']}", flush=True)
-                if not config.keep_going:
-                    rows.append(row)
-                    raise RuntimeError(f"{baseline}/{dataset} baseline smoke check failed") from exc
-            rows.append(row)
-    if failures and not config.keep_going:
-        raise RuntimeError(f"{len(failures)} baseline smoke checks failed")
-    return rows
-
-
 def _jsonable(row: dict[str, object]) -> dict[str, object]:
     return {k: (asdict(v) if hasattr(v, "__dataclass_fields__") else v) for k, v in row.items() if not k.endswith("_tensor")}
 
 
-def _config_payload(config: SmokeConfig) -> dict[str, object]:
+def _config_payload(config: TrainConfig) -> dict[str, object]:
     payload = asdict(config)
     payload["source_root"] = "<external-baseline-source-root>"
     if payload.get("output_dir") is not None:
@@ -346,7 +234,7 @@ def _flatten_csv_row(row: dict[str, object]) -> dict[str, object]:
     return flat
 
 
-def write_rows(rows: Sequence[dict[str, object]], output: Path | str, *, prefix: str = "baseline_pool_smoke") -> None:
+def write_rows(rows: Sequence[dict[str, object]], output: Path | str, *, prefix: str = "baseline_practical") -> None:
     out = output_dir(output)
     json_rows = [_jsonable(r) for r in rows]
     csv_rows = [_flatten_csv_row(r) for r in json_rows]
@@ -362,10 +250,6 @@ def write_rows(rows: Sequence[dict[str, object]], output: Path | str, *, prefix:
         "horizon",
         "entity_selection_mode",
         "num_entities_used",
-        "entity_cap",
-        "batch_scan_cap",
-        "train_batch_cap",
-        "eval_batch_cap",
         "valid_observations",
         "loss",
         "mse",
@@ -406,10 +290,7 @@ def _evaluate_loader(
     loader,
     dataset_info: dict[str, object],
     device: torch.device,
-    max_batches: int | None,
-    selected_entities: Sequence[int] | None,
 ) -> dict[str, object]:
-    max_batches = normalize_cap(max_batches, "max_batches")
     loss_total = 0.0
     raw_batches = 0
     valid_batches = 0
@@ -418,20 +299,13 @@ def _evaluate_loader(
     sq_sum = 0.0
     crps_sum = 0.0
     crps_count = 0.0
-    metric_target_type = "context_imputation_holdout" if key == "csdi" else "forecast_horizon"
+    metric_target_type = "target_horizon_imputation" if key == "csdi" else "forecast_horizon"
     model.eval()
     with torch.no_grad():
         for raw in loader:
             raw_batches += 1
             batch = batch_to_device(raw, device)
-            if selected_entities is not None:
-                batch = slice_entities(batch, selected_entities)
-            if not _has_supervision(
-                key,
-                batch,
-                dataset_info,
-                csdi_imputation_target=getattr(model, "imputation_target", "target"),
-            ):
+            if not _has_supervision(key, batch, dataset_info):
                 continue
             row = _evaluate_batch(model, key, batch, dataset_info)
             metric_target_type = str(row.get("metric_target_type", metric_target_type))
@@ -451,8 +325,6 @@ def _evaluate_loader(
                 crps_count += count
             valid_observations += count
             valid_batches += 1
-            if max_batches is not None and valid_batches >= max_batches:
-                break
     if valid_batches == 0 or valid_observations <= 0:
         raise RuntimeError(f"{key}/{dataset_info['dataset']}: no valid evaluation batches")
     return {
@@ -492,27 +364,15 @@ def run_practical_one(
     source = source_manager.validate(spec)
     loaders, dataset_info = load_dataset_loaders(
         dataset,
-        split="all",
         horizon=horizon,
         allow_cache_copy=config.allow_cache_copy,
         work_cache_dir=Path(config.work_cache_dir).expanduser().resolve() if config.work_cache_dir else None,
     )
     train_dl, val_dl, test_dl = loaders
-    selected_entities = select_stable_entities(
-        (train_dl, val_dl),
-        dataset_info,
-        device,
-        config.max_entities,
-        config.max_batches,
-    )
-    sample_batch, selected_entities, _ = find_batch(
+    sample_batch, _ = find_batch(
         train_dl,
         dataset_info,
         device,
-        config.max_entities,
-        config.max_batches,
-        require_future_target=baseline != "csdi" or config.csdi_imputation_target == "target",
-        selected_entities=selected_entities,
     )
     model = build_adapter(
         baseline,
@@ -522,7 +382,6 @@ def run_practical_one(
         device,
         num_samples=config.num_samples,
         imputation_random_mask_ratio=_validate_imputation_random_mask_ratio(config.imputation_random_mask_ratio),
-        csdi_imputation_target=config.csdi_imputation_target,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     run_dir = output_dir(run_root) / f"{baseline}_{dataset}_h{dataset_info['horizon']}"
@@ -538,17 +397,9 @@ def run_practical_one(
         model.train()
         train_loss = 0.0
         train_batches = 0
-        train_cap = normalize_cap(config.max_train_batches, "max_train_batches")
         for raw in train_dl:
             batch = batch_to_device(raw, device)
-            if selected_entities is not None:
-                batch = slice_entities(batch, selected_entities)
-            if not _has_supervision(
-                baseline,
-                batch,
-                dataset_info,
-                csdi_imputation_target=config.csdi_imputation_target,
-            ):
+            if not _has_supervision(baseline, batch, dataset_info):
                 continue
             optimizer.zero_grad(set_to_none=True)
             loss = _loss_for_training(model, baseline, batch, dataset_info)
@@ -558,12 +409,10 @@ def run_practical_one(
             optimizer.step()
             train_loss += float(loss.detach().cpu().item())
             train_batches += 1
-            if train_cap is not None and train_batches >= train_cap:
-                break
         if train_batches == 0:
             raise RuntimeError(f"{baseline}/{dataset}: no valid training batches")
 
-        val = _evaluate_loader(model, baseline, val_dl, dataset_info, device, config.max_eval_batches, selected_entities)
+        val = _evaluate_loader(model, baseline, val_dl, dataset_info, device)
         epoch_row = {"epoch": epoch, "train_loss": train_loss / train_batches, "train_batches": train_batches, "val": val}
         history.append(epoch_row)
         print(
@@ -583,9 +432,8 @@ def run_practical_one(
 
     if best_path.exists():
         model.load_state_dict(torch.load(best_path, map_location=device))
-    test = _evaluate_loader(model, baseline, test_dl, dataset_info, device, config.max_eval_batches, selected_entities)
-    num_entities_used = int(sample_batch[0][0].shape[1]) if selected_entities is None else len(selected_entities)
-    entity_selection_mode = "full_panel" if selected_entities is None else "stable_context_coverage_cap_train_val"
+    test = _evaluate_loader(model, baseline, test_dl, dataset_info, device)
+    num_entities_used = int(sample_batch[0][0].shape[1])
     loader_batches = {"train": _loader_length(train_dl), "val": _loader_length(val_dl), "test": _loader_length(test_dl)}
     result = {
         "status": "ok",
@@ -598,13 +446,8 @@ def run_practical_one(
         "horizon": dataset_info["horizon"],
         "dataset_lengths": dataset_info["lengths"],
         "copied_cache": dataset_info["copied_cache"],
-        "selected_entities": selected_entities,
-        "entity_selection_mode": entity_selection_mode,
+        "entity_selection_mode": "full_panel",
         "num_entities_used": num_entities_used,
-        "entity_cap": normalize_cap(config.max_entities, "max_entities"),
-        "batch_scan_cap": normalize_cap(config.max_batches, "max_batches"),
-        "train_batch_cap": normalize_cap(config.max_train_batches, "max_train_batches"),
-        "eval_batch_cap": normalize_cap(config.max_eval_batches, "max_eval_batches"),
         "loader_batches": loader_batches,
         "train_config": _config_payload(config),
         "best_epoch": best_epoch,
@@ -638,7 +481,6 @@ def write_isambard_jobs(
     datasets: Iterable[str] = DATASET_KEYS,
     baselines: Iterable[str] = EXTRAPOLATION_BASELINES,
     horizons: Iterable[int] | str | None = None,
-    quick: bool = False,
     time_limit: str = "08:00:00",
 ) -> list[Path]:
     out = output_dir(output)
@@ -666,7 +508,6 @@ def write_isambard_jobs(
         for horizon in selected_horizons:
             for baseline in selected_baselines:
                 source_arg = f"--baseline-source-root {source_root} " if source_root and not BASELINES[baseline].first_party else ""
-                quick_arg = "--quick " if quick else ""
                 script = out / f"llapdiff_{baseline}_{dataset}_h{horizon}.sh"
                 script.write_text(
                     "#!/bin/bash\n"
@@ -680,7 +521,6 @@ def write_isambard_jobs(
                     "nvidia-smi\n"
                     "llapdiff-baselines practical-extrapolation "
                     f"--baseline {baseline} --dataset {dataset} --horizons {horizon} "
-                    f"{quick_arg}"
                     f"{source_arg}"
                     "--output-dir ${SCRATCHDIR:-$PWD}/llapdiffusion_baselines/runs "
                     "--allow-cache-copy --work-cache-dir ${SCRATCHDIR:-$PWD}/llapdiffusion_baselines/cache_work\n",
