@@ -175,12 +175,13 @@ def _flatten_dt(
     key: str,
 ) -> Optional[torch.Tensor]:
     """
-    Reduce per-entity relative-time deltas to a per-batch timeline.
+    Reduce per-entity time offsets to a per-batch query grid.
 
-    The dataloader/collate provides ``delta_t`` and ``delta_t_y`` as [B,N,L]. The set-VAE + diffusion
-    operate at the batch level (B), so we collapse the entity dimension via a masked mean over entities
-    present in ``mask_bn``. Callers pass a context/entity-valid mask; this
-    function must not inspect future target values or target masks.
+    The dataloader/collate provides context ``delta_t`` relative to the first context timestamp and
+    target/query ``delta_t_y`` relative to the last context timestamp, both as [B,N,L]. The set-VAE
+    + diffusion operate at the batch level (B), so we collapse the entity dimension via a masked mean
+    over entities present in ``mask_bn`` without re-centering. Callers pass a context/entity-valid mask;
+    this function must not inspect future target values or target masks.
     """
     delta_t = meta.get(key)
     if delta_t is None:

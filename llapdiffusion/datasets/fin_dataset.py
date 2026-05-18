@@ -270,9 +270,56 @@ def _infer_native_time_scale(paths: CachePaths, assets: Sequence[str], meta: dic
     return "1s", 1.0
 
 
+def _compute_time_offsets_from_anchor(
+    times: np.ndarray,
+    anchor_time,
+    native_scale_seconds: float,
+) -> np.ndarray:
+    """
+    Return offsets from ``anchor_time`` measured in native time units.
+
+    For daily data, ``times=[t1, t4]`` and ``anchor_time=t0`` returns ``[1, 4]``.
+    """
+    if times is None:
+        return np.array([], dtype=np.float32)
+
+    arr = np.asarray(times)
+    if arr.size == 0:
+        return np.array([], dtype=np.float32)
+
+    if np.issubdtype(arr.dtype, np.number):
+        values = arr.astype(np.float32, copy=False)
+        anchor = float(np.asarray(anchor_time, dtype=np.float32).reshape(-1)[0])
+        return (values - anchor).astype(np.float32, copy=False)
+
+    if np.issubdtype(arr.dtype, np.datetime64):
+        t_sec = arr.astype("datetime64[s]").astype(np.int64)
+        anchor_sec = np.asarray(anchor_time).astype("datetime64[s]").astype(np.int64)
+        rel_sec = (t_sec - anchor_sec).astype(np.float32)
+
+        scale = float(native_scale_seconds)
+        if not np.isfinite(scale) or scale <= 0:
+            scale = 1.0
+
+        return (rel_sec / scale).astype(np.float32, copy=False)
+
+    try:
+        values = arr.astype(np.float32, copy=False)
+        anchor = float(np.asarray(anchor_time, dtype=np.float32).reshape(-1)[0])
+        return (values - anchor).astype(np.float32, copy=False)
+    except (TypeError, ValueError):
+        t_sec = arr.astype("datetime64[s]").astype(np.int64)
+        anchor_sec = np.asarray(anchor_time).astype("datetime64[s]").astype(np.int64)
+        rel_sec = (t_sec - anchor_sec).astype(np.float32)
+        scale = float(native_scale_seconds)
+        if not np.isfinite(scale) or scale <= 0:
+            scale = 1.0
+        return (rel_sec / scale).astype(np.float32, copy=False)
+
+
 def _compute_relative_time_deltas(times: np.ndarray, native_scale_seconds: float) -> np.ndarray:
     """
-    Return *relative* time offsets (not raw first differences), measured in native time units.
+    Return context-window-relative time offsets, measured in native time units.
 
     Example (daily data):
       times = [t0, t1, t2] -> [0, 1, 2]
@@ -284,14 +331,7 @@ def _compute_relative_time_deltas(times: np.ndarray, native_scale_seconds: float
     if arr.size == 0:
         return np.array([], dtype=np.float32)
 
-    t_sec = arr.astype("datetime64[s]").astype(np.int64)
-    rel_sec = (t_sec - t_sec[0]).astype(np.float32)
-
-    scale = float(native_scale_seconds)
-    if not np.isfinite(scale) or scale <= 0:
-        scale = 1.0
-
-    return (rel_sec / scale).astype(np.float32, copy=False)
+    return _compute_time_offsets_from_anchor(arr, arr.reshape(-1)[0], native_scale_seconds)
 
 
 def build_calendar_frame(idx: pd.DatetimeIndex, cfg: CalendarConfig) -> pd.DataFrame:
@@ -909,11 +949,7 @@ def make_collate_level_and_firstdiff(
                 ctx_t = ctx_times_list[j]
                 if ctx_t is not None and len(ctx_t) == K:
                     # NOTE: native scale is expected to be already handled upstream if you store relative units.
-                    try:
-                        t0 = ctx_t.astype("datetime64[s]").astype(np.int64)
-                        delta_t[row, aid] = (t0 - t0[0]).astype(np.float32)
-                    except Exception:
-                        delta_t[row, aid] = np.asarray(ctx_t, dtype=np.float32)
+                    delta_t[row, aid] = _compute_relative_time_deltas(ctx_t, native_scale_seconds=1.0)
 
             dt_y = delta_t_y_list[j]
             if dt_y is not None:
@@ -923,11 +959,15 @@ def make_collate_level_and_firstdiff(
             else:
                 yt = y_times_list[j]
                 if yt is not None and len(yt) == H:
-                    try:
-                        t1 = yt.astype("datetime64[s]").astype(np.int64)
-                        delta_t_y[row, aid] = (t1 - t1[0]).astype(np.float32)
-                    except Exception:
-                        delta_t_y[row, aid] = np.asarray(yt, dtype=np.float32)
+                    ctx_t = ctx_times_list[j]
+                    anchor = None
+                    if ctx_t is not None:
+                        ctx_arr = np.asarray(ctx_t)
+                        if ctx_arr.size > 0:
+                            anchor = ctx_arr.reshape(-1)[-1]
+                    if anchor is None:
+                        raise ValueError("Cannot infer delta_t_y from y_times without ctx_times or explicit delta_t_y")
+                    delta_t_y[row, aid] = _compute_time_offsets_from_anchor(yt, anchor, native_scale_seconds=1.0)
 
         xb = (
             torch.from_numpy(V_full),  # [B,N,K,F]
@@ -1069,7 +1109,11 @@ class _IndexBackedDataset(Dataset):
         # Relative time deltas for context (K) and forecast horizon (H).
         # Always store these because diffusion/Laplace evaluation needs dt for irregular sampling.
         meta['delta_t'] = _compute_relative_time_deltas(Tf[s:e], self.native_time_scale_seconds)
-        meta['delta_t_y'] = _compute_relative_time_deltas(Tf[e:e+self.horizon], self.native_time_scale_seconds)
+        meta['delta_t_y'] = _compute_time_offsets_from_anchor(
+            Tf[e:e+self.horizon],
+            Tf[e-1],
+            self.native_time_scale_seconds,
+        )
         if self.keep_time_meta != 'none':
             if self.keep_time_meta == 'full':
                 meta['ctx_times'] = Tf[s:e]

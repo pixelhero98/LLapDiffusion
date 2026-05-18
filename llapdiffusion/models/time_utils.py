@@ -3,8 +3,14 @@ from __future__ import annotations
 import torch
 
 
-def relative_time_offsets(dt: torch.Tensor, *, time_dim: int = 1, tol: float = 1e-6) -> torch.Tensor:
-    """Convert time metadata to window-local relative offsets."""
+def relative_time_offsets(
+    dt: torch.Tensor,
+    *,
+    time_dim: int = 1,
+    tol: float = 1e-6,
+    recenter: bool = True,
+) -> torch.Tensor:
+    """Validate monotone time metadata and optionally recenter to the first timestamp."""
 
     if dt.dim() < 2:
         raise ValueError(f"dt must have at least 2 dims with a time dimension, got {tuple(dt.shape)}")
@@ -25,5 +31,5 @@ def relative_time_offsets(dt: torch.Tensor, *, time_dim: int = 1, tol: float = 1
         if not (moved[:, 1:] - moved[:, :-1] >= -float(tol)).all():
             raise ValueError("dt must be nondecreasing along the time dimension")
 
-    out = moved - moved[:, :1]
+    out = moved - moved[:, :1] if recenter else moved
     return out.movedim(1, time_dim) if time_dim != 1 else out

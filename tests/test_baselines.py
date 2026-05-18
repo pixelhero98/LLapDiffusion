@@ -352,6 +352,96 @@ def test_csdi_target_horizon_mask_hides_only_future_tokens():
     assert kept[:, 3:, :].sum().item() == 4.0
 
 
+def test_csdi_timepoints_use_context_end_relative_future_offsets():
+    from llapdiffusion.baselines.adapters.csdi import CSDIAdapter
+
+    adapter = CSDIAdapter.__new__(CSDIAdapter)
+    adapter.imputation_random_mask_ratio = 0.50
+    batch = _sample_baseline_batch(batch_size=1, entities=1, context=3, horizon=3)
+    (V, T), y, meta = batch
+    meta = {k: v.clone() if torch.is_tensor(v) else v for k, v in meta.items()}
+    meta["delta_t"] = torch.tensor([[[0.0, 1.0, 4.0]]])
+    meta["delta_t_y"] = torch.tensor([[[1.0, 4.0, 5.0]]])
+    batch = (V, T), y, meta
+
+    csdi_batch = adapter._batch(batch, _sample_dataset_info(context=3, horizon=3))
+
+    expected = torch.tensor([[0.0, 1.0, 4.0, 5.0, 8.0, 9.0]]) / 9.0
+    assert torch.allclose(csdi_batch["timepoints"], expected)
+
+
+def test_csdi_timepoints_ignore_padded_entity_offsets():
+    from llapdiffusion.baselines.adapters.csdi import CSDIAdapter
+
+    adapter = CSDIAdapter.__new__(CSDIAdapter)
+    adapter.imputation_random_mask_ratio = 0.50
+    batch = _sample_baseline_batch(batch_size=1, entities=2, context=3, horizon=2)
+    (V, T), y, meta = batch
+    meta = {k: v.clone() if torch.is_tensor(v) else v for k, v in meta.items()}
+    meta["entity_mask"] = torch.tensor([[True, False]])
+    meta["delta_t"] = torch.tensor([[[0.0, 2.0, 4.0], [0.0, 0.0, 0.0]]])
+    meta["delta_t_y"] = torch.tensor([[[1.0, 3.0], [0.0, 0.0]]])
+    batch = (V, T), y, meta
+
+    csdi_batch = adapter._batch(batch, _sample_dataset_info(context=3, horizon=2))
+
+    expected = torch.tensor([[0.0, 2.0, 4.0, 5.0, 7.0]]) / 7.0
+    assert torch.allclose(csdi_batch["timepoints"], expected)
+
+
+def test_baseline_future_time_features_preserve_nonuniform_query_grid():
+    from llapdiffusion.baselines.features import time_features
+
+    batch = _sample_baseline_batch(batch_size=1, entities=1, context=3, horizon=3)
+    (V, _), _, meta = batch
+    meta = {k: v.clone() if torch.is_tensor(v) else v for k, v in meta.items()}
+    meta["delta_t_y"] = torch.tensor([[[1.0, 4.0, 5.0]]])
+
+    _, _, ty = time_features(meta, V)
+
+    assert torch.allclose(ty[0, 0], torch.tensor([0.2, 0.8, 1.0]))
+
+
+def test_csdi_loss_and_samples_returns_target_horizon_mask():
+    from llapdiffusion.baselines.adapters.csdi import CSDIAdapter
+
+    class FakeCSDI(torch.nn.Module):
+        def process_data(self, batch):
+            observed_data = batch["observed_data"].float().permute(0, 2, 1)
+            observed_mask = batch["observed_mask"].float().permute(0, 2, 1)
+            observed_tp = batch["timepoints"].float()
+            gt_mask = batch["gt_mask"].float().permute(0, 2, 1)
+            return observed_data, observed_mask, observed_tp, gt_mask, None
+
+        def get_side_info(self, observed_tp, gt_mask):
+            return torch.zeros_like(gt_mask)
+
+        def calc_loss(self, observed_data, gt_mask, observed_mask, side_info, is_train=1):
+            return (observed_mask - gt_mask).sum()
+
+        def evaluate(self, batch, n_samples=1):
+            observed_data, observed_mask, observed_tp, gt_mask = self.process_data(batch)[:4]
+            samples = observed_data.unsqueeze(0).expand(n_samples, -1, -1, -1).contiguous()
+            target_mask = observed_mask - gt_mask
+            return samples, observed_data, target_mask, observed_mask, observed_tp
+
+    adapter = CSDIAdapter.__new__(CSDIAdapter)
+    torch.nn.Module.__init__(adapter)
+    adapter.model = FakeCSDI()
+    adapter.num_samples = 2
+    adapter.imputation_random_mask_ratio = 0.50
+    batch = _sample_baseline_batch(batch_size=1, entities=2, context=3, horizon=4)
+
+    torch.manual_seed(13)
+    loss, samples, observed, target_mask = adapter.loss_and_samples(batch, _sample_dataset_info(context=3, horizon=4))
+
+    assert torch.isfinite(loss)
+    assert samples.shape == (1, 2, 2, 7)
+    assert observed.shape == (1, 2, 7)
+    assert target_mask[:, :, :3].sum().item() == 0.0
+    assert target_mask[:, :, 3:].sum().item() == 4.0
+
+
 def test_csdi_target_horizon_mask_hides_sparse_future_token():
     from llapdiffusion.baselines.adapters.csdi import CSDIAdapter
 

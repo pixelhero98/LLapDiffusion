@@ -60,8 +60,20 @@ class CSDIAdapter(nn.Module):
         return gt_mask
 
     def _target_timepoints(self, meta, V: torch.Tensor, context_length: int) -> torch.Tensor:
-        dt = meta["delta_t"].to(device=V.device, dtype=V.dtype).mean(dim=1)
-        dt_y = meta["delta_t_y"].to(device=V.device, dtype=V.dtype).mean(dim=1)
+        def _masked_mean(values: torch.Tensor) -> torch.Tensor:
+            entity_mask = meta.get("entity_mask")
+            if entity_mask is None:
+                return values.mean(dim=1)
+            mask = entity_mask.to(device=values.device, dtype=torch.bool)
+            if tuple(mask.shape) != tuple(values.shape[:2]):
+                raise ValueError(
+                    f"entity_mask shape {tuple(mask.shape)} does not match time metadata shape {tuple(values.shape[:2])}"
+                )
+            weights = mask.to(dtype=values.dtype).unsqueeze(-1)
+            return (values * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+        dt = _masked_mean(meta["delta_t"].to(device=V.device, dtype=V.dtype))
+        dt_y = _masked_mean(meta["delta_t_y"].to(device=V.device, dtype=V.dtype))
         future = dt[:, -1:].clamp_min(0.0) + dt_y.clamp_min(0.0)
         combined = torch.cat([dt, future], dim=1)
         denom = combined.amax(dim=1, keepdim=True).clamp_min(1.0)

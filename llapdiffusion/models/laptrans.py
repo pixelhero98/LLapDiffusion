@@ -173,17 +173,21 @@ class LaplaceTransformEncoder(nn.Module):
         dt: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return relative time t_rel with t_rel[:,0]=0, shape [B,T,1]."""
+        """Return model time coordinates with shape [B,T,1].
+
+        Explicit ``t`` values are absolute timestamps and are recentered to the first query.
+        Explicit ``dt`` values are already-relative query offsets and are preserved.
+        """
         if t is not None:
             t = t.to(device=device, dtype=dtype)
             if t.dim() == 2:
                 t = t.unsqueeze(-1)
-            return t - t[:, :1]
+            return relative_time_offsets(t, time_dim=1, recenter=True)
         if dt is not None:
             dt = dt.to(device=device, dtype=dtype)
             if dt.dim() == 2:
                 dt = dt.unsqueeze(-1)
-            return relative_time_offsets(dt, time_dim=1)
+            return relative_time_offsets(dt, time_dim=1, recenter=False)
         return torch.arange(T, device=device, dtype=dtype).view(1, T, 1).expand(B, T, 1)
 
     @staticmethod

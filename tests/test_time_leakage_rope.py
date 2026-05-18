@@ -3,6 +3,7 @@ import sys
 import zipfile
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -35,10 +36,109 @@ def test_irregular_relative_offset_dt_is_preserved():
     assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 4.0, 5.0]]))
 
 
+def test_relative_time_offsets_can_preserve_supplied_query_offsets():
+    dt = torch.tensor([[[1.0], [4.0], [5.0]]])
+    rel_t = relative_time_offsets(dt, recenter=False)
+    assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[1.0, 4.0, 5.0]]))
+
+
 def test_laplace_ae_uses_shared_time_offsets():
     dt = torch.tensor([[[0.0], [1.0], [4.0], [5.0]]])
     rel_t = LaplaceAE._relative_time_from_dt(dt)
     assert torch.allclose(rel_t, relative_time_offsets(dt))
+
+
+def test_index_backed_dataset_target_offsets_are_context_end_relative():
+    from llapdiffusion.datasets.fin_dataset import _IndexBackedDataset
+
+    ds = _IndexBackedDataset.__new__(_IndexBackedDataset)
+    ds.pairs = np.asarray([[0, 0]], dtype=np.int64)
+    ds.assets = ["asset"]
+    ds.window = 3
+    ds.horizon = 3
+    ds.regression = True
+    ds.keep_time_meta = "full"
+    ds.clamp_sigma = 10.0
+    ds.per_ticker = False
+    ds.mean_x = np.zeros((1, 1, 1), dtype=np.float32)
+    ds.std_x = np.ones((1, 1, 1), dtype=np.float32)
+    ds.mean_y = 0.0
+    ds.std_y = 1.0
+    ds.native_time_scale_seconds = 86400.0
+    ds.native_time_scale_name = "1D"
+
+    features = np.arange(6, dtype=np.float32).reshape(6, 1)
+    targets = np.arange(6, dtype=np.float32)
+    times = np.array(
+        ["2026-01-10", "2026-01-11", "2026-01-14", "2026-01-15", "2026-01-18", "2026-01-19"],
+        dtype="datetime64[D]",
+    )
+    ds._get_arrays = lambda aid: (features, targets, times, None, None)
+
+    _, _, meta = ds[0]
+
+    assert np.allclose(meta["delta_t"], np.array([0.0, 1.0, 4.0], dtype=np.float32))
+    assert np.allclose(meta["delta_t_y"], np.array([1.0, 4.0, 5.0], dtype=np.float32))
+
+
+def test_collate_target_time_fallback_anchors_at_context_end():
+    from llapdiffusion.datasets.fin_dataset import make_collate_level_and_firstdiff
+
+    collate = make_collate_level_and_firstdiff(n_entities=1)
+    _, _, meta = collate(
+        [
+            {
+                "asset_id": 0,
+                "V": np.zeros((3, 1), dtype=np.float32),
+                "T": np.zeros((3, 1), dtype=np.float32),
+                "y": np.zeros(3, dtype=np.float32),
+                "ctx_times": np.array([10, 11, 14]),
+                "y_times": np.array([15, 18, 19]),
+            }
+        ]
+    )
+
+    assert torch.allclose(meta["delta_t"][0, 0], torch.tensor([0.0, 1.0, 4.0]))
+    assert torch.allclose(meta["delta_t_y"][0, 0], torch.tensor([1.0, 4.0, 5.0]))
+
+
+def test_collate_datetime_time_fallback_anchors_at_context_end_in_seconds():
+    from llapdiffusion.datasets.fin_dataset import make_collate_level_and_firstdiff
+
+    collate = make_collate_level_and_firstdiff(n_entities=1)
+    _, _, meta = collate(
+        [
+            {
+                "asset_id": 0,
+                "V": np.zeros((3, 1), dtype=np.float32),
+                "T": np.zeros((3, 1), dtype=np.float32),
+                "y": np.zeros(2, dtype=np.float32),
+                "ctx_times": np.array(["2026-01-10", "2026-01-11", "2026-01-14"], dtype="datetime64[D]"),
+                "y_times": np.array(["2026-01-15", "2026-01-18"], dtype="datetime64[D]"),
+            }
+        ]
+    )
+
+    assert torch.allclose(meta["delta_t"][0, 0], torch.tensor([0.0, 86400.0, 345600.0]))
+    assert torch.allclose(meta["delta_t_y"][0, 0], torch.tensor([86400.0, 345600.0]))
+
+
+def test_collate_target_time_fallback_requires_context_anchor():
+    from llapdiffusion.datasets.fin_dataset import make_collate_level_and_firstdiff
+
+    collate = make_collate_level_and_firstdiff(n_entities=1)
+    with pytest.raises(ValueError, match="Cannot infer delta_t_y"):
+        collate(
+            [
+                {
+                    "asset_id": 0,
+                    "V": np.zeros((3, 1), dtype=np.float32),
+                    "T": np.zeros((3, 1), dtype=np.float32),
+                    "y": np.zeros(2, dtype=np.float32),
+                    "y_times": np.array([15, 18]),
+                }
+            ]
+        )
 
 
 
@@ -325,10 +425,10 @@ def test_laplace_relative_time_preserves_irregular_offsets():
     assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 4.0, 5.0]]))
 
 
-def test_laplace_relative_time_shifts_offset_clock():
-    dt = torch.tensor([[5.0, 6.0, 9.0, 10.0]])
+def test_laplace_relative_time_preserves_context_end_query_offsets():
+    dt = torch.tensor([[1.0, 4.0, 5.0, 9.0]])
     rel_t = LaplaceTransformEncoder.relative_time(1, 4, torch.float32, torch.device("cpu"), dt=dt)
-    assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 4.0, 5.0]]))
+    assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[1.0, 4.0, 5.0, 9.0]]))
 
 
 def test_laplace_relative_time_prefers_explicit_t():
@@ -341,11 +441,11 @@ def test_laplace_relative_time_prefers_explicit_t():
 def test_target_dt_flatten_then_laplace_preserves_offsets():
     from llapdiffusion.trainers import train_val_llapdiff as tv
 
-    meta = {"delta_t_y": torch.tensor([[[0.0, 1.0, 4.0, 5.0], [0.0, 1.0, 4.0, 5.0]]])}
+    meta = {"delta_t_y": torch.tensor([[[1.0, 4.0, 5.0, 9.0], [1.0, 4.0, 5.0, 9.0]]])}
     mask = torch.tensor([[True, True]])
     dt_b = tv._flatten_dt(meta, mask, torch.device("cpu"), key="delta_t_y")
     rel_t = LaplaceTransformEncoder.relative_time(1, 4, torch.float32, torch.device("cpu"), dt=dt_b)
-    assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[0.0, 1.0, 4.0, 5.0]]))
+    assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[1.0, 4.0, 5.0, 9.0]]))
 
 
 def test_target_dt_flatten_does_not_depend_on_target_values():
@@ -353,14 +453,61 @@ def test_target_dt_flatten_does_not_depend_on_target_values():
 
     meta = {
         "delta_t_y": torch.tensor(
-            [[[0.0, 1.0, 2.0, 3.0], [0.0, 2.0, 4.0, 6.0]]]
+            [[[1.0, 2.0, 3.0, 4.0], [1.0, 3.0, 5.0, 7.0]]]
         )
     }
     mask = torch.tensor([[True, True]])
 
     dt_b = tv._flatten_dt(meta, mask, torch.device("cpu"), key="delta_t_y")
 
-    assert torch.allclose(dt_b, torch.tensor([[0.0, 1.5, 3.0, 4.5]]))
+    assert torch.allclose(dt_b, torch.tensor([[1.0, 2.5, 4.0, 5.5]]))
+
+
+def test_llapdiff_generate_forwards_context_end_query_offsets_unchanged():
+    from llapdiffusion.models.llapdiff import LLapDiff
+
+    model = LLapDiff(data_dim=1, hidden_dim=4, num_layers=1, num_heads=1, laplace_k=2, timesteps=4)
+    seen = []
+
+    def fake_forward(x_t, t, **kwargs):
+        seen.append(kwargs["dt"].detach().cpu().clone())
+        return torch.zeros_like(x_t)
+
+    model.forward = fake_forward
+    out = model.generate(
+        (1, 3, 1),
+        steps=1,
+        guidance_strength=1.0,
+        dt=torch.tensor([[1.0, 4.0, 5.0]]),
+    )
+
+    assert out.shape == (1, 3, 1)
+    assert seen
+    assert torch.allclose(seen[0], torch.tensor([[1.0, 4.0, 5.0]]))
+
+
+def test_llapdiff_generate_rejects_invalid_query_dt_shape():
+    from llapdiffusion.models.llapdiff import LLapDiff
+
+    model = LLapDiff(data_dim=1, hidden_dim=4, num_layers=1, num_heads=1, laplace_k=2, timesteps=4)
+    with pytest.raises(ValueError, match="dt shape"):
+        model.generate((1, 3, 1), steps=1, dt=torch.tensor([[1.0, 2.0]]))
+
+
+def test_llapdiff_generate_rejects_nonfinite_query_dt():
+    from llapdiffusion.models.llapdiff import LLapDiff
+
+    model = LLapDiff(data_dim=1, hidden_dim=4, num_layers=1, num_heads=1, laplace_k=2, timesteps=4)
+    with pytest.raises(ValueError, match="finite"):
+        model.generate((1, 3, 1), steps=1, dt=torch.tensor([[1.0, float("nan"), 3.0]]))
+
+
+def test_llapdiff_generate_rejects_decreasing_query_dt():
+    from llapdiffusion.models.llapdiff import LLapDiff
+
+    model = LLapDiff(data_dim=1, hidden_dim=4, num_layers=1, num_heads=1, laplace_k=2, timesteps=4)
+    with pytest.raises(ValueError, match="nondecreasing"):
+        model.generate((1, 3, 1), steps=1, dt=torch.tensor([[1.0, 3.0, 2.0]]))
 
 
 def test_vae_target_mask_excludes_zero_filled_missing_targets():
@@ -638,7 +785,7 @@ def test_forecast_generation_does_not_condition_on_target_values_or_masks():
         meta = {
             "entity_mask": torch.tensor([[True, True]]),
             "delta_t": torch.zeros(1, 2, 3),
-            "delta_t_y": torch.tensor([[[0.0, 1.0, 4.0, 5.0], [0.0, 1.0, 4.0, 5.0]]]),
+            "delta_t_y": torch.tensor([[[1.0, 4.0, 5.0, 9.0], [1.0, 4.0, 5.0, 9.0]]]),
             "x_obs_mask": torch.ones(1, 2, 3, 1, dtype=torch.bool),
             "y_obs_mask": torch.ones(1, 2, 4, dtype=torch.bool),
         }
@@ -662,7 +809,7 @@ def test_forecast_generation_does_not_condition_on_target_values_or_masks():
 
     assert len(diff_model.calls) == 1
     call = diff_model.calls[0]
-    assert torch.allclose(call["dt"], torch.tensor([[0.0, 1.0, 4.0, 5.0]]))
+    assert torch.allclose(call["dt"], torch.tensor([[1.0, 4.0, 5.0, 9.0]]))
     assert "y_obs" not in call
     assert "obs_mask" not in call
 
@@ -687,7 +834,7 @@ def test_imputation_generation_only_uses_intentionally_observed_target_tokens(mo
         "_build_cond_summary_pair",
         lambda *args, **kwargs: (torch.zeros(1, 2, 4), torch.zeros(1, 2, 4)),
     )
-    monkeypatch.setattr(ce.tv, "_flatten_dt", lambda *args, **kwargs: torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
+    monkeypatch.setattr(ce.tv, "_flatten_dt", lambda *args, **kwargs: torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
     monkeypatch.setattr(ce, "pack_targets_tokens", lambda *args, **kwargs: (
         torch.zeros(1, 4, 1, 2),
         torch.zeros(1, 1, dtype=torch.bool),
@@ -701,7 +848,7 @@ def test_imputation_generation_only_uses_intentionally_observed_target_tokens(mo
     meta = {
         "entity_mask": torch.tensor([[True]]),
         "delta_t": torch.zeros(1, 1, 3),
-        "delta_t_y": torch.tensor([[[0.0, 1.0, 2.0, 3.0]]]),
+        "delta_t_y": torch.tensor([[[1.0, 2.0, 3.0, 4.0]]]),
         "x_obs_mask": torch.ones(1, 1, 3, 1, dtype=torch.bool),
         "y_obs_mask": torch.ones(1, 1, 4, dtype=torch.bool),
     }

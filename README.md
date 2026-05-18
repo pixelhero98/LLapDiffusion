@@ -131,6 +131,10 @@ The pipeline and evaluation CLIs also accept `--dataset-zip` and `--dataset-extr
 
 The archive contains compact caches derived from public sources: UCI Air Quality, Beijing Multi-Site Air Quality, PhysioNet Challenge 2012, NOAA ISD, and Yahoo Finance market data through `yfinance`. These cached data are redistributed only for reproducible evaluation convenience; the repository code is MIT-licensed, while each dataset remains governed by its original source terms. Check the upstream dataset pages before redistributing derived caches or using them beyond replication.
 
+### Timestamp convention
+
+Context offsets `delta_t` are relative to the first context timestamp. Target/query offsets `delta_t_y` are relative to the last context timestamp, so a regular daily horizon is `[1, 2, ..., H]` and a gapped query grid with context ending at day 14 and future days `[15, 18, 19]` is `[1, 4, 5]`. Lower-level LLapDiff generation treats `generate(dt=...)` as an already-relative finite, nondecreasing query grid and does not re-zero it. Arbitrary future grids are supported at the model/query-grid level when the requested latent shape matches the checkpoint; public preset training still uses the registered dataset horizons.
+
 ## Controlled synthetic shifts
 
 The repository also includes two generated regime-shift tests:
@@ -208,7 +212,7 @@ The pole plot overlays global/base poles with conditioned effective poles built 
 
 ## Baselines
 
-Baseline adapters are packaged under `llapdiffusion.baselines`. DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, t-PatchGNN, ContiFormer, and CSDI use pinned external upstream repositories; clone those sources outside this repository and pass their parent directory explicitly. `MR-Diff is implemented first-party in this repository from the ICLR 2024 paper, and it has no GitHub repo or official implementation`:
+Baseline adapters are packaged under `llapdiffusion.baselines`. DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, t-PatchGNN, ContiFormer, and CSDI use pinned external upstream repositories; clone those sources outside this repository and pass their parent directory explicitly. MR-Diff is implemented first-party in this repository from the ICLR 2024 paper, and it has no GitHub repo or official implementation:
 
 ```bash
 mkdir -p /path/to/baseline-sources

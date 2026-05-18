@@ -166,6 +166,25 @@ class LLapDiff(nn.Module):
             raise ValueError(
                 f"cond_summary_raw batch mismatch: expected B={B}, got {cond_summary_raw.shape[0]}"
             )
+        if dt is not None:
+            dt = torch.as_tensor(dt, device=device)
+            if not torch.is_floating_point(dt):
+                dt = dt.to(dtype=torch.float32)
+            if dt.dim() == 2:
+                dt_check = dt
+            elif dt.dim() == 3 and dt.size(-1) == 1:
+                dt_check = dt.squeeze(-1)
+            else:
+                raise ValueError(f"dt must have shape [B, L] or [B, L, 1], got {tuple(dt.shape)}")
+            if tuple(dt_check.shape) != (int(B), int(L)):
+                raise ValueError(
+                    f"dt shape must match generation shape (B={int(B)}, L={int(L)}), got {tuple(dt_check.shape)}"
+                )
+            if not torch.isfinite(dt_check).all():
+                raise ValueError("dt must contain only finite values")
+            if dt_check.size(1) > 1:
+                if not (dt_check[:, 1:] - dt_check[:, :-1] >= -1e-6).all():
+                    raise ValueError("dt must be nondecreasing along the time dimension")
 
         n = int(max(1, min(int(steps), T)))
         if n >= T:
