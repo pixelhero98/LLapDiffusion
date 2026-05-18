@@ -85,7 +85,7 @@ def _dataset_name_from_public_path(data_dir: object) -> str:
 
 def resolve_run_experiment(data_dir: object) -> RunExperiment:
     dataset_name = dataset_name_from_data_dir(data_dir) or _dataset_name_from_public_path(data_dir)
-    if dataset_name == "finance":
+    if dataset_name in {"finance", "fin_dataset"}:
         return _import_fin_run_experiment()
     importer = _IMPORTERS.get(dataset_name)
     if importer is None:

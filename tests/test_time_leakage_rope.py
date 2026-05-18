@@ -451,6 +451,21 @@ def test_bundled_dataset_archive_is_used_when_env_is_absent(tmp_path, monkeypatc
     assert resolved == (extract_root / "crypto").resolve()
     assert (resolved / "sample.txt").read_text() == "ok"
 
+
+def test_finance_cache_metadata_resolves_fin_dataset_loader(tmp_path, monkeypatch):
+    from llapdiffusion.configs import dataset_registry
+
+    data_dir = tmp_path / "fin_dataset" / "crypto"
+    meta_dir = data_dir / "cache_ratio_index"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text('{"dataset": "fin_dataset"}', encoding="utf-8")
+
+    marker = object()
+    monkeypatch.setattr(dataset_registry, "_import_fin_run_experiment", lambda: marker)
+
+    assert dataset_registry.resolve_run_experiment(data_dir) is marker
+
+
 def test_laplace_relative_time_preserves_regular_offsets():
     dt = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
     rel_t = LaplaceTransformEncoder.relative_time(1, 4, torch.float32, torch.device("cpu"), dt=dt)
