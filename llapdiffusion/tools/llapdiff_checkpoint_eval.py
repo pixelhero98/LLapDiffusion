@@ -59,6 +59,13 @@ def _make_random_keep(obs_any: torch.Tensor, frac: float, *, generator: torch.Ge
     return _enforce_valid_keep_mask(obs_any, keep)
 
 
+def _validate_random_mask_ratio(value: float) -> float:
+    ratio = float(value)
+    if not 0.0 < ratio < 1.0:
+        raise ValueError("imputation random mask ratio must be in the open interval (0, 1)")
+    return ratio
+
+
 def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, train_dl):
     _, num_entities, window_size, feat_dim = tv._summarize_dataset(train_dl, None)
 
@@ -302,8 +309,13 @@ def evaluate_checkpoint(
     out_path: Optional[str] = None,
     *,
     generator_seed: Optional[int] = None,
+    random_mask_ratio: Optional[float] = None,
 ) -> Dict[str, object]:
     ckpt_path = Path(ckpt_path)
+    if random_mask_ratio is None:
+        random_mask_ratio = float(getattr(cfg, "IMPUTATION_RANDOM_MASK_RATIO", 0.30))
+    random_mask_ratio = _validate_random_mask_ratio(random_mask_ratio)
+    random_keep_frac = 1.0 - random_mask_ratio
     device = set_torch(seed=int(getattr(cfg, "SEED", 42)), deterministic=bool(getattr(cfg, "DETERMINISTIC", False)))
     run_experiment = resolve_run_experiment(cfg.DATA_DIR)
     train_dl, val_dl, test_dl, sizes = run_experiment(
@@ -355,7 +367,7 @@ def evaluate_checkpoint(
     )
     random_keep_generator = torch.Generator(device=device)
     random_keep_generator.manual_seed(1234)
-    random_mask30 = _evaluate_impute_case(
+    random_mask = _evaluate_impute_case(
         test_dl,
         diff_model=diff_model,
         vae=vae,
@@ -363,7 +375,7 @@ def evaluate_checkpoint(
         device=device,
         mu_mean=mu_mean,
         mu_std=mu_std,
-        keep_fn=lambda obs_any: _make_random_keep(obs_any, frac=0.70, generator=random_keep_generator),
+        keep_fn=lambda obs_any: _make_random_keep(obs_any, frac=random_keep_frac, generator=random_keep_generator),
         num_samples=8,
         steps=int(test_sampling["steps"]),
         guidance_strength=test_sampling["guidance_strength"],
@@ -380,13 +392,16 @@ def evaluate_checkpoint(
         "checkpoint": str(ckpt_path),
         "forecast_test": forecast,
         "regular_keep25": regular,
-        "random_mask30": random_mask30,
+        "random_mask_ratio": random_mask_ratio,
+        "random_mask": random_mask,
         "balanced_summary": {
             "avg_hidden_crps": 0.5
-            * (float(regular["hidden_crps"]) + float(random_mask30["hidden_crps"])),
+            * (float(regular["hidden_crps"]) + float(random_mask["hidden_crps"])),
             "passes_forecast_guardrail": None,
         },
     }
+    if abs(random_mask_ratio - 0.30) < 1e-12:
+        result["random_mask30"] = random_mask
     if out_path is not None:
         out_file = Path(out_path)
         out_file.write_text(json.dumps(make_jsonable(result), indent=2))
@@ -421,6 +436,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--label", type=str, default=None, help="Optional label for the evaluation payload.")
     parser.add_argument("--out-json", type=str, default=None, help="Optional JSON output path.")
     parser.add_argument(
+        "--imputation-random-mask-ratio",
+        type=float,
+        default=None,
+        help="Fraction of observed target entries hidden in the random-mask imputation case.",
+    )
+    parser.add_argument(
         "--dataset-zip",
         type=str,
         default=None,
@@ -446,6 +467,7 @@ def main() -> None:
         args.checkpoint,
         label=label,
         out_path=args.out_json,
+        random_mask_ratio=args.imputation_random_mask_ratio,
     )
     print(json.dumps(make_jsonable(result), indent=2))
 

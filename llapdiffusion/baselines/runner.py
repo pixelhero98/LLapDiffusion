@@ -31,6 +31,7 @@ from llapdiffusion.baselines.registry import (
     BaselineSpec,
 )
 from llapdiffusion.baselines.sources import SourceManager
+from llapdiffusion.configs.dataset_defaults import default_horizons
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class SmokeConfig:
     max_batches: int = 30
     seed: int = 42
     num_samples: int = 4
+    imputation_random_mask_ratio: float = 0.30
     allow_cache_copy: bool = False
     keep_going: bool = True
 
@@ -54,6 +56,7 @@ class TrainConfig(SmokeConfig):
     lr: float = 1e-3
     max_train_batches: int = 256
     max_eval_batches: int = 256
+    horizons: tuple[int, ...] | str | None = None
 
 
 def set_seed(seed: int) -> None:
@@ -73,6 +76,31 @@ def output_dir(path: Path | str | None) -> Path:
     out = Path(path or "baseline_results").expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _validate_imputation_random_mask_ratio(value: float) -> float:
+    ratio = float(value)
+    if not 0.0 < ratio < 1.0:
+        raise ValueError("imputation_random_mask_ratio must be in the open interval (0, 1)")
+    return ratio
+
+
+def _selected_horizons(dataset: str, config: TrainConfig) -> tuple[int, ...]:
+    supported = tuple(int(h) for h in default_horizons(dataset))
+    requested = config.horizons
+    if requested is None:
+        return (max(supported),)
+    if isinstance(requested, str):
+        if requested != "all":
+            raise ValueError("horizons must be 'all' or a sequence of supported integers")
+        return supported
+    selected = tuple(int(h) for h in requested)
+    if not selected:
+        raise ValueError("At least one horizon must be selected")
+    invalid = [h for h in selected if h not in supported]
+    if invalid:
+        raise ValueError(f"{dataset}: unsupported horizons {invalid}; supported horizons are {supported}")
+    return selected
 
 
 def notes_payload() -> dict[str, dict[str, object]]:
@@ -189,7 +217,15 @@ def run_baseline_smoke(baseline: str, dataset: str, config: SmokeConfig) -> dict
     )
 
     start = time.time()
-    model = build_adapter(baseline, dataset_info, batch, source_manager, device, num_samples=config.num_samples).to(device)
+    model = build_adapter(
+        baseline,
+        dataset_info,
+        batch,
+        source_manager,
+        device,
+        num_samples=config.num_samples,
+        imputation_random_mask_ratio=_validate_imputation_random_mask_ratio(config.imputation_random_mask_ratio),
+    ).to(device)
     model.train()
     eval_row = _evaluate_batch(model, baseline, batch, dataset_info)
     loss = eval_row.pop("loss_tensor")
@@ -329,7 +365,14 @@ def _evaluate_loader(
     return {k: v / count for k, v in totals.items()} | {"batches": count}
 
 
-def run_practical_one(baseline: str, dataset: str, config: TrainConfig, run_root: Path | str) -> dict[str, object]:
+def run_practical_one(
+    baseline: str,
+    dataset: str,
+    config: TrainConfig,
+    run_root: Path | str,
+    *,
+    horizon: int | None = None,
+) -> dict[str, object]:
     set_seed(config.seed)
     device = resolve_device(config.device)
     source_manager = SourceManager(config.source_root)
@@ -338,6 +381,7 @@ def run_practical_one(baseline: str, dataset: str, config: TrainConfig, run_root
     loaders, dataset_info = load_dataset_loaders(
         dataset,
         split="all",
+        horizon=horizon,
         allow_cache_copy=config.allow_cache_copy,
         work_cache_dir=Path(config.work_cache_dir).expanduser().resolve() if config.work_cache_dir else None,
     )
@@ -358,9 +402,17 @@ def run_practical_one(baseline: str, dataset: str, config: TrainConfig, run_root
         require_future_target=baseline != "csdi",
         selected_entities=selected_entities,
     )
-    model = build_adapter(baseline, dataset_info, sample_batch, source_manager, device, num_samples=config.num_samples).to(device)
+    model = build_adapter(
+        baseline,
+        dataset_info,
+        sample_batch,
+        source_manager,
+        device,
+        num_samples=config.num_samples,
+        imputation_random_mask_ratio=_validate_imputation_random_mask_ratio(config.imputation_random_mask_ratio),
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    run_dir = output_dir(run_root) / f"{baseline}_{dataset}"
+    run_dir = output_dir(run_root) / f"{baseline}_{dataset}_h{dataset_info['horizon']}"
     run_dir.mkdir(parents=True, exist_ok=True)
     best_path = run_dir / "best.pt"
     history = []
@@ -396,7 +448,11 @@ def run_practical_one(baseline: str, dataset: str, config: TrainConfig, run_root
         val = _evaluate_loader(model, baseline, val_dl, dataset_info, device, config.max_eval_batches, selected_entities)
         epoch_row = {"epoch": epoch, "train_loss": train_loss / train_batches, "val": val}
         history.append(epoch_row)
-        print(f"{baseline}/{dataset} epoch={epoch} train_loss={epoch_row['train_loss']:.6f} val_mse={val['mse']:.6f}", flush=True)
+        print(
+            f"{baseline}/{dataset}/h{dataset_info['horizon']} "
+            f"epoch={epoch} train_loss={epoch_row['train_loss']:.6f} val_mse={val['mse']:.6f}",
+            flush=True,
+        )
         if val["mse"] < best_val:
             best_val = val["mse"]
             best_epoch = epoch
@@ -437,7 +493,12 @@ def run_practical_one(baseline: str, dataset: str, config: TrainConfig, run_root
 
 
 def run_practical_matrix(baselines: Sequence[str], datasets: Sequence[str], config: TrainConfig, run_root: Path | str) -> list[dict[str, object]]:
-    rows = [run_practical_one(baseline, dataset, config, run_root) for dataset in datasets for baseline in baselines]
+    rows = [
+        run_practical_one(baseline, dataset, config, run_root, horizon=horizon)
+        for dataset in datasets
+        for horizon in _selected_horizons(dataset, config)
+        for baseline in baselines
+    ]
     write_rows(rows, run_root, prefix="baseline_practical")
     return rows
 
@@ -445,32 +506,54 @@ def run_practical_matrix(baselines: Sequence[str], datasets: Sequence[str], conf
 def write_isambard_jobs(
     output: Path | str,
     *,
-    source_root: str,
+    source_root: str | None = None,
     datasets: Iterable[str] = DATASET_KEYS,
     baselines: Iterable[str] = EXTRAPOLATION_BASELINES,
+    horizons: Iterable[int] | str | None = None,
     time_limit: str = "08:00:00",
 ) -> list[Path]:
     out = output_dir(output)
     scripts = []
+    selected_baselines = tuple(baselines)
+    if any(not BASELINES[baseline].first_party for baseline in selected_baselines) and not source_root:
+        raise ValueError("External baseline jobs require --baseline-source-root.")
     for dataset in datasets:
-        for baseline in baselines:
-            script = out / f"llapdiff_{baseline}_{dataset}.sh"
-            script.write_text(
-                "#!/bin/bash\n"
-                f"#SBATCH --job-name=llap-{baseline}-{dataset}\n"
-                "#SBATCH --partition=hopper\n"
-                "#SBATCH --nodes=1\n"
-                "#SBATCH --gpus=1\n"
-                f"#SBATCH --time={time_limit}\n"
-                "#SBATCH --output=%x.%j.out\n\n"
-                "set -euo pipefail\n"
-                "nvidia-smi\n"
-                "llapdiff-baselines practical-extrapolation "
-                f"--baseline {baseline} --dataset {dataset} "
-                f"--baseline-source-root {source_root} "
-                "--output-dir ${SCRATCHDIR:-$PWD}/llapdiffusion_baselines/runs "
-                "--allow-cache-copy --work-cache-dir ${SCRATCHDIR:-$PWD}/llapdiffusion_baselines/cache_work\n",
-                encoding="utf-8",
-            )
-            scripts.append(script)
+        if horizons is None:
+            selected_horizons = (max(default_horizons(dataset)),)
+        elif isinstance(horizons, str):
+            if horizons != "all":
+                raise ValueError("horizons must be 'all' or a sequence of supported integers")
+            selected_horizons = default_horizons(dataset)
+        else:
+            selected_horizons = tuple(int(h) for h in horizons)
+        if not selected_horizons:
+            raise ValueError("At least one horizon must be selected")
+        supported_horizons = default_horizons(dataset)
+        supported = set(supported_horizons)
+        invalid = [h for h in selected_horizons if h not in supported]
+        if invalid:
+            raise ValueError(f"{dataset}: unsupported horizons {invalid}; supported horizons are {supported_horizons}")
+
+        for horizon in selected_horizons:
+            for baseline in selected_baselines:
+                source_arg = f"--baseline-source-root {source_root} " if source_root and not BASELINES[baseline].first_party else ""
+                script = out / f"llapdiff_{baseline}_{dataset}_h{horizon}.sh"
+                script.write_text(
+                    "#!/bin/bash\n"
+                    f"#SBATCH --job-name=llap-{baseline}-{dataset}-h{horizon}\n"
+                    "#SBATCH --partition=hopper\n"
+                    "#SBATCH --nodes=1\n"
+                    "#SBATCH --gpus=1\n"
+                    f"#SBATCH --time={time_limit}\n"
+                    "#SBATCH --output=%x.%j.out\n\n"
+                    "set -euo pipefail\n"
+                    "nvidia-smi\n"
+                    "llapdiff-baselines practical-extrapolation "
+                    f"--baseline {baseline} --dataset {dataset} --horizons {horizon} "
+                    f"{source_arg}"
+                    "--output-dir ${SCRATCHDIR:-$PWD}/llapdiffusion_baselines/runs "
+                    "--allow-cache-copy --work-cache-dir ${SCRATCHDIR:-$PWD}/llapdiffusion_baselines/cache_work\n",
+                    encoding="utf-8",
+                )
+                scripts.append(script)
     return scripts

@@ -23,6 +23,7 @@ def build_adapter(
     device: torch.device,
     *,
     num_samples: int = 4,
+    imputation_random_mask_ratio: float = 0.30,
 ) -> nn.Module:
     if key == "dlinear":
         return DLinearAdapter(dataset_info, sample_batch, source_manager)
@@ -41,5 +42,12 @@ def build_adapter(
     if key == "contiformer":
         return ContiFormerAdapter(dataset_info, sample_batch, source_manager)
     if key == "csdi":
-        return CSDIAdapter(dataset_info, sample_batch, source_manager, device, num_samples=num_samples)
+        return CSDIAdapter(
+            dataset_info,
+            sample_batch,
+            source_manager,
+            device,
+            num_samples=num_samples,
+            imputation_random_mask_ratio=imputation_random_mask_ratio,
+        )
     raise KeyError(key)

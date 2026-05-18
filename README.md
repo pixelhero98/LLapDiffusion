@@ -24,7 +24,7 @@ The port-collocated output is
 
 $$\tilde{y}_t = G^\top(\psi_t)\nabla_x H(x_t;\psi_t).$$
 
-Applying Itô's lemma gives the expected energy balance
+Applying Ito's lemma gives the expected energy balance
 
 $$\frac{d}{dt}\mathbb{E}[H] = \mathbb{E}[\partial_{\psi}H\,\dot{\psi}_t] - \mathbb{E}[\nabla_xH^\top R\nabla_xH] + \mathbb{E}[\tilde{y}_t^\top u_t] + \frac{1}{2}\mathbb{E}[\mathrm{tr}(\Sigma\Sigma^\top\nabla_x^2H)].$$
 
@@ -51,6 +51,12 @@ python -m pip install -e .
 If you need a specific CUDA build of PyTorch, install `torch` with the official PyTorch selector first, then install the remaining requirements.
 
 The public stack uses standard scientific PyTorch tooling, including `torch`, `numpy`, `pandas`, `matplotlib`, `pyarrow`, `fastparquet`, `yfinance`, `requests`, and `tqdm`.
+
+Baseline replication needs the optional baseline dependency group:
+
+```bash
+python -m pip install -e ".[baselines]"
+```
 
 ## Quick start
 
@@ -123,6 +129,8 @@ export LLAPDIFF_DATASET_EXTRACT_DIR=~/.cache/llapdiffusion/datasets
 
 The pipeline and evaluation CLIs also accept `--dataset-zip` and `--dataset-extract-dir`. By default, extracted caches are written under the user cache directory, not into the installed package or source checkout. If neither an existing preset cache directory nor an available archive is present, the run fails early with a clear dataset-cache error.
 
+The archive contains compact caches derived from public sources: UCI Air Quality, Beijing Multi-Site Air Quality, PhysioNet Challenge 2012, NOAA ISD, and Yahoo Finance market data through `yfinance`. These cached data are redistributed only for reproducible evaluation convenience; the repository code is MIT-licensed, while each dataset remains governed by its original source terms. Check the upstream dataset pages before redistributing derived caches or using them beyond replication.
+
 ## Controlled synthetic shifts
 
 The repository also includes two generated regime-shift tests:
@@ -180,6 +188,7 @@ llapdiff-checkpoint-eval \
   --pred 100 \
   --dataset-zip /path/to/LLapDiff-evaluation-datasets.zip \
   --checkpoint /path/to/LLapDiffusion/ldt/output/crypto/llapdiff_pred-100_best_raw.pt \
+  --imputation-random-mask-ratio 0.30 \
   --out-json ldt/results/crypto_eval.json
 ```
 
@@ -215,34 +224,45 @@ git clone https://github.com/ermongroup/CSDI.git CSDI && git -C CSDI checkout 7f
 git clone https://github.com/microsoft/physiopro.git physiopro && git -C physiopro checkout 5486d1ccaff8f33d635753e3debd7465234b09f1
 ```
 
+### Practical all-horizon runs
+
+Use the bounded practical runners for public baseline results. Pass `--horizons all` to evaluate every public horizon for each selected dataset; omitting it keeps the longest-horizon default. `--dataset all` covers all seven public datasets and `--baseline all` covers DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, MR-Diff, t-PatchGNN, and ContiFormer:
+
 ```bash
-llapdiff-baselines smoke \
+llapdiff-baselines practical-extrapolation \
   --baseline all \
   --dataset all \
+  --horizons all \
   --baseline-source-root /path/to/baseline-sources \
-  --output-dir ldt/results/baseline_smoke \
+  --output-dir ldt/results/baseline_runs \
   --allow-cache-copy \
   --work-cache-dir ldt/cache_work
 ```
 
-The baseline pool includes extrapolation adapters for DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, t-PatchGNN, ContiFormer, and MR-Diff, plus CSDI under imputation. Smoke results are one-batch source/import/forward/loss/backward checks, not benchmark scores. CSDI is reported as `context_imputation_holdout`; it is not a forecast-horizon extrapolation result.
+CSDI is an imputation baseline, not a forecast-horizon extrapolator. The CSDI practical runner reports held-out context imputation on the supported imputation datasets:
 
-MR-Diff can be selected with `--baseline mr-diff` without `--baseline-source-root`. For paper-style stochastic evaluation, set `--num-samples 10`; smoke checks can use fewer samples for runtime.
+```bash
+llapdiff-baselines csdi-imputation \
+  --dataset all \
+  --baseline-source-root /path/to/baseline-sources \
+  --imputation-random-mask-ratio 0.30 \
+  --output-dir ldt/results/csdi_runs \
+  --allow-cache-copy \
+  --work-cache-dir ldt/cache_work
+```
 
-Bounded practical runs use the same LLapDiffusion dataset presets and longest horizons:
+For smaller checks, select one baseline or dataset explicitly:
 
 ```bash
 llapdiff-baselines practical-extrapolation \
   --baseline dlinear \
   --dataset crypto \
+  --horizons 5 20 60 100 \
   --baseline-source-root /path/to/baseline-sources \
   --output-dir ldt/results/baseline_runs
-
-llapdiff-baselines csdi-imputation \
-  --dataset all \
-  --baseline-source-root /path/to/baseline-sources \
-  --output-dir ldt/results/csdi_runs
 ```
+
+MR-Diff can be selected with `--baseline mr-diff` without `--baseline-source-root`. For paper-style stochastic evaluation of probabilistic baselines, set `--num-samples 10`.
 
 ## Repository layout
 
@@ -261,58 +281,59 @@ LLapDiffusion/
 `-- README.md                  # Public overview and usage guide
 ```
 
-## Public presets
+## Practical notes
 
-The repository exposes one canonical latent channel setting per dataset.
+The dataset registry defines the public context lengths, horizons, latent dimensions, VAE settings, and summarizer settings used by the pipeline. The command-line examples above intentionally use dataset keys instead of duplicating those defaults in the README. Advanced users can inspect `llapdiffusion/configs/config.py` and `llapdiffusion/configs/dataset_defaults.py`.
 
-| Dataset | Horizons | Default latent channel |
-| --- | --- | --- |
-| `bms_air` | `24, 48, 96, 168` | `24` |
-| `uci_air` | `24, 48, 96, 168` | `16` |
-| `physionet` | `4, 8, 10, 12` | `16` |
-| `noaa_us` | `24, 48, 96, 168` | `24` |
-| `noaa_uk` | `24, 48, 96, 168` | `16` |
-| `us_equity` | `5, 20, 60, 100` | `12` |
-| `crypto` | `5, 20, 60, 100` | `16` |
+### LLapDiff imputation modes
 
-### VAE defaults
+LLapDiff supports two practical imputation paths:
 
-These are the public forward defaults in `llapdiffusion/configs/config.py`:
+1. Forecast-only checkpoint queried for imputation. The standard public pipeline trains with `TARGET_MASK_AUX_P=0.0`, so no target-imputation objective is mixed into training. `llapdiff-checkpoint-eval` can still query that checkpoint on held-out target masks and reports both forecast metrics and imputation cases such as regular keep-25 and random-mask settings.
+2. Dual-task target-mask training. Keep `IMPUTATION_TRAINING=True` and set a positive `TARGET_MASK_AUX_P` only when intentionally mixing target-mask reconstruction batches into LLapDiff training. The target-mask controls are `TARGET_MASK_AUX_KEEP_MODE`, `TARGET_MASK_AUX_KEEP_PROB`, `TARGET_MASK_AUX_KEEP_STRIDE`, and `TARGET_MASK_AUX_START_EPOCH`.
 
-| Setting | Value |
-| --- | --- |
-| `VAE_WARMUP_EPOCHS` | `5` |
-| `VAE_KL_ANNEAL_EPOCHS` | `25` |
-| `VAE_MIN_EPOCHS` | `40` |
-| `VAE_BETA` | `1e-3` |
-| `VAE_MAX_PATIENCE` | `20` |
-| `VAE_INPUT_DROPOUT` | `0.20` |
-| `VAE_NOISE_STD` | `0.01` |
-| `VAE_RECON_BALANCE` | `none` |
+Forecast-only training plus imputation evaluation:
 
-### Summarizer defaults
+```bash
+llapdiff-train \
+  --dataset-key crypto \
+  --preds 100 \
+  --summary-json ldt/results/crypto_forecast_only.json
 
-The summarizer uses the shared public baseline in `llapdiffusion/configs/config.py`, with dataset-specific presets applied by the registry:
+llapdiff-checkpoint-eval \
+  --dataset-key crypto \
+  --pred 100 \
+  --checkpoint /path/to/LLapDiffusion/ldt/output/crypto/llapdiff_pred-100_best_raw.pt \
+  --imputation-random-mask-ratio 0.30 \
+  --out-json ldt/results/crypto_forecast_only_imputation.json
+```
 
-| Dataset | Override |
-| --- | --- |
-| `bms_air` | `SUM_LR = 1e-4`, `SUM_AMP = False` |
-| `physionet` | dataset-specific VAE and summarizer preset |
-| `crypto` | dataset-specific VAE and summarizer preset |
-| all others | shared summarizer defaults |
+Dual-task training plus imputation evaluation:
 
+```bash
+llapdiff-train \
+  --dataset-key crypto \
+  --preds 100 \
+  --target-mask-aux-p 0.20 \
+  --target-mask-aux-keep-mode mixed \
+  --target-mask-aux-keep-prob 0.70 \
+  --target-mask-aux-keep-stride 4 \
+  --target-mask-aux-start-epoch 10 \
+  --summary-json ldt/results/crypto_dual_task.json
 
-### Time and imputation settings
+llapdiff-checkpoint-eval \
+  --dataset-key crypto \
+  --pred 100 \
+  --checkpoint /path/to/LLapDiffusion/ldt/output/crypto/llapdiff_pred-100_best_raw.pt \
+  --imputation-random-mask-ratio 0.30 \
+  --out-json ldt/results/crypto_dual_task_imputation.json
+```
 
-The default summarizer position mode is `SUM_POS_ENCODING="learned_abs"` for public baselines. Variants can set `SUM_POS_ENCODING="continuous_rope"` or `"learned_plus_continuous_rope"` to rotate attention queries and keys by context-window relative time. `SUM_ROPE_BASE=10000.0` controls the RoPE frequency base.
-
-`IMPUTATION_TRAINING=True` means imputation-style target anchors are allowed by configuration, not active by default. Pure extrapolation-training remains clean by `TARGET_MASK_AUX_P=0.0`; set a positive value only when intentionally running dual-task or imputation-style training. Extrapolation and interpolation both support in either training setting by querying the same model.
-
-Context and target `delta_t` metadata are interpreted as nondecreasing window-local offsets and are shifted relative to the first timestamp before use.
+When using CLI entry points that expose random-mask imputation evaluation, `--imputation-random-mask-ratio` is the fraction of observed target entries to hide for the random-mask imputation case. For example, `--imputation-random-mask-ratio 0.30` hides 30% and keeps 70% of observed target entries. Use this as an evaluation mask setting, not as evidence that the checkpoint was trained with an imputation loss.
 
 ## Practical tuning guidance
 
-When moving beyond the public presets, the most reliable order is:
+When moving beyond the default examples, the most reliable order is:
 
 1. Validate the dataset cache and window geometry.
 2. Check normalization and data scale.

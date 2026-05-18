@@ -18,8 +18,11 @@ class CSDIAdapter(nn.Module):
         device: torch.device,
         *,
         num_samples: int = 4,
+        imputation_random_mask_ratio: float = 0.30,
     ):
         super().__init__()
+        if not 0.0 < float(imputation_random_mask_ratio) < 1.0:
+            raise ValueError("imputation_random_mask_ratio must be in the open interval (0, 1)")
         with source_manager.prepend(source_manager.path("CSDI"), module_prefixes=("diff_models", "main_model")):
             module = importlib.import_module("main_model")
         N = sample_batch[0][0].shape[1]
@@ -39,15 +42,16 @@ class CSDIAdapter(nn.Module):
         }
         self.model = module.CSDI_Physio(config, device, target_dim=N)
         self.num_samples = int(num_samples)
+        self.imputation_random_mask_ratio = float(imputation_random_mask_ratio)
 
-    @staticmethod
-    def _random_gt_mask(observed_mask: torch.Tensor) -> torch.Tensor:
+    def _random_gt_mask(self, observed_mask: torch.Tensor) -> torch.Tensor:
         gt_mask = observed_mask.clone().contiguous()
         for b in range(gt_mask.shape[0]):
             observed = torch.nonzero(observed_mask[b].reshape(-1) > 0, as_tuple=False).flatten()
-            if observed.numel() == 0:
+            if observed.numel() < 2:
                 continue
-            holdout = max(1, observed.numel() // 5)
+            holdout = int(round(observed.numel() * self.imputation_random_mask_ratio))
+            holdout = min(max(1, holdout), observed.numel() - 1)
             chosen = observed[torch.randperm(observed.numel(), device=observed.device)[:holdout]]
             flat = gt_mask[b].view(-1)
             flat[chosen] = 0.0

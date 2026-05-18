@@ -23,10 +23,14 @@ def load_dataset_loaders(
     allow_cache_copy: bool,
     work_cache_dir: Path | None,
     split: str = "all",
+    horizon: int | None = None,
 ):
     preset = get_dataset_preset(dataset_key)
     data_dir = Path(preset.data_dir)
-    horizon = max(preset.horizons)
+    requested_horizon = max(preset.horizons) if horizon is None else int(horizon)
+    if requested_horizon not in preset.horizons:
+        raise ValueError(f"{dataset_key}: horizon={requested_horizon} not in supported horizons {preset.horizons}")
+    horizon = requested_horizon
     window = preset.context_length
     copied_cache = False
     reindex = False
@@ -36,7 +40,7 @@ def load_dataset_loaders(
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if int(meta.get("horizon", 0)) < horizon:
             if not allow_cache_copy:
-                raise RuntimeError("noaa_us H=168 requires --allow-cache-copy and --work-cache-dir")
+                raise RuntimeError(f"noaa_us H={horizon} requires --allow-cache-copy and --work-cache-dir")
             if work_cache_dir is None:
                 raise RuntimeError("noaa_us copied cache reindex requires --work-cache-dir")
             root = Path(work_cache_dir).expanduser().resolve()
@@ -44,7 +48,7 @@ def load_dataset_loaders(
             cache_key = (dataset_key, str(data_dir.resolve()), str(root), horizon)
             copy_dir = _COPIED_CACHES.get(cache_key)
             if copy_dir is None:
-                copy_dir = root / f"noaa_us_h168_{os.getpid()}_{time.time_ns()}"
+                copy_dir = root / f"noaa_us_h{horizon}_{os.getpid()}_{time.time_ns()}"
                 shutil.copytree(data_dir, copy_dir)
                 _COPIED_CACHES[cache_key] = copy_dir
             data_dir = copy_dir

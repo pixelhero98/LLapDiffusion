@@ -302,15 +302,14 @@ class MRDiffAdapter(nn.Module):
 
     def _training_loss(self, features, y_trends, y_masks, future_time) -> torch.Tensor:
         losses = []
+        history_trends = [stage.history(features[idx]) for idx, stage in enumerate(self.stages)]
         for stage_idx in range(len(self.stages) - 1, -1, -1):
             stage = self.stages[stage_idx]
             target = y_trends[stage_idx]
             target_mask = y_masks[stage_idx]
-            z_history = stage.history(features[stage_idx])
-            mix = torch.rand_like(target)
-            z_mix = mix * z_history + (1.0 - mix) * target
-            coarse = y_trends[stage_idx + 1] if stage_idx < len(self.stages) - 1 else None
-            condition = stage.denoiser.condition(z_mix, coarse, future_time)
+            z_history = history_trends[stage_idx]
+            coarse = history_trends[stage_idx + 1].detach() if stage_idx < len(self.stages) - 1 else None
+            condition = stage.denoiser.condition(z_history, coarse, future_time)
             step = torch.randint(0, self.diffusion_steps, (target.shape[0],), device=target.device)
             noise = torch.randn_like(target)
             noisy = self._q_sample(target, step, noise)
@@ -353,5 +352,4 @@ class MRDiffAdapter(nn.Module):
 
     def forward(self, batch, dataset_info):
         features, _, _, future_time, revin = self._inputs(batch, dataset_info)
-        with torch.no_grad():
-            return revin.denormalize(self._sample_normalized(features, future_time))
+        return revin.denormalize(self._sample_normalized(features, future_time))

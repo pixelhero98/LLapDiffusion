@@ -30,7 +30,26 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-batches", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-samples", type=int, default=4)
+    parser.add_argument(
+        "--imputation-random-mask-ratio",
+        type=float,
+        default=0.30,
+        help="Fraction of observed entries to hide for random-mask imputation comparisons.",
+    )
     parser.add_argument("--allow-cache-copy", action="store_true")
+
+
+def _parse_horizons(values: list[str] | None) -> tuple[int, ...] | str | None:
+    if values is None:
+        return None
+    if len(values) == 1 and values[0].lower() == "all":
+        return "all"
+    if any(value.lower() == "all" for value in values):
+        raise SystemExit("--horizons accepts either 'all' or explicit integer horizons, not both.")
+    try:
+        return tuple(int(value) for value in values)
+    except ValueError as exc:
+        raise SystemExit("--horizons values must be integers or 'all'.") from exc
 
 
 def _smoke_config(args: argparse.Namespace) -> SmokeConfig:
@@ -43,6 +62,7 @@ def _smoke_config(args: argparse.Namespace) -> SmokeConfig:
         max_batches=args.max_batches,
         seed=args.seed,
         num_samples=args.num_samples,
+        imputation_random_mask_ratio=args.imputation_random_mask_ratio,
         allow_cache_copy=args.allow_cache_copy,
         keep_going=not args.fail_fast,
     )
@@ -58,6 +78,7 @@ def _train_config(args: argparse.Namespace) -> TrainConfig:
         max_batches=args.max_batches,
         seed=args.seed,
         num_samples=args.num_samples,
+        imputation_random_mask_ratio=args.imputation_random_mask_ratio,
         allow_cache_copy=args.allow_cache_copy,
         keep_going=True,
         epochs=args.epochs,
@@ -65,6 +86,7 @@ def _train_config(args: argparse.Namespace) -> TrainConfig:
         lr=args.lr,
         max_train_batches=args.max_train_batches,
         max_eval_batches=args.max_eval_batches,
+        horizons=_parse_horizons(getattr(args, "horizons", None)),
     )
 
 
@@ -112,6 +134,7 @@ def _run_write_jobs(args: argparse.Namespace) -> None:
         source_root=args.source_root,
         datasets=datasets,
         baselines=baselines,
+        horizons=_parse_horizons(args.horizons),
         time_limit=args.time_limit,
     )
     for script in scripts:
@@ -134,6 +157,12 @@ def parse_args() -> argparse.Namespace:
     _add_common(practical)
     practical.add_argument("--baseline", choices=EXTRAPOLATION_BASELINES + ("all",), default="all")
     practical.add_argument("--dataset", choices=DATASET_KEYS + ("all",), default="all")
+    practical.add_argument(
+        "--horizons",
+        nargs="+",
+        default=None,
+        help="Horizon selection: omit for longest only, use 'all', or list explicit supported horizons.",
+    )
     practical.add_argument("--epochs", type=int, default=50)
     practical.add_argument("--patience", type=int, default=8)
     practical.add_argument("--lr", type=float, default=1e-3)
@@ -155,11 +184,17 @@ def parse_args() -> argparse.Namespace:
     notes.add_argument("--output-dir", default="baseline_results")
     notes.set_defaults(func=_run_export_notes)
 
-    jobs = sub.add_parser("write-isambard-jobs", help="Write Slurm scripts for longest-horizon extrapolation baselines.")
-    jobs.add_argument("--baseline-source-root", dest="source_root", required=True)
+    jobs = sub.add_parser("write-isambard-jobs", help="Write Slurm scripts for practical extrapolation baselines.")
+    jobs.add_argument("--baseline-source-root", dest="source_root", required=False)
     jobs.add_argument("--output-dir", default="isambard_jobs")
     jobs.add_argument("--baseline", choices=EXTRAPOLATION_BASELINES + ("all",), default="all")
     jobs.add_argument("--dataset", choices=DATASET_KEYS + ("all",), default="all")
+    jobs.add_argument(
+        "--horizons",
+        nargs="+",
+        default=None,
+        help="Horizon selection: omit for longest only, use 'all', or list explicit supported horizons.",
+    )
     jobs.add_argument("--time-limit", default="08:00:00")
     jobs.set_defaults(func=_run_write_jobs)
     return parser.parse_args()

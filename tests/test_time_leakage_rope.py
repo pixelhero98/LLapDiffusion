@@ -1,4 +1,5 @@
 import io
+import sys
 import zipfile
 from types import SimpleNamespace
 
@@ -219,6 +220,56 @@ def test_run_single_pred_applies_output_dirs_after_pred_update(monkeypatch, tmp_
     assert cfg.OUT_DIR == str(tmp_path / "out" / "pred-20")
     assert cfg.CKPT_DIR == str(tmp_path / "ckpt" / "pred-20")
     assert cfg.POLE_PLOT_DIR == str(tmp_path / "out" / "pred-20" / "pole_plots")
+
+
+def test_llapdiff_train_target_mask_aux_cli_overrides(monkeypatch):
+    from llapdiffusion import pipeline
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llapdiff-train",
+            "--dataset-key",
+            "crypto",
+            "--target-mask-aux-p",
+            "0.35",
+            "--target-mask-aux-keep-mode",
+            "regular",
+            "--target-mask-aux-keep-prob",
+            "0.65",
+            "--target-mask-aux-keep-stride",
+            "3",
+            "--target-mask-aux-start-epoch",
+            "7",
+        ],
+    )
+
+    args = pipeline._parse_args()
+
+    assert args.target_mask_aux_p == 0.35
+    assert args.target_mask_aux_keep_mode == "regular"
+    assert args.target_mask_aux_keep_prob == 0.65
+    assert args.target_mask_aux_keep_stride == 3
+    assert args.target_mask_aux_start_epoch == 7
+
+    overrides = pipeline._training_overrides_from_args(args)
+    cfg = SimpleNamespace(
+        IMPUTATION_TRAINING=False,
+        TARGET_MASK_AUX_P=0.0,
+        TARGET_MASK_AUX_KEEP_MODE="prefix",
+        TARGET_MASK_AUX_KEEP_PROB=0.5,
+        TARGET_MASK_AUX_KEEP_STRIDE=4,
+        TARGET_MASK_AUX_START_EPOCH=10,
+    )
+    pipeline._apply_training_overrides(overrides, config=cfg)
+
+    assert cfg.IMPUTATION_TRAINING is True
+    assert cfg.TARGET_MASK_AUX_P == 0.35
+    assert cfg.TARGET_MASK_AUX_KEEP_MODE == "regular"
+    assert cfg.TARGET_MASK_AUX_KEEP_PROB == 0.65
+    assert cfg.TARGET_MASK_AUX_KEEP_STRIDE == 3
+    assert cfg.TARGET_MASK_AUX_START_EPOCH == 7
 
 
 def test_missing_dataset_archive_fails_early(tmp_path, monkeypatch):
@@ -686,6 +737,83 @@ def test_random_imputation_keep_mask_generator_advances_between_batches():
     second = ce._make_random_keep(obs_any, frac=0.70, generator=generator)
 
     assert not torch.equal(first, second)
+
+
+def test_checkpoint_eval_random_mask30_uses_seventy_percent_keep(monkeypatch, tmp_path):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+
+    captured = {}
+
+    monkeypatch.setattr(ce, "set_torch", lambda **kwargs: torch.device("cpu"))
+    monkeypatch.setattr(
+        ce,
+        "resolve_run_experiment",
+        lambda data_dir: (
+            lambda **kwargs: (["train"], ["val"], ["test"], (1, 1, 1))
+        ),
+    )
+    monkeypatch.setattr(
+        ce,
+        "_load_stack",
+        lambda *args, **kwargs: (
+            object(),
+            object(),
+            object(),
+            torch.zeros(1),
+            torch.ones(1),
+        ),
+    )
+    monkeypatch.setattr(ce.tv, "_sampling_kwargs", lambda cfg, prefix: {
+        "steps": 2,
+        "guidance_strength": (1.0, 2.0),
+        "guidance_power": 1.0,
+        "eta": 0.0,
+        "dynamic_thresh_p": 0.0,
+        "dynamic_thresh_max": 1.0,
+        "rho": 7.5,
+    })
+    monkeypatch.setattr(ce.tv, "evaluate_regression", lambda *args, **kwargs: {"crps": 1.0})
+
+    def fake_impute_case(*args, **kwargs):
+        keep_fn = kwargs["keep_fn"]
+        obs_any = torch.ones(100, 100, dtype=torch.bool)
+        keep = keep_fn(obs_any)
+        key = "random" if "regular" in captured else "regular"
+        captured[key] = keep
+        return {
+            "hidden_mae": 0.0,
+            "hidden_mse": 0.0,
+            "hidden_crps": 1.0,
+            "observed_mae": 0.0,
+            "observed_token_frac": float(keep.sum().item() / obs_any.sum().item()),
+            "hidden_token_frac": float((obs_any & (~keep)).sum().item() / obs_any.sum().item()),
+        }
+
+    monkeypatch.setattr(ce, "_evaluate_impute_case", fake_impute_case)
+    cfg = SimpleNamespace(
+        DATA_DIR="demo",
+        date_batching=True,
+        DATES_PER_BATCH=1,
+        WINDOW=4,
+        PRED=10,
+        COVERAGE=0.0,
+        train_ratio=0.7,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        SEED=42,
+        DETERMINISTIC=False,
+        NUM_EVAL_SAMPLES=1,
+        SELF_COND=False,
+    )
+
+    result = ce.evaluate_checkpoint(cfg, tmp_path / "model.pt", label="demo")
+
+    assert "random" in captured
+    assert result["random_mask_ratio"] == pytest.approx(0.30)
+    assert result["random_mask"]["observed_token_frac"] == pytest.approx(0.70, abs=0.10)
+    assert result["random_mask"]["hidden_token_frac"] == pytest.approx(0.30, abs=0.10)
+    assert result["random_mask30"]["observed_token_frac"] == pytest.approx(0.70, abs=0.10)
+    assert result["random_mask30"]["hidden_token_frac"] == pytest.approx(0.30, abs=0.10)
 
 
 def test_continuous_rope_summarizer_forward_shape_and_finiteness():

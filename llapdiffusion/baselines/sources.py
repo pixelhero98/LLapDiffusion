@@ -68,11 +68,12 @@ def load_module_from_file(module_name: str, path: Path) -> ModuleType:
 
 class SourceManager:
     def __init__(self, source_root: str | os.PathLike[str] | None):
-        self.root = resolve_source_root(source_root) if source_root or os.environ.get("LLAPDIFF_BASELINE_SOURCE_ROOT") else None
+        self._source_root = source_root
+        self.root: Path | None = None
 
     def path(self, name: str) -> Path:
         if self.root is None:
-            raise ValueError("Provide --baseline-source-root or LLAPDIFF_BASELINE_SOURCE_ROOT for external baselines.")
+            self.root = resolve_source_root(self._source_root)
         return self.root / name
 
     def validate(self, spec: BaselineSpec) -> dict[str, object]:

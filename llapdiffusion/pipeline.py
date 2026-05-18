@@ -109,6 +109,7 @@ def run_single_pred(
     allow_balanced_eval_failure: bool = False,
     base_out_dir: Path | None = None,
     base_ckpt_dir: Path | None = None,
+    training_overrides: Dict[str, object] | None = None,
     config=config,
 ) -> Dict[str, object]:
     """
@@ -124,6 +125,7 @@ def run_single_pred(
             base_ckpt_dir=base_ckpt_dir,
             config=config,
         )
+    _apply_training_overrides(training_overrides, config=config)
 
     train_val_latent, train_val_summarizer, train_val_llapdiff = _import_trainers()
 
@@ -220,6 +222,7 @@ def run_preds(
     latent_plot_only: bool = False,
     use_shared_loaders: bool = True,
     allow_balanced_eval_failure: bool = False,
+    training_overrides: Dict[str, object] | None = None,
     config=config,
 ) -> Dict[int, Dict[str, object]]:
     """
@@ -240,6 +243,7 @@ def run_preds(
             allow_balanced_eval_failure=allow_balanced_eval_failure,
             base_out_dir=base_out_dir,
             base_ckpt_dir=base_ckpt_dir,
+            training_overrides=training_overrides,
             config=config,
         )
     return results
@@ -295,6 +299,36 @@ def _parse_args() -> argparse.Namespace:
         help="Record balanced checkpoint evaluation errors instead of failing the run.",
     )
     parser.add_argument(
+        "--target-mask-aux-p",
+        type=float,
+        default=None,
+        help="Probability of mixing target-mask reconstruction batches into LLapDiff training.",
+    )
+    parser.add_argument(
+        "--target-mask-aux-keep-mode",
+        choices=("random", "regular", "prefix", "mixed"),
+        default=None,
+        help="Target-mask auxiliary keep-mask mode.",
+    )
+    parser.add_argument(
+        "--target-mask-aux-keep-prob",
+        type=float,
+        default=None,
+        help="Observed target keep probability for random target-mask auxiliary batches.",
+    )
+    parser.add_argument(
+        "--target-mask-aux-keep-stride",
+        type=int,
+        default=None,
+        help="Observed target keep stride for regular target-mask auxiliary batches.",
+    )
+    parser.add_argument(
+        "--target-mask-aux-start-epoch",
+        type=int,
+        default=None,
+        help="Epoch at which target-mask auxiliary batches may begin.",
+    )
+    parser.add_argument(
         "--dataset-zip",
         type=str,
         default=None,
@@ -307,6 +341,51 @@ def _parse_args() -> argparse.Namespace:
         help="Optional directory for extracting --dataset-zip. Defaults to the user cache directory.",
     )
     return parser.parse_args()
+
+
+def _training_overrides_from_args(args: argparse.Namespace) -> Dict[str, object]:
+    names = (
+        "target_mask_aux_p",
+        "target_mask_aux_keep_mode",
+        "target_mask_aux_keep_prob",
+        "target_mask_aux_keep_stride",
+        "target_mask_aux_start_epoch",
+    )
+    return {name: value for name in names if (value := getattr(args, name, None)) is not None}
+
+
+def _apply_training_overrides(overrides: Dict[str, object] | None, *, config=config) -> None:
+    if not overrides:
+        return
+
+    if "target_mask_aux_p" in overrides:
+        value = float(overrides["target_mask_aux_p"])
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("--target-mask-aux-p must be between 0 and 1.")
+        config.TARGET_MASK_AUX_P = value
+        if value > 0.0:
+            config.IMPUTATION_TRAINING = True
+
+    if "target_mask_aux_keep_mode" in overrides:
+        config.TARGET_MASK_AUX_KEEP_MODE = str(overrides["target_mask_aux_keep_mode"])
+
+    if "target_mask_aux_keep_prob" in overrides:
+        value = float(overrides["target_mask_aux_keep_prob"])
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("--target-mask-aux-keep-prob must be between 0 and 1.")
+        config.TARGET_MASK_AUX_KEEP_PROB = value
+
+    if "target_mask_aux_keep_stride" in overrides:
+        value = int(overrides["target_mask_aux_keep_stride"])
+        if value < 1:
+            raise ValueError("--target-mask-aux-keep-stride must be at least 1.")
+        config.TARGET_MASK_AUX_KEEP_STRIDE = value
+
+    if "target_mask_aux_start_epoch" in overrides:
+        value = int(overrides["target_mask_aux_start_epoch"])
+        if value < 0:
+            raise ValueError("--target-mask-aux-start-epoch must be non-negative.")
+        config.TARGET_MASK_AUX_START_EPOCH = value
 
 
 def _pred_list_from_config(config=config) -> Tuple[int, ...]:
@@ -427,6 +506,7 @@ def main() -> Dict[int, Dict[str, object]]:
     args = _parse_args()
     configure_dataset_archive(args.dataset_zip, args.dataset_extract_dir)
     apply_dataset_preset(config, args.dataset_key)
+    training_overrides = _training_overrides_from_args(args)
     preds = tuple(args.preds) if args.preds else _pred_list_from_config(config=config)
     if not preds:
         raise ValueError("No prediction horizons provided to the pipeline.")
@@ -445,6 +525,7 @@ def main() -> Dict[int, Dict[str, object]]:
             allow_balanced_eval_failure=args.allow_balanced_eval_failure,
             base_out_dir=base_out_dir,
             base_ckpt_dir=base_ckpt_dir,
+            training_overrides=training_overrides,
             config=config,
         )
 
