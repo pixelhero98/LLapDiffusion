@@ -138,7 +138,7 @@ BASELINES: Mapping[str, BaselineSpec] = {
         "main_model.py::CSDI_Physio + diff_models.py::diff_CSDI",
         "native CSDI time embedding over observed context tokens",
         probabilistic=True,
-        dependency_caveat="CSDI is evaluated as context-window imputation on held-out observed tokens, not forecast-horizon extrapolation",
+        dependency_caveat="CSDI target-horizon imputation is the comparable default; context-window imputation remains a diagnostic mode",
     ),
 }
 

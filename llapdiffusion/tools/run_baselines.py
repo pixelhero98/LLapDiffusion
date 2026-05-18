@@ -16,7 +16,25 @@ from llapdiffusion.baselines.runner import (
 from llapdiffusion.baselines.sources import SourceManager
 
 
-def _add_common(parser: argparse.ArgumentParser) -> None:
+FULL_NUM_SAMPLES = 25
+FULL_EPOCHS = 600
+FULL_PATIENCE = 50
+QUICK_MAX_ENTITIES = 4
+QUICK_MAX_BATCHES = 30
+QUICK_MAX_TRAIN_BATCHES = 256
+QUICK_MAX_EVAL_BATCHES = 256
+QUICK_EPOCHS = 50
+QUICK_PATIENCE = 8
+QUICK_NUM_SAMPLES = 4
+
+
+def _add_common(
+    parser: argparse.ArgumentParser,
+    *,
+    max_entities_default: int | None = 4,
+    max_batches_default: int | None = 30,
+    num_samples_default: int | None = QUICK_NUM_SAMPLES,
+) -> None:
     parser.add_argument(
         "--baseline-source-root",
         dest="source_root",
@@ -26,10 +44,10 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", default="baseline_results")
     parser.add_argument("--work-cache-dir", default=None)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--max-entities", type=int, default=4)
-    parser.add_argument("--max-batches", type=int, default=30)
+    parser.add_argument("--max-entities", type=int, default=max_entities_default, help="Entity cap; use 0 for full panel.")
+    parser.add_argument("--max-batches", type=int, default=max_batches_default, help="Valid-batch scan cap; use 0 for no cap.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-samples", type=int, default=4)
+    parser.add_argument("--num-samples", type=int, default=num_samples_default)
     parser.add_argument(
         "--imputation-random-mask-ratio",
         type=float,
@@ -52,41 +70,89 @@ def _parse_horizons(values: list[str] | None) -> tuple[int, ...] | str | None:
         raise SystemExit("--horizons values must be integers or 'all'.") from exc
 
 
+def _normalize_cap(value: int | None, name: str) -> int | None:
+    if value is None:
+        return None
+    value = int(value)
+    if value < 0:
+        raise SystemExit(f"--{name.replace('_', '-')} must be non-negative; use 0 for no cap.")
+    return None if value == 0 else value
+
+
+def _positive_int(value: int | None, name: str) -> int | None:
+    if value is None:
+        return None
+    value = int(value)
+    if value <= 0:
+        raise SystemExit(f"--{name.replace('_', '-')} must be positive.")
+    return value
+
+
+def _quick_default(value, *, quick: bool, full, quick_value):
+    if value is not None:
+        return value
+    return quick_value if quick else full
+
+
 def _smoke_config(args: argparse.Namespace) -> SmokeConfig:
     return SmokeConfig(
         source_root=args.source_root,
         output_dir=args.output_dir,
         work_cache_dir=args.work_cache_dir,
         device=args.device,
-        max_entities=args.max_entities,
-        max_batches=args.max_batches,
+        max_entities=_normalize_cap(args.max_entities, "max_entities"),
+        max_batches=_normalize_cap(args.max_batches, "max_batches"),
         seed=args.seed,
-        num_samples=args.num_samples,
+        num_samples=_positive_int(args.num_samples, "num_samples") or QUICK_NUM_SAMPLES,
         imputation_random_mask_ratio=args.imputation_random_mask_ratio,
+        csdi_imputation_target=getattr(args, "csdi_imputation_target", "target"),
         allow_cache_copy=args.allow_cache_copy,
         keep_going=not args.fail_fast,
     )
 
 
 def _train_config(args: argparse.Namespace) -> TrainConfig:
+    quick = bool(getattr(args, "quick", False))
     return TrainConfig(
         source_root=args.source_root,
         output_dir=args.output_dir,
         work_cache_dir=args.work_cache_dir,
         device=args.device,
-        max_entities=args.max_entities,
-        max_batches=args.max_batches,
+        max_entities=_normalize_cap(
+            _quick_default(args.max_entities, quick=quick, full=None, quick_value=QUICK_MAX_ENTITIES),
+            "max_entities",
+        ),
+        max_batches=_normalize_cap(
+            _quick_default(args.max_batches, quick=quick, full=None, quick_value=QUICK_MAX_BATCHES),
+            "max_batches",
+        ),
         seed=args.seed,
-        num_samples=args.num_samples,
+        num_samples=_positive_int(
+            _quick_default(args.num_samples, quick=quick, full=FULL_NUM_SAMPLES, quick_value=QUICK_NUM_SAMPLES),
+            "num_samples",
+        )
+        or FULL_NUM_SAMPLES,
         imputation_random_mask_ratio=args.imputation_random_mask_ratio,
         allow_cache_copy=args.allow_cache_copy,
         keep_going=True,
-        epochs=args.epochs,
-        patience=args.patience,
+        epochs=_positive_int(_quick_default(args.epochs, quick=quick, full=FULL_EPOCHS, quick_value=QUICK_EPOCHS), "epochs")
+        or FULL_EPOCHS,
+        patience=_positive_int(
+            _quick_default(args.patience, quick=quick, full=FULL_PATIENCE, quick_value=QUICK_PATIENCE),
+            "patience",
+        )
+        or FULL_PATIENCE,
         lr=args.lr,
-        max_train_batches=args.max_train_batches,
-        max_eval_batches=args.max_eval_batches,
-        horizons=_parse_horizons(getattr(args, "horizons", None)),
+        max_train_batches=_normalize_cap(
+            _quick_default(args.max_train_batches, quick=quick, full=None, quick_value=QUICK_MAX_TRAIN_BATCHES),
+            "max_train_batches",
+        ),
+        max_eval_batches=_normalize_cap(
+            _quick_default(args.max_eval_batches, quick=quick, full=None, quick_value=QUICK_MAX_EVAL_BATCHES),
+            "max_eval_batches",
+        ),
+        horizons=_parse_horizons(getattr(args, "horizons", None)) or "all",
+        csdi_imputation_target=getattr(args, "csdi_imputation_target", "target"),
     )
 
 
@@ -117,7 +183,7 @@ def _run_practical_extrapolation(args: argparse.Namespace) -> None:
 
 
 def _run_csdi(args: argparse.Namespace) -> None:
-    datasets = ["physionet", "crypto", "noaa_uk"] if args.dataset == "all" else [args.dataset]
+    datasets = selected(DATASET_KEYS, args.dataset)
     run_practical_matrix(IMPUTATION_BASELINES, datasets, _train_config(args), args.output_dir)
 
 
@@ -135,6 +201,7 @@ def _run_write_jobs(args: argparse.Namespace) -> None:
         datasets=datasets,
         baselines=baselines,
         horizons=_parse_horizons(args.horizons),
+        quick=args.quick,
         time_limit=args.time_limit,
     )
     for script in scripts:
@@ -153,31 +220,40 @@ def parse_args() -> argparse.Namespace:
     smoke.add_argument("--validate-sources-only", action="store_true")
     smoke.set_defaults(func=_run_smoke)
 
-    practical = sub.add_parser("practical-extrapolation", help="Run bounded early-stop extrapolation baselines.")
-    _add_common(practical)
+    practical = sub.add_parser("practical-extrapolation", help="Run full-data early-stop extrapolation baselines.")
+    _add_common(practical, max_entities_default=None, max_batches_default=None, num_samples_default=None)
     practical.add_argument("--baseline", choices=EXTRAPOLATION_BASELINES + ("all",), default="all")
     practical.add_argument("--dataset", choices=DATASET_KEYS + ("all",), default="all")
+    practical.add_argument("--quick", action="store_true", help="Use legacy bounded debug caps and short training budget.")
     practical.add_argument(
         "--horizons",
         nargs="+",
         default=None,
-        help="Horizon selection: omit for longest only, use 'all', or list explicit supported horizons.",
+        help="Horizon selection: omit or use 'all' for every supported horizon, or list explicit supported horizons.",
     )
-    practical.add_argument("--epochs", type=int, default=50)
-    practical.add_argument("--patience", type=int, default=8)
+    practical.add_argument("--epochs", type=int, default=None)
+    practical.add_argument("--patience", type=int, default=None)
     practical.add_argument("--lr", type=float, default=1e-3)
-    practical.add_argument("--max-train-batches", type=int, default=256)
-    practical.add_argument("--max-eval-batches", type=int, default=256)
+    practical.add_argument("--max-train-batches", type=int, default=None)
+    practical.add_argument("--max-eval-batches", type=int, default=None)
     practical.set_defaults(func=_run_practical_extrapolation)
 
-    csdi = sub.add_parser("csdi-imputation", help="Run bounded CSDI context-imputation baselines.")
-    _add_common(csdi)
-    csdi.add_argument("--dataset", choices=("physionet", "crypto", "noaa_uk", "all"), default="all")
-    csdi.add_argument("--epochs", type=int, default=50)
-    csdi.add_argument("--patience", type=int, default=8)
+    csdi = sub.add_parser("csdi-imputation", help="Run full-data CSDI target-horizon imputation baselines.")
+    _add_common(csdi, max_entities_default=None, max_batches_default=None, num_samples_default=None)
+    csdi.add_argument("--dataset", choices=DATASET_KEYS + ("all",), default="all")
+    csdi.add_argument("--quick", action="store_true", help="Use legacy bounded debug caps and short training budget.")
+    csdi.add_argument("--csdi-imputation-target", choices=("target", "context"), default="target")
+    csdi.add_argument(
+        "--horizons",
+        nargs="+",
+        default=None,
+        help="Horizon selection: omit or use 'all' for every supported horizon, or list explicit supported horizons.",
+    )
+    csdi.add_argument("--epochs", type=int, default=None)
+    csdi.add_argument("--patience", type=int, default=None)
     csdi.add_argument("--lr", type=float, default=1e-3)
-    csdi.add_argument("--max-train-batches", type=int, default=256)
-    csdi.add_argument("--max-eval-batches", type=int, default=256)
+    csdi.add_argument("--max-train-batches", type=int, default=None)
+    csdi.add_argument("--max-eval-batches", type=int, default=None)
     csdi.set_defaults(func=_run_csdi)
 
     notes = sub.add_parser("export-notes", help="Write baseline metadata and caveats.")
@@ -193,8 +269,9 @@ def parse_args() -> argparse.Namespace:
         "--horizons",
         nargs="+",
         default=None,
-        help="Horizon selection: omit for longest only, use 'all', or list explicit supported horizons.",
+        help="Horizon selection: omit or use 'all' for every supported horizon, or list explicit supported horizons.",
     )
+    jobs.add_argument("--quick", action="store_true", help="Write bounded debug job scripts instead of full-data scripts.")
     jobs.add_argument("--time-limit", default="08:00:00")
     jobs.set_defaults(func=_run_write_jobs)
     return parser.parse_args()

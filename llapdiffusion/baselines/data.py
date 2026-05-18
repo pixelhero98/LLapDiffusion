@@ -164,7 +164,19 @@ def slice_entities(batch, indices: Sequence[int]):
     )
 
 
-def select_entities(batch, max_entities: int):
+def normalize_cap(value: int | None, name: str) -> int | None:
+    if value is None:
+        return None
+    cap = int(value)
+    if cap < 0:
+        raise ValueError(f"{name} must be non-negative; use 0 for no cap")
+    return None if cap == 0 else cap
+
+
+def select_entities(batch, max_entities: int | None):
+    max_entities = normalize_cap(max_entities, "max_entities")
+    if max_entities is None:
+        return batch, None
     (V, T), y, meta = batch
     _, N = V.shape[:2]
     cap = min(int(max_entities), N)
@@ -183,14 +195,18 @@ def select_stable_entities(
     loaders,
     dataset_info: dict[str, Any],
     device: torch.device,
-    max_entities: int,
-    max_batches: int,
-) -> list[int]:
+    max_entities: int | None,
+    max_batches: int | None,
+) -> list[int] | None:
+    max_entities = normalize_cap(max_entities, "max_entities")
+    max_batches = normalize_cap(max_batches, "max_batches")
+    if max_entities is None:
+        return None
     split_counts = []
     for loader in loaders:
         counts = None
         for i, raw in enumerate(loader):
-            if i >= max_batches:
+            if max_batches is not None and i >= max_batches:
                 break
             batch = batch_to_device(raw, device)
             (V, _), _, meta = batch
@@ -219,24 +235,30 @@ def find_batch(
     loader,
     dataset_info: dict[str, Any],
     device: torch.device,
-    max_entities: int,
-    max_batches: int,
+    max_entities: int | None,
+    max_batches: int | None,
     *,
     require_future_target: bool = True,
     selected_entities: Sequence[int] | None = None,
 ):
+    max_entities = normalize_cap(max_entities, "max_entities")
+    max_batches = normalize_cap(max_batches, "max_batches")
     skipped = 0
     for i, raw in enumerate(loader):
-        if i >= max_batches:
+        if max_batches is not None and i >= max_batches:
             break
         batch = batch_to_device(raw, device)
-        if selected_entities is None:
+        if selected_entities is None and max_entities is not None:
             batch, selected = select_entities(batch, max_entities)
         else:
-            batch = slice_entities(batch, selected_entities)
-            selected = list(selected_entities)
+            if selected_entities is None:
+                selected = None
+            else:
+                batch = slice_entities(batch, selected_entities)
+                selected = list(selected_entities)
         valid = target_mask(batch[2], batch[1]) if require_future_target else context_target_mask(batch[2], batch[0][0], dataset_info)
         if valid.any():
             return batch, selected, skipped
         skipped += 1
-    raise RuntimeError(f"{dataset_info['dataset']}: no valid batch found in first {max_batches} batches")
+    scanned = "all" if max_batches is None else str(max_batches)
+    raise RuntimeError(f"{dataset_info['dataset']}: no valid batch found in first {scanned} batches")

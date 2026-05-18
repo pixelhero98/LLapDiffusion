@@ -66,6 +66,87 @@ def _validate_random_mask_ratio(value: float) -> float:
     return ratio
 
 
+def _validate_sample_count(value: int, *, name: str) -> int:
+    count = int(value)
+    if count <= 0:
+        raise ValueError(f"{name} must be positive")
+    return count
+
+
+def _resolve_sample_counts(
+    cfg: SimpleNamespace,
+    *,
+    num_samples: Optional[int],
+    forecast_num_samples: Optional[int],
+    imputation_num_samples: Optional[int],
+) -> tuple[int, int]:
+    default_samples = _validate_sample_count(
+        getattr(cfg, "NUM_EVAL_SAMPLES", 25),
+        name="cfg.NUM_EVAL_SAMPLES",
+    )
+    shared_samples = (
+        default_samples
+        if num_samples is None
+        else _validate_sample_count(num_samples, name="num_samples")
+    )
+    forecast_samples = (
+        shared_samples
+        if forecast_num_samples is None
+        else _validate_sample_count(forecast_num_samples, name="forecast_num_samples")
+    )
+    imputation_samples = (
+        shared_samples
+        if imputation_num_samples is None
+        else _validate_sample_count(imputation_num_samples, name="imputation_num_samples")
+    )
+    return forecast_samples, imputation_samples
+
+
+def _resolve_max_eval_batches(max_eval_batches: Optional[int]) -> Optional[int]:
+    if max_eval_batches is None:
+        return None
+    batch_cap = int(max_eval_batches)
+    if batch_cap < 0:
+        raise ValueError("max_eval_batches must be non-negative")
+    return None if batch_cap == 0 else batch_cap
+
+
+class _LimitedBatches:
+    def __init__(self, dataloader, max_batches: int):
+        self._dataloader = dataloader
+        self._max_batches = int(max_batches)
+
+    def __iter__(self):
+        for batch_idx, batch in enumerate(self._dataloader):
+            if batch_idx >= self._max_batches:
+                break
+            yield batch
+
+    def __len__(self) -> int:
+        try:
+            return min(len(self._dataloader), self._max_batches)
+        except TypeError:
+            return self._max_batches
+
+
+def _limit_batches(dataloader, max_batches: Optional[int]):
+    if max_batches is None:
+        return dataloader
+    return _LimitedBatches(dataloader, max_batches)
+
+
+def _config_with_num_eval_samples(cfg: SimpleNamespace, num_samples: int) -> SimpleNamespace:
+    cfg_copy = SimpleNamespace(**vars(cfg))
+    cfg_copy.NUM_EVAL_SAMPLES = int(num_samples)
+    return cfg_copy
+
+
+def _with_imputation_metric_target(metrics: Dict[str, float]) -> Dict[str, object]:
+    tagged = dict(metrics)
+    tagged["metric_target_type"] = "target_horizon_imputation"
+    return tagged
+
+
 def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, train_dl):
     _, num_entities, window_size, feat_dim = tv._summarize_dataset(train_dl, None)
 
@@ -134,7 +215,7 @@ def _evaluate_impute_case(
     mu_mean: torch.Tensor,
     mu_std: torch.Tensor,
     keep_fn: Callable[[torch.Tensor], torch.Tensor],
-    num_samples: int = 8,
+    num_samples: int = 25,
     steps: int = 64,
     guidance_strength=(1.0, 2.0),
     guidance_power: float = 1.0,
@@ -310,12 +391,23 @@ def evaluate_checkpoint(
     *,
     generator_seed: Optional[int] = None,
     random_mask_ratio: Optional[float] = None,
+    num_samples: Optional[int] = None,
+    forecast_num_samples: Optional[int] = None,
+    imputation_num_samples: Optional[int] = None,
+    max_eval_batches: Optional[int] = None,
 ) -> Dict[str, object]:
     ckpt_path = Path(ckpt_path)
     if random_mask_ratio is None:
         random_mask_ratio = float(getattr(cfg, "IMPUTATION_RANDOM_MASK_RATIO", 0.30))
     random_mask_ratio = _validate_random_mask_ratio(random_mask_ratio)
     random_keep_frac = 1.0 - random_mask_ratio
+    forecast_samples, imputation_samples = _resolve_sample_counts(
+        cfg,
+        num_samples=num_samples,
+        forecast_num_samples=forecast_num_samples,
+        imputation_num_samples=imputation_num_samples,
+    )
+    batch_cap = _resolve_max_eval_batches(max_eval_batches)
     device = set_torch(seed=int(getattr(cfg, "SEED", 42)), deterministic=bool(getattr(cfg, "DETERMINISTIC", False)))
     run_experiment = resolve_run_experiment(cfg.DATA_DIR)
     train_dl, val_dl, test_dl, sizes = run_experiment(
@@ -331,23 +423,24 @@ def evaluate_checkpoint(
         print("eval sizes:", tuple(sizes))
     diff_model, vae, summarizer, mu_mean, mu_std = _load_stack(cfg, ckpt_path, device, train_dl)
     test_sampling = tv._sampling_kwargs(cfg, prefix="TEST")
+    forecast_cfg = _config_with_num_eval_samples(cfg, forecast_samples)
 
     forecast = tv.evaluate_regression(
         diff_model,
         vae,
         summarizer,
-        test_dl,
+        _limit_batches(test_dl, batch_cap),
         device,
         mu_mean,
         mu_std,
-        cfg,
+        forecast_cfg,
         ema=None,
         self_cond=bool(getattr(cfg, "SELF_COND", False)),
         generator_seed=generator_seed,
         **test_sampling,
     )
-    regular = _evaluate_impute_case(
-        test_dl,
+    regular = _with_imputation_metric_target(_evaluate_impute_case(
+        _limit_batches(test_dl, batch_cap),
         diff_model=diff_model,
         vae=vae,
         summarizer=summarizer,
@@ -355,7 +448,7 @@ def evaluate_checkpoint(
         mu_mean=mu_mean,
         mu_std=mu_std,
         keep_fn=lambda obs_any: _make_regular_keep(obs_any, stride=4),
-        num_samples=8,
+        num_samples=imputation_samples,
         steps=int(test_sampling["steps"]),
         guidance_strength=test_sampling["guidance_strength"],
         guidance_power=float(test_sampling["guidance_power"]),
@@ -364,11 +457,11 @@ def evaluate_checkpoint(
         dynamic_thresh_max=float(test_sampling["dynamic_thresh_max"]),
         rho=float(test_sampling["rho"]),
         generator_seed=generator_seed,
-    )
+    ))
     random_keep_generator = torch.Generator(device=device)
     random_keep_generator.manual_seed(1234)
-    random_mask = _evaluate_impute_case(
-        test_dl,
+    random_mask = _with_imputation_metric_target(_evaluate_impute_case(
+        _limit_batches(test_dl, batch_cap),
         diff_model=diff_model,
         vae=vae,
         summarizer=summarizer,
@@ -376,7 +469,7 @@ def evaluate_checkpoint(
         mu_mean=mu_mean,
         mu_std=mu_std,
         keep_fn=lambda obs_any: _make_random_keep(obs_any, frac=random_keep_frac, generator=random_keep_generator),
-        num_samples=8,
+        num_samples=imputation_samples,
         steps=int(test_sampling["steps"]),
         guidance_strength=test_sampling["guidance_strength"],
         guidance_power=float(test_sampling["guidance_power"]),
@@ -385,7 +478,7 @@ def evaluate_checkpoint(
         dynamic_thresh_max=float(test_sampling["dynamic_thresh_max"]),
         rho=float(test_sampling["rho"]),
         generator_seed=None if generator_seed is None else int(generator_seed) + 100003,
-    )
+    ))
 
     result = {
         "label": label,
@@ -401,7 +494,7 @@ def evaluate_checkpoint(
         },
     }
     if abs(random_mask_ratio - 0.30) < 1e-12:
-        result["random_mask30"] = random_mask
+        result["random_mask30"] = dict(random_mask)
     if out_path is not None:
         out_file = Path(out_path)
         out_file.write_text(json.dumps(make_jsonable(result), indent=2))
@@ -436,6 +529,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--label", type=str, default=None, help="Optional label for the evaluation payload.")
     parser.add_argument("--out-json", type=str, default=None, help="Optional JSON output path.")
     parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Shared forecast and imputation sample count. Specific sample flags take precedence.",
+    )
+    parser.add_argument(
+        "--forecast-num-samples",
+        type=int,
+        default=None,
+        help="Forecast sample count override.",
+    )
+    parser.add_argument(
+        "--imputation-num-samples",
+        type=int,
+        default=None,
+        help="Imputation sample count override.",
+    )
+    parser.add_argument(
+        "--max-eval-batches",
+        type=int,
+        default=None,
+        help="Maximum evaluation batches per pass. Use 0 for no cap.",
+    )
+    parser.add_argument(
         "--imputation-random-mask-ratio",
         type=float,
         default=None,
@@ -468,6 +585,10 @@ def main() -> None:
         label=label,
         out_path=args.out_json,
         random_mask_ratio=args.imputation_random_mask_ratio,
+        num_samples=args.num_samples,
+        forecast_num_samples=args.forecast_num_samples,
+        imputation_num_samples=args.imputation_num_samples,
+        max_eval_batches=args.max_eval_batches,
     )
     print(json.dumps(make_jsonable(result), indent=2))
 

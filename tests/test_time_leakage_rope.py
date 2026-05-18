@@ -726,6 +726,7 @@ def test_imputation_generation_only_uses_intentionally_observed_target_tokens(mo
     assert torch.allclose(call["y_obs"], expected_y_obs)
     assert torch.all(call["y_obs"][:, 2:] == 0)
 
+
 def test_random_imputation_keep_mask_generator_advances_between_batches():
     from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
 
@@ -737,6 +738,192 @@ def test_random_imputation_keep_mask_generator_advances_between_batches():
     second = ce._make_random_keep(obs_any, frac=0.70, generator=generator)
 
     assert not torch.equal(first, second)
+
+
+def _checkpoint_eval_cfg(num_eval_samples=25):
+    return SimpleNamespace(
+        DATA_DIR="demo",
+        date_batching=True,
+        DATES_PER_BATCH=1,
+        WINDOW=4,
+        PRED=10,
+        COVERAGE=0.0,
+        train_ratio=0.7,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        SEED=42,
+        DETERMINISTIC=False,
+        NUM_EVAL_SAMPLES=num_eval_samples,
+        SELF_COND=False,
+    )
+
+
+def _checkpoint_eval_impute_metrics():
+    return {
+        "hidden_mae": 0.0,
+        "hidden_mse": 0.0,
+        "hidden_crps": 1.0,
+        "observed_mae": 0.0,
+        "observed_token_frac": 0.7,
+        "hidden_token_frac": 0.3,
+    }
+
+
+def _patch_checkpoint_eval_dependencies(
+    monkeypatch,
+    ce,
+    *,
+    test_dl=None,
+    forecast_fn=None,
+    impute_fn=None,
+):
+    if test_dl is None:
+        test_dl = ["test"]
+    monkeypatch.setattr(ce, "set_torch", lambda **kwargs: torch.device("cpu"))
+    monkeypatch.setattr(
+        ce,
+        "resolve_run_experiment",
+        lambda data_dir: (
+            lambda **kwargs: (["train"], ["val"], test_dl, (1, 1, len(test_dl)))
+        ),
+    )
+    monkeypatch.setattr(
+        ce,
+        "_load_stack",
+        lambda *args, **kwargs: (
+            object(),
+            object(),
+            object(),
+            torch.zeros(1),
+            torch.ones(1),
+        ),
+    )
+    monkeypatch.setattr(ce.tv, "_sampling_kwargs", lambda cfg, prefix: {
+        "steps": 2,
+        "guidance_strength": (1.0, 2.0),
+        "guidance_power": 1.0,
+        "eta": 0.0,
+        "dynamic_thresh_p": 0.0,
+        "dynamic_thresh_max": 1.0,
+        "rho": 7.5,
+    })
+    monkeypatch.setattr(
+        ce.tv,
+        "evaluate_regression",
+        forecast_fn or (lambda *args, **kwargs: {"crps": 1.0}),
+    )
+    monkeypatch.setattr(
+        ce,
+        "_evaluate_impute_case",
+        impute_fn or (lambda *args, **kwargs: _checkpoint_eval_impute_metrics()),
+    )
+
+
+def test_checkpoint_eval_cli_parses_sample_and_batch_knobs(monkeypatch):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llapdiff-checkpoint-eval",
+            "--dataset-key",
+            "crypto",
+            "--checkpoint",
+            "model.pt",
+            "--num-samples",
+            "6",
+            "--forecast-num-samples",
+            "7",
+            "--imputation-num-samples",
+            "9",
+            "--max-eval-batches",
+            "0",
+        ],
+    )
+
+    args = ce._parse_args()
+
+    assert args.num_samples == 6
+    assert args.forecast_num_samples == 7
+    assert args.imputation_num_samples == 9
+    assert args.max_eval_batches == 0
+
+
+def test_checkpoint_eval_routes_sample_counts(monkeypatch, tmp_path):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+
+    captured = {"forecast": [], "impute": []}
+
+    def fake_forecast(*args, **kwargs):
+        captured["forecast"].append(args[7].NUM_EVAL_SAMPLES)
+        return {"crps": 1.0}
+
+    def fake_impute(*args, **kwargs):
+        captured["impute"].append(kwargs["num_samples"])
+        return _checkpoint_eval_impute_metrics()
+
+    _patch_checkpoint_eval_dependencies(
+        monkeypatch,
+        ce,
+        forecast_fn=fake_forecast,
+        impute_fn=fake_impute,
+    )
+    cfg = _checkpoint_eval_cfg(num_eval_samples=25)
+
+    ce.evaluate_checkpoint(cfg, tmp_path / "model.pt", label="default")
+    assert captured == {"forecast": [25], "impute": [25, 25]}
+
+    captured["forecast"].clear()
+    captured["impute"].clear()
+    ce.evaluate_checkpoint(cfg, tmp_path / "model.pt", label="shared", num_samples=6)
+    assert captured == {"forecast": [6], "impute": [6, 6]}
+
+    captured["forecast"].clear()
+    captured["impute"].clear()
+    ce.evaluate_checkpoint(
+        cfg,
+        tmp_path / "model.pt",
+        label="specific",
+        num_samples=6,
+        forecast_num_samples=7,
+        imputation_num_samples=9,
+    )
+    assert captured == {"forecast": [7], "impute": [9, 9]}
+
+
+def test_checkpoint_eval_routes_max_eval_batches(monkeypatch, tmp_path):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+
+    test_batches = ["batch0", "batch1", "batch2", "batch3"]
+    captured = {"forecast": [], "impute": []}
+
+    def fake_forecast(*args, **kwargs):
+        captured["forecast"].append(list(args[3]))
+        return {"crps": 1.0}
+
+    def fake_impute(test_dl, *args, **kwargs):
+        captured["impute"].append(list(test_dl))
+        return _checkpoint_eval_impute_metrics()
+
+    _patch_checkpoint_eval_dependencies(
+        monkeypatch,
+        ce,
+        test_dl=test_batches,
+        forecast_fn=fake_forecast,
+        impute_fn=fake_impute,
+    )
+    cfg = _checkpoint_eval_cfg()
+
+    ce.evaluate_checkpoint(cfg, tmp_path / "model.pt", label="capped", max_eval_batches=2)
+    assert captured["forecast"] == [["batch0", "batch1"]]
+    assert captured["impute"] == [["batch0", "batch1"], ["batch0", "batch1"]]
+
+    captured["forecast"].clear()
+    captured["impute"].clear()
+    ce.evaluate_checkpoint(cfg, tmp_path / "model.pt", label="uncapped", max_eval_batches=0)
+    assert captured["forecast"] == [test_batches]
+    assert captured["impute"] == [test_batches, test_batches]
 
 
 def test_checkpoint_eval_random_mask30_uses_seventy_percent_keep(monkeypatch, tmp_path):
@@ -814,6 +1001,9 @@ def test_checkpoint_eval_random_mask30_uses_seventy_percent_keep(monkeypatch, tm
     assert result["random_mask"]["hidden_token_frac"] == pytest.approx(0.30, abs=0.10)
     assert result["random_mask30"]["observed_token_frac"] == pytest.approx(0.70, abs=0.10)
     assert result["random_mask30"]["hidden_token_frac"] == pytest.approx(0.30, abs=0.10)
+    assert result["regular_keep25"]["metric_target_type"] == "target_horizon_imputation"
+    assert result["random_mask"]["metric_target_type"] == "target_horizon_imputation"
+    assert result["random_mask30"]["metric_target_type"] == "target_horizon_imputation"
 
 
 def test_continuous_rope_summarizer_forward_shape_and_finiteness():

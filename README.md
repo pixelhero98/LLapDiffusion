@@ -226,20 +226,19 @@ git clone https://github.com/microsoft/physiopro.git physiopro && git -C physiop
 
 ### Practical all-horizon runs
 
-Use the bounded practical runners for public baseline results. Pass `--horizons all` to evaluate every public horizon for each selected dataset; omitting it keeps the longest-horizon default. `--dataset all` covers all seven public datasets and `--baseline all` covers DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, MR-Diff, t-PatchGNN, and ContiFormer:
+The practical baseline runners are full-data comparison runs by default. They evaluate every public horizon, use the full entity panel, scan the full train/validation/test loaders, train with a 600-epoch budget and 50-epoch patience, report observation-weighted metrics, and use 25 samples for probabilistic CRPS. `--dataset all` covers all seven public datasets and `--baseline all` covers DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, MR-Diff, t-PatchGNN, and ContiFormer:
 
 ```bash
 llapdiff-baselines practical-extrapolation \
   --baseline all \
   --dataset all \
-  --horizons all \
   --baseline-source-root /path/to/baseline-sources \
   --output-dir ldt/results/baseline_runs \
   --allow-cache-copy \
   --work-cache-dir ldt/cache_work
 ```
 
-CSDI is an imputation baseline, not a forecast-horizon extrapolator. The CSDI practical runner reports held-out context imputation on the supported imputation datasets:
+CSDI is an imputation baseline, not a forecast-horizon extrapolator. Its comparable default is target-horizon imputation: the model conditions on the context plus retained target-horizon tokens, randomly hides the configured fraction of observed target-horizon tokens, and scores only those hidden target tokens:
 
 ```bash
 llapdiff-baselines csdi-imputation \
@@ -251,18 +250,20 @@ llapdiff-baselines csdi-imputation \
   --work-cache-dir ldt/cache_work
 ```
 
-For smaller checks, select one baseline or dataset explicitly:
+The older context-window CSDI diagnostic remains available with `--csdi-imputation-target context`, but it should not be mixed with target-horizon LLapDiff imputation comparisons.
+
+For small debug probes, use `--quick`. This restores the bounded legacy settings: up to 4 entities, 30 scan batches, 256 train/eval batches, 50 epochs, 8 patience, and 4 probabilistic samples. Treat these as sanity checks, not comparison numbers:
 
 ```bash
 llapdiff-baselines practical-extrapolation \
   --baseline dlinear \
   --dataset crypto \
-  --horizons 5 20 60 100 \
+  --quick \
   --baseline-source-root /path/to/baseline-sources \
   --output-dir ldt/results/baseline_runs
 ```
 
-MR-Diff can be selected with `--baseline mr-diff` without `--baseline-source-root`. For paper-style stochastic evaluation of probabilistic baselines, set `--num-samples 10`.
+MR-Diff can be selected with `--baseline mr-diff` without `--baseline-source-root`. Use explicit caps such as `--max-entities`, `--max-train-batches`, or `--max-eval-batches` only for debugging; passing `0` to these cap flags means no cap.
 
 ## Repository layout
 

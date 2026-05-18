@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib
 import sys
 from types import ModuleType, SimpleNamespace
@@ -7,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from llapdiffusion.baselines.data import select_stable_entities, target_index
+from llapdiffusion.baselines.data import find_batch, select_stable_entities, target_index
 from llapdiffusion.baselines.metrics import masked_mae, masked_mse, sample_crps
 from llapdiffusion.baselines.registry import BASELINES, DATASET_KEYS, EXTRAPOLATION_BASELINES, IMPUTATION_BASELINES
 from llapdiffusion.baselines.sources import SourceManager, prepend_paths
@@ -28,7 +29,7 @@ def test_baseline_registry_records_public_contracts():
     assert len(DATASET_KEYS) == 7
     assert BASELINES["dlinear"].source_sha == "0c113668a3b88c4c4ee586b8c5ec3e539c4de5a6"
     assert BASELINES["csdi"].placement == "imputation/csdi"
-    assert "context-window imputation" in BASELINES["csdi"].dependency_caveat
+    assert "target-horizon imputation" in BASELINES["csdi"].dependency_caveat
     assert BASELINES["mtan"].probabilistic is True
     assert BASELINES["contiformer"].dependency_sources == (("physiopro", "5486d1ccaff8f33d635753e3debd7465234b09f1"),)
 
@@ -57,6 +58,8 @@ def _sample_dataset_info(context: int = 5, horizon: int = 4):
         "dataset": "demo",
         "window": context,
         "horizon": horizon,
+        "lengths": [1, 1, 1],
+        "copied_cache": False,
         "feature_cols": ["target"],
         "target_col": "target",
     }
@@ -145,10 +148,12 @@ def test_build_adapter_passes_csdi_imputation_mask_ratio(monkeypatch):
             *,
             num_samples=4,
             imputation_random_mask_ratio=0.30,
+            imputation_target="target",
         ):
             super().__init__()
             seen["num_samples"] = num_samples
             seen["imputation_random_mask_ratio"] = imputation_random_mask_ratio
+            seen["imputation_target"] = imputation_target
 
     monkeypatch.setattr(builder, "CSDIAdapter", FakeCSDIAdapter)
     adapter = builder.build_adapter(
@@ -159,10 +164,11 @@ def test_build_adapter_passes_csdi_imputation_mask_ratio(monkeypatch):
         torch.device("cpu"),
         num_samples=5,
         imputation_random_mask_ratio=0.45,
+        csdi_imputation_target="context",
     )
 
     assert isinstance(adapter, FakeCSDIAdapter)
-    assert seen == {"num_samples": 5, "imputation_random_mask_ratio": 0.45}
+    assert seen == {"num_samples": 5, "imputation_random_mask_ratio": 0.45, "imputation_target": "context"}
 
 
 def test_mr_diff_adapter_loss_and_samples_shape():
@@ -338,6 +344,94 @@ def test_csdi_random_gt_mask_holds_out_configured_hidden_fraction():
     assert (observed - gt_mask).sum(dim=(1, 2)).tolist() == [15.0, 15.0]
 
 
+def test_csdi_target_horizon_mask_hides_only_future_tokens():
+    from llapdiffusion.baselines.adapters.csdi import CSDIAdapter
+
+    adapter = CSDIAdapter.__new__(CSDIAdapter)
+    adapter.imputation_random_mask_ratio = 0.50
+    adapter.imputation_target = "target"
+    batch = _sample_baseline_batch(batch_size=1, entities=2, context=3, horizon=4)
+    dataset_info = _sample_dataset_info(context=3, horizon=4)
+
+    torch.manual_seed(13)
+    csdi_batch = adapter._batch(batch, dataset_info)
+
+    observed = csdi_batch["observed_mask"]
+    kept = csdi_batch["gt_mask"]
+    assert observed.shape == (1, 7, 2)
+    assert torch.equal(kept[:, :3, :], observed[:, :3, :])
+    hidden_future = observed[:, 3:, :] - kept[:, 3:, :]
+    assert hidden_future.sum().item() == 4.0
+    assert kept[:, 3:, :].sum().item() == 4.0
+
+
+def test_csdi_target_horizon_mask_hides_sparse_future_token():
+    from llapdiffusion.baselines.adapters.csdi import CSDIAdapter
+
+    adapter = CSDIAdapter.__new__(CSDIAdapter)
+    adapter.imputation_random_mask_ratio = 0.30
+    observed = torch.zeros(1, 5, 2)
+    observed[:, :3, :] = 1.0
+    observed[:, 4, 1] = 1.0
+
+    kept = adapter._target_horizon_gt_mask(observed, context_length=3)
+
+    assert torch.equal(kept[:, :3, :], observed[:, :3, :])
+    assert kept[:, 3:, :].sum().item() == 0.0
+    assert (observed[:, 3:, :] - kept[:, 3:, :]).sum().item() == 1.0
+
+
+def test_csdi_loss_uses_target_horizon_gt_mask_for_training():
+    from llapdiffusion.baselines.adapters.csdi import CSDIAdapter
+
+    class FakeCSDI(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+            self.forward_called = False
+            self.cond_mask = None
+            self.received_gt = None
+            self.target_mask = None
+
+        def forward(self, batch, is_train=1):
+            self.forward_called = True
+            raise AssertionError("adapter should not use upstream random-mask forward for training")
+
+        def process_data(self, batch):
+            observed_data = batch["observed_data"].float().permute(0, 2, 1)
+            observed_mask = batch["observed_mask"].float().permute(0, 2, 1)
+            observed_tp = batch["timepoints"].float()
+            gt_mask = batch["gt_mask"].float().permute(0, 2, 1)
+            self.received_gt = gt_mask.detach().clone()
+            return observed_data, observed_mask, observed_tp, gt_mask, observed_mask, torch.zeros(observed_data.shape[0])
+
+        def get_side_info(self, observed_tp, cond_mask):
+            self.cond_mask = cond_mask.detach().clone()
+            return cond_mask.unsqueeze(1)
+
+        def calc_loss(self, observed_data, cond_mask, observed_mask, side_info, is_train, set_t=-1):
+            self.target_mask = observed_mask - cond_mask
+            return self.target_mask.sum() * self.weight
+
+    adapter = CSDIAdapter.__new__(CSDIAdapter)
+    torch.nn.Module.__init__(adapter)
+    adapter.imputation_random_mask_ratio = 0.50
+    adapter.imputation_target = "target"
+    adapter.model = FakeCSDI()
+    batch = _sample_baseline_batch(batch_size=1, entities=2, context=3, horizon=4)
+    dataset_info = _sample_dataset_info(context=3, horizon=4)
+
+    torch.manual_seed(17)
+    loss = adapter.loss(batch, dataset_info)
+    loss.backward()
+
+    assert adapter.model.forward_called is False
+    assert torch.equal(adapter.model.cond_mask, adapter.model.received_gt)
+    assert adapter.model.target_mask[..., :3].sum().item() == 0.0
+    assert adapter.model.target_mask[..., 3:].sum().item() == 4.0
+    assert adapter.model.weight.grad.item() == pytest.approx(4.0)
+
+
 def test_practical_matrix_expands_all_supported_horizons(monkeypatch, tmp_path):
     from llapdiffusion.baselines import runner
 
@@ -356,6 +450,125 @@ def test_practical_matrix_expands_all_supported_horizons(monkeypatch, tmp_path):
 
     assert calls == [("mr-diff", "crypto", 4), ("mr-diff", "crypto", 8)]
     assert [row["horizon"] for row in rows] == [4, 8]
+
+
+def test_run_baselines_practical_defaults_are_full_comparison(monkeypatch):
+    from llapdiffusion.tools import run_baselines
+
+    monkeypatch.setattr(sys, "argv", ["llapdiff-baselines", "practical-extrapolation"])
+    args = run_baselines.parse_args()
+    config = run_baselines._train_config(args)
+
+    assert config.max_entities is None
+    assert config.max_batches is None
+    assert config.max_train_batches is None
+    assert config.max_eval_batches is None
+    assert config.horizons == "all"
+    assert config.epochs == 600
+    assert config.patience == 50
+    assert config.num_samples == 25
+
+
+def test_run_baselines_smoke_defaults_remain_bounded(monkeypatch):
+    from llapdiffusion.tools import run_baselines
+
+    monkeypatch.setattr(sys, "argv", ["llapdiff-baselines", "smoke"])
+    args = run_baselines.parse_args()
+    config = run_baselines._smoke_config(args)
+
+    assert config.max_entities == 4
+    assert config.max_batches == 30
+    assert config.num_samples == 4
+
+
+def test_run_baselines_quick_restores_legacy_caps(monkeypatch):
+    from llapdiffusion.tools import run_baselines
+
+    monkeypatch.setattr(sys, "argv", ["llapdiff-baselines", "practical-extrapolation", "--quick"])
+    args = run_baselines.parse_args()
+    config = run_baselines._train_config(args)
+
+    assert config.max_entities == 4
+    assert config.max_batches == 30
+    assert config.max_train_batches == 256
+    assert config.max_eval_batches == 256
+    assert config.epochs == 50
+    assert config.patience == 8
+    assert config.num_samples == 4
+
+
+def test_run_baselines_csdi_defaults_to_target_horizon_all_horizons(monkeypatch):
+    from llapdiffusion.tools import run_baselines
+
+    monkeypatch.setattr(sys, "argv", ["llapdiff-baselines", "csdi-imputation"])
+    args = run_baselines.parse_args()
+    config = run_baselines._train_config(args)
+
+    assert config.csdi_imputation_target == "target"
+    assert config.horizons == "all"
+    assert config.max_entities is None
+    assert config.max_train_batches is None
+    assert config.num_samples == 25
+
+
+def test_run_baselines_csdi_quick_restores_legacy_caps(monkeypatch):
+    from llapdiffusion.tools import run_baselines
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["llapdiff-baselines", "csdi-imputation", "--quick", "--csdi-imputation-target", "context", "--horizons", "5"],
+    )
+    args = run_baselines.parse_args()
+    config = run_baselines._train_config(args)
+
+    assert config.csdi_imputation_target == "context"
+    assert config.horizons == (5,)
+    assert config.max_entities == 4
+    assert config.max_train_batches == 256
+    assert config.max_eval_batches == 256
+    assert config.epochs == 50
+    assert config.patience == 8
+    assert config.num_samples == 4
+
+
+def test_run_baselines_zero_caps_mean_no_cap(monkeypatch):
+    from llapdiffusion.tools import run_baselines
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llapdiff-baselines",
+            "practical-extrapolation",
+            "--max-entities",
+            "0",
+            "--max-batches",
+            "0",
+            "--max-train-batches",
+            "0",
+            "--max-eval-batches",
+            "0",
+        ],
+    )
+    args = run_baselines.parse_args()
+    config = run_baselines._train_config(args)
+
+    assert config.max_entities is None
+    assert config.max_batches is None
+    assert config.max_train_batches is None
+    assert config.max_eval_batches is None
+
+
+@pytest.mark.parametrize("flag", ["--max-entities", "--max-batches", "--max-train-batches", "--max-eval-batches"])
+def test_run_baselines_negative_caps_are_rejected(monkeypatch, flag):
+    from llapdiffusion.tools import run_baselines
+
+    monkeypatch.setattr(sys, "argv", ["llapdiff-baselines", "practical-extrapolation", flag, "-1"])
+    args = run_baselines.parse_args()
+
+    with pytest.raises(SystemExit, match=flag.removeprefix("--")):
+        run_baselines._train_config(args)
 
 
 def test_write_jobs_omits_source_root_for_first_party_mr_diff(tmp_path):
@@ -392,6 +605,136 @@ def test_masked_metrics_and_point_crps_respect_valid_mask():
     crps, mse = sample_crps(samples, y, valid)
     assert torch.allclose(crps, masked_mae(pred, y, valid))
     assert torch.allclose(mse, masked_mse(pred, y, valid))
+
+
+def test_sample_crps_uses_distinct_pair_estimator():
+    samples = torch.tensor([[[[0.0]]], [[[4.0]]]])
+    y = torch.tensor([[[1.0]]])
+    valid = torch.tensor([[[True]]])
+
+    crps, mse = sample_crps(samples, y, valid)
+
+    assert torch.allclose(crps, torch.tensor(0.0))
+    assert torch.allclose(mse, torch.tensor(1.0))
+
+
+class _ZeroPointModel(torch.nn.Module):
+    def forward(self, batch, dataset_info):
+        return torch.zeros_like(batch[1])
+
+
+def _metric_batch(values: torch.Tensor, valid: torch.Tensor):
+    batch_size, entities, horizon = values.shape
+    V = torch.zeros(batch_size, entities, 1, 1)
+    T = torch.zeros_like(V)
+    meta = {
+        "x_obs_mask": torch.ones(batch_size, entities, 1, 1, dtype=torch.bool),
+        "y_obs_mask": valid,
+        "entity_mask": torch.ones(batch_size, entities, dtype=torch.bool),
+    }
+    return (V, T), values, meta
+
+
+def test_evaluate_loader_weights_metrics_by_valid_observations():
+    from llapdiffusion.baselines.runner import _evaluate_loader
+
+    loader = [
+        _metric_batch(torch.tensor([[[10.0, 0.0, 0.0]]]), torch.tensor([[[True, False, False]]])),
+        _metric_batch(torch.tensor([[[1.0, 1.0, 1.0]]]), torch.tensor([[[True, True, True]]])),
+    ]
+    result = _evaluate_loader(
+        _ZeroPointModel(),
+        "dlinear",
+        loader,
+        _sample_dataset_info(context=1, horizon=3),
+        torch.device("cpu"),
+        max_batches=0,
+        selected_entities=None,
+    )
+
+    assert result["batches"] == 2
+    assert result["valid_observations"] == 4
+    assert result["raw_batches_scanned"] == 2
+    assert result["metric_aggregation"] == "valid_observation_weighted"
+    assert result["loss_aggregation"] == "batch_mean"
+    assert result["mse"] == pytest.approx((100.0 + 1.0 + 1.0 + 1.0) / 4.0)
+    assert result["mae"] == pytest.approx((10.0 + 1.0 + 1.0 + 1.0) / 4.0)
+    assert result["crps"] is None
+
+
+class _ZeroCSDIModel(torch.nn.Module):
+    imputation_target = "target"
+    metric_target_type = "target_horizon_imputation"
+
+    def loss_and_samples(self, batch, dataset_info):
+        observed = batch[1].permute(0, 2, 1).contiguous()
+        mask = batch[2]["csdi_target_mask"].permute(0, 2, 1).contiguous()
+        return torch.tensor(0.0), torch.zeros(1, *observed.shape), observed, mask
+
+
+def test_evaluate_loader_uses_csdi_holdout_denominator():
+    from llapdiffusion.baselines.runner import _evaluate_loader
+
+    first = _metric_batch(torch.tensor([[[10.0, 0.0, 0.0]]]), torch.tensor([[[True, False, False]]]))
+    first[2]["csdi_target_mask"] = torch.tensor([[[True, False, False]]])
+    second = _metric_batch(torch.tensor([[[1.0, 1.0, 1.0]]]), torch.tensor([[[True, True, True]]]))
+    second[2]["csdi_target_mask"] = torch.tensor([[[True, True, True]]])
+    result = _evaluate_loader(
+        _ZeroCSDIModel(),
+        "csdi",
+        [first, second],
+        _sample_dataset_info(context=1, horizon=3),
+        torch.device("cpu"),
+        max_batches=0,
+        selected_entities=None,
+    )
+
+    assert result["valid_observations"] == 4
+    assert result["metric_target_type"] == "target_horizon_imputation"
+    assert result["mse"] == pytest.approx((100.0 + 1.0 + 1.0 + 1.0) / 4.0)
+    assert result["crps"] == pytest.approx((10.0 + 1.0 + 1.0 + 1.0) / 4.0)
+
+
+def test_write_rows_flattens_practical_metrics(tmp_path):
+    from llapdiffusion.baselines.runner import write_rows
+
+    write_rows(
+        [
+            {
+                "status": "ok",
+                "baseline": "mr-diff",
+                "dataset": "crypto",
+                "horizon": 100,
+                "entity_selection_mode": "full_panel",
+                "best_epoch": 3,
+                "best_val_mse": 1.25,
+                "entity_cap": None,
+                "batch_scan_cap": None,
+                "train_batch_cap": None,
+                "eval_batch_cap": None,
+                "loader_batches": {"train": 10, "val": 2, "test": 4},
+                "test": {
+                    "mse": 2.5,
+                    "crps": 1.5,
+                    "valid_observations": 99,
+                    "metric_aggregation": "valid_observation_weighted",
+                },
+            }
+        ],
+        tmp_path,
+        prefix="baseline_practical",
+    )
+
+    with (tmp_path / "baseline_practical.csv").open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["test_mse"] == "2.5"
+    assert row["test_crps"] == "1.5"
+    assert row["test_valid_observations"] == "99"
+    assert row["test_metric_aggregation"] == "valid_observation_weighted"
+    assert row["best_epoch"] == "3"
+    assert row["train_loader_batches"] == "10"
+    assert row["val_loader_batches"] == "2"
+    assert row["test_loader_batches"] == "4"
 
 
 def test_source_manager_loads_modules_without_leaking_sys_path(tmp_path):
@@ -461,6 +804,69 @@ def test_select_stable_entities_uses_context_coverage_across_splits():
         max_batches=2,
     )
     assert selected == [1]
+
+
+def test_select_stable_entities_full_panel_returns_none_without_scanning():
+    selected = select_stable_entities(
+        loaders=[],
+        dataset_info={"dataset": "demo", "feature_cols": ["target"], "target_col": "target"},
+        device=torch.device("cpu"),
+        max_entities=0,
+        max_batches=0,
+    )
+    assert selected is None
+
+
+def test_find_batch_full_panel_does_not_slice_entities():
+    batch = _sample_baseline_batch(batch_size=1, entities=5, context=3, horizon=2)
+    found, selected, skipped = find_batch(
+        [batch],
+        _sample_dataset_info(context=3, horizon=2),
+        torch.device("cpu"),
+        max_entities=0,
+        max_batches=0,
+    )
+
+    assert selected is None
+    assert skipped == 0
+    assert found[0][0].shape[1] == 5
+
+
+def test_practical_entity_selection_does_not_scan_test_split(monkeypatch, tmp_path):
+    from llapdiffusion.baselines import runner
+
+    calls = {}
+
+    def fake_select(loaders, dataset_info, device, max_entities, max_batches):
+        calls["loader_count"] = len(tuple(loaders))
+        return [0]
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, batch, dataset_info):
+            return torch.zeros_like(batch[1]) + self.weight
+
+    batch = _sample_baseline_batch(batch_size=1, entities=2, context=3, horizon=2)
+    monkeypatch.setattr(runner, "resolve_device", lambda device: torch.device("cpu"))
+    monkeypatch.setattr(runner, "SourceManager", lambda source_root: SimpleNamespace(validate=lambda spec: {
+        "source_name": "LLapDiffusion",
+        "source_sha": "first-party-paper-derived",
+        "source_clean": True,
+        "official_reference": "",
+        "dependency_caveat": "",
+        "dependency_sources": {},
+    }))
+    monkeypatch.setattr(runner, "load_dataset_loaders", lambda *args, **kwargs: (([batch], [batch], [batch]), _sample_dataset_info(context=3, horizon=2)))
+    monkeypatch.setattr(runner, "select_stable_entities", fake_select)
+    monkeypatch.setattr(runner, "build_adapter", lambda *args, **kwargs: FakeModel())
+
+    config = runner.TrainConfig(source_root=None, max_entities=1, max_batches=1, epochs=1, patience=1, max_train_batches=1, max_eval_batches=1)
+    runner.run_practical_one("dlinear", "crypto", config, tmp_path, horizon=2)
+
+    assert calls["loader_count"] == 2
 
 
 def test_mr_diff_adapter_handles_masked_irregular_inputs_and_backward():
