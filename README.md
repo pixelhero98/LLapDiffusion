@@ -94,7 +94,7 @@ done
 
 ## Evaluation datasets
 
-The cached evaluation datasets are bundled as package data at `llapdiffusion/datasets/LLapDiff-evaluation-datasets.zip`. The pipeline extracts the matching cache root automatically when a preset cache directory is absent. You can also provide an alternate archive:
+The cached evaluation datasets are bundled as package data at `llapdiffusion/datasets/LLapDiff-evaluation-datasets.zip` with SHA256 `afd74b04ba498e9fca521938b6090867a61a8de1b7c2dea01007794b051d89e0`. The pipeline extracts the matching cache root automatically when a preset cache directory is absent. You can also provide an alternate archive:
 
 ```bash
 llapdiff-train \
@@ -197,12 +197,58 @@ llapdiff-plot-poles \
 
 The pole plot overlays global/base poles with conditioned effective poles built from real dataset context.
 
+## External baselines
+
+Baseline adapters are packaged under `llapdiffusion.baselines`, but the official upstream repositories remain external. Clone the pinned sources outside this repository and pass their parent directory explicitly:
+
+```bash
+mkdir -p /path/to/baseline-sources
+cd /path/to/baseline-sources
+git clone https://github.com/cure-lab/LTSF-Linear.git LTSF-Linear && git -C LTSF-Linear checkout 0c113668a3b88c4c4ee586b8c5ec3e539c4de5a6
+git clone https://github.com/patrick-kidger/NeuralCDE.git NeuralCDE && git -C NeuralCDE checkout 7e529f58441d719d2ce85f56bdee3208a90d5132
+git clone https://github.com/PatchTST/PatchTST.git PatchTST && git -C PatchTST checkout bb0bc6058ddc421c02e8afe77e7e8db99f913957
+git clone https://github.com/kongqi404/timegrad.git timegrad && git -C timegrad checkout dec29a5679a65f5464a9da2dd27a3521000d8b75
+git clone https://github.com/reml-lab/mTAN.git mTAN && git -C mTAN checkout 7a3d536ee742f1cacb4a6d3478ac78a228d995ff
+git clone https://github.com/usail-hkust/t-PatchGNN.git t-PatchGNN && git -C t-PatchGNN checkout 00c94e7bbaf21c71b03ed84ff690ae59e37129e5
+git clone https://github.com/microsoft/SeqML.git SeqML && git -C SeqML checkout 1ecaa5b28fd14fa30eabf5c7de9fe11444e315ce
+git clone https://github.com/ermongroup/CSDI.git CSDI && git -C CSDI checkout 7f24a436f08d98853a6b43d4f7f04e5a65ecdf27
+git clone https://github.com/microsoft/physiopro.git physiopro && git -C physiopro checkout 5486d1ccaff8f33d635753e3debd7465234b09f1
+```
+
+```bash
+llapdiff-baselines smoke \
+  --baseline all \
+  --dataset all \
+  --baseline-source-root /path/to/baseline-sources \
+  --output-dir ldt/results/baseline_smoke \
+  --allow-cache-copy \
+  --work-cache-dir ldt/cache_work
+```
+
+The baseline pool includes extrapolation adapters for DLinear, NeuralCDE, PatchTST, TimeGrad, mTAN, t-PatchGNN, and ContiFormer, plus CSDI under imputation. Smoke results are one-batch source/import/forward/loss/backward checks, not benchmark scores. CSDI is reported as `context_imputation_holdout`; it is not a forecast-horizon extrapolation result.
+
+Bounded practical runs use the same LLapDiffusion dataset presets and longest horizons:
+
+```bash
+llapdiff-baselines practical-extrapolation \
+  --baseline dlinear \
+  --dataset crypto \
+  --baseline-source-root /path/to/baseline-sources \
+  --output-dir ldt/results/baseline_runs
+
+llapdiff-baselines csdi-imputation \
+  --dataset all \
+  --baseline-source-root /path/to/baseline-sources \
+  --output-dir ldt/results/csdi_runs
+```
+
 ## Repository layout
 
 ```text
 LLapDiffusion/
 |-- llapdiffusion/
 |   |-- pipeline.py            # Main training and validation entrypoint
+|   |-- baselines/             # External baseline adapters, metrics, and runners
 |   |-- configs/               # Generic config, dataset presets, and config helpers
 |   |-- trainers/              # VAE, summarizer, and LLapDiff trainers
 |   |-- tools/                 # Artifact preparation and checkpoint evaluation CLIs
