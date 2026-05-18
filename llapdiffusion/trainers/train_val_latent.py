@@ -1,6 +1,6 @@
 """Training routine for the latent VAE used in the pipeline.
 
-This version trains a PDF-aligned *set-attention* VAE:
+This version trains a *set-attention* VAE:
 - For each time step t, treat N entities as a set of tokens.
 - Token features are [value * obs_mask, obs_mask] (2 channels).
 - Loss is masked reconstruction (only where obs_mask==1) + β * KL.
