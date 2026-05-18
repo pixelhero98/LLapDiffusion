@@ -14,10 +14,6 @@ __all__ = ["LaplaceTransformEncoder", "LaplacePseudoInverse"]
 class LaplaceTransformEncoder(nn.Module):
     """Modal analysis that maps a time sequence to modal residues.
 
-    This version keeps only the *learned spectral cross-attention* path, which is the
-    most expressive and matches the paper's main conditioning mechanism (modes query
-    time; values come from x).
-
     Output:
         theta: [B, 2K, D]  (first K cosine residues, last K sine residues)
         rho:   [B, K]
