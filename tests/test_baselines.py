@@ -7,7 +7,7 @@ from types import ModuleType
 import pytest
 import torch
 
-from llapdiffusion.baselines.data import target_index
+from llapdiffusion.baselines.data import select_stable_entities, target_index
 from llapdiffusion.baselines.metrics import masked_mae, masked_mse, sample_crps
 from llapdiffusion.baselines.registry import BASELINES, DATASET_KEYS, EXTRAPOLATION_BASELINES, IMPUTATION_BASELINES
 from llapdiffusion.baselines.sources import SourceManager, prepend_paths
@@ -90,3 +90,29 @@ def test_prepend_paths_restores_preexisting_modules(tmp_path):
     finally:
         sys.modules.pop("fake_upstream", None)
         sys.modules.pop("fake_upstream.child", None)
+
+
+def test_select_stable_entities_uses_context_coverage_across_splits():
+    def batch(mask):
+        V = torch.zeros(1, 3, 2, 1)
+        T = torch.zeros_like(V)
+        y = torch.zeros(1, 3, 1)
+        meta = {
+            "x_obs_mask": torch.tensor(mask, dtype=torch.bool).reshape(1, 3, 2, 1),
+            "entity_mask": torch.ones(1, 3, dtype=torch.bool),
+        }
+        return (V, T), y, meta
+
+    loaders = [
+        [batch([1, 1, 1, 1, 0, 0])],
+        [batch([0, 0, 1, 1, 1, 1])],
+        [batch([0, 0, 1, 1, 0, 0])],
+    ]
+    selected = select_stable_entities(
+        loaders,
+        {"dataset": "demo", "feature_cols": ["target"], "target_col": "target"},
+        torch.device("cpu"),
+        max_entities=1,
+        max_batches=2,
+    )
+    assert selected == [1]

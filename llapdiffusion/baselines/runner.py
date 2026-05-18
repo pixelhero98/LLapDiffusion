@@ -17,6 +17,7 @@ from llapdiffusion.baselines.data import (
     context_target_mask,
     find_batch,
     load_dataset_loaders,
+    select_stable_entities,
     slice_entities,
     target_mask,
 )
@@ -341,6 +342,13 @@ def run_practical_one(baseline: str, dataset: str, config: TrainConfig, run_root
         work_cache_dir=Path(config.work_cache_dir).expanduser().resolve() if config.work_cache_dir else None,
     )
     train_dl, val_dl, test_dl = loaders
+    selected_entities = select_stable_entities(
+        loaders,
+        dataset_info,
+        device,
+        config.max_entities,
+        config.max_batches,
+    )
     sample_batch, selected_entities, _ = find_batch(
         train_dl,
         dataset_info,
@@ -348,6 +356,7 @@ def run_practical_one(baseline: str, dataset: str, config: TrainConfig, run_root
         config.max_entities,
         config.max_batches,
         require_future_target=baseline != "csdi",
+        selected_entities=selected_entities,
     )
     model = build_adapter(baseline, dataset_info, sample_batch, source_manager, device, num_samples=config.num_samples).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)

@@ -175,6 +175,42 @@ def select_entities(batch, max_entities: int):
     return slice_entities(batch, selected), selected
 
 
+def select_stable_entities(
+    loaders,
+    dataset_info: dict[str, Any],
+    device: torch.device,
+    max_entities: int,
+    max_batches: int,
+) -> list[int]:
+    split_counts = []
+    for loader in loaders:
+        counts = None
+        for i, raw in enumerate(loader):
+            if i >= max_batches:
+                break
+            batch = batch_to_device(raw, device)
+            (V, _), _, meta = batch
+            valid_context = context_target_mask(meta, V, dataset_info)
+            current = valid_context.sum(dim=0).to(dtype=torch.float32)
+            counts = current if counts is None else counts + current
+        if counts is not None:
+            split_counts.append(counts)
+
+    if not split_counts:
+        raise RuntimeError(f"{dataset_info['dataset']}: no batches available for stable entity selection")
+
+    cap = min(int(max_entities), split_counts[0].numel())
+    common_scores = torch.stack(split_counts).amin(dim=0)
+    candidate = torch.nonzero(common_scores > 0, as_tuple=False).flatten()
+    if candidate.numel() >= cap:
+        local = torch.topk(common_scores.index_select(0, candidate), k=cap, largest=True).indices
+        idx = candidate.index_select(0, local).sort().values
+    else:
+        aggregate = torch.stack(split_counts).sum(dim=0)
+        idx = torch.topk(aggregate, k=cap, largest=True).indices.sort().values
+    return [int(i) for i in idx.detach().cpu().tolist()]
+
+
 def find_batch(
     loader,
     dataset_info: dict[str, Any],
@@ -183,13 +219,18 @@ def find_batch(
     max_batches: int,
     *,
     require_future_target: bool = True,
+    selected_entities: Sequence[int] | None = None,
 ):
     skipped = 0
     for i, raw in enumerate(loader):
         if i >= max_batches:
             break
         batch = batch_to_device(raw, device)
-        batch, selected = select_entities(batch, max_entities)
+        if selected_entities is None:
+            batch, selected = select_entities(batch, max_entities)
+        else:
+            batch = slice_entities(batch, selected_entities)
+            selected = list(selected_entities)
         valid = target_mask(batch[2], batch[1]) if require_future_target else context_target_mask(batch[2], batch[0][0], dataset_info)
         if valid.any():
             return batch, selected, skipped
