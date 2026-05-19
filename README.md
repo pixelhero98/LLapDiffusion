@@ -3,10 +3,7 @@
 Official implementation of **Latent Laplace Diffusion for Irregular Multivariate Time Series**.
 
 > Accepted at ICML 2026.
-> Proceedings citation will be added once the official entry is available.
-
-LLapDiff is a Laplace-domain latent diffusion model for irregular, partially observed panel and multivariate time series. It generates a low-dimensional latent trajectory over arbitrary query timestamps, avoiding sequential numerical integration over physical time while preserving continuous-time structure.
-
+> 19/05/2026 - fixed incorrect mixed-precision training that affected baselines and llapdiff evaluation behavior.
 ## Highlights
 
 - **Irregular-time forecasting and imputation** through timestamp-aware latent trajectory generation.
