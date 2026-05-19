@@ -106,7 +106,13 @@ def run_single_pred(
     recompute_summarizer: bool = False,
     latent_plot_only: bool = False,
     use_shared_loaders: bool = True,
+    run_checkpoint_eval: bool = False,
     allow_balanced_eval_failure: bool = False,
+    checkpoint_eval_num_samples: int | None = None,
+    checkpoint_eval_forecast_num_samples: int | None = None,
+    checkpoint_eval_imputation_num_samples: int | None = None,
+    checkpoint_eval_max_eval_batches: int | None = None,
+    checkpoint_eval_random_mask_ratio: float | None = None,
     base_out_dir: Path | None = None,
     base_ckpt_dir: Path | None = None,
     training_overrides: Dict[str, object] | None = None,
@@ -183,7 +189,7 @@ def run_single_pred(
     loaded_checkpoint = llapdiff_stats.get("loaded_checkpoint")
     balanced_evaluation = None
     eval_ckpt = loaded_checkpoint
-    if eval_ckpt:
+    if run_checkpoint_eval and eval_ckpt:
         try:
             from llapdiffusion.tools.llapdiff_checkpoint_eval import evaluate_checkpoint
 
@@ -191,6 +197,11 @@ def run_single_pred(
                 config,
                 eval_ckpt,
                 label=f"{_resolve_dataset_key(config=config)}_pred{pred}",
+                random_mask_ratio=checkpoint_eval_random_mask_ratio,
+                num_samples=checkpoint_eval_num_samples,
+                forecast_num_samples=checkpoint_eval_forecast_num_samples,
+                imputation_num_samples=checkpoint_eval_imputation_num_samples,
+                max_eval_batches=checkpoint_eval_max_eval_batches,
             )
         except Exception as exc:
             if not allow_balanced_eval_failure:
@@ -221,7 +232,13 @@ def run_preds(
     recompute_summarizer: bool = False,
     latent_plot_only: bool = False,
     use_shared_loaders: bool = True,
+    run_checkpoint_eval: bool = False,
     allow_balanced_eval_failure: bool = False,
+    checkpoint_eval_num_samples: int | None = None,
+    checkpoint_eval_forecast_num_samples: int | None = None,
+    checkpoint_eval_imputation_num_samples: int | None = None,
+    checkpoint_eval_max_eval_batches: int | None = None,
+    checkpoint_eval_random_mask_ratio: float | None = None,
     training_overrides: Dict[str, object] | None = None,
     config=config,
 ) -> Dict[int, Dict[str, object]]:
@@ -240,7 +257,13 @@ def run_preds(
             recompute_summarizer=recompute_summarizer,
             latent_plot_only=latent_plot_only,
             use_shared_loaders=use_shared_loaders,
+            run_checkpoint_eval=run_checkpoint_eval,
             allow_balanced_eval_failure=allow_balanced_eval_failure,
+            checkpoint_eval_num_samples=checkpoint_eval_num_samples,
+            checkpoint_eval_forecast_num_samples=checkpoint_eval_forecast_num_samples,
+            checkpoint_eval_imputation_num_samples=checkpoint_eval_imputation_num_samples,
+            checkpoint_eval_max_eval_batches=checkpoint_eval_max_eval_batches,
+            checkpoint_eval_random_mask_ratio=checkpoint_eval_random_mask_ratio,
             base_out_dir=base_out_dir,
             base_ckpt_dir=base_ckpt_dir,
             training_overrides=training_overrides,
@@ -297,6 +320,41 @@ def _parse_args() -> argparse.Namespace:
         "--allow-balanced-eval-failure",
         action="store_true",
         help="Record balanced checkpoint evaluation errors instead of failing the run.",
+    )
+    parser.add_argument(
+        "--run-checkpoint-eval",
+        action="store_true",
+        help="After training, run the optional checkpoint forecast and target-imputation evaluation.",
+    )
+    parser.add_argument(
+        "--checkpoint-eval-num-samples",
+        type=int,
+        default=None,
+        help="Shared sample count for optional checkpoint forecast and imputation evaluation.",
+    )
+    parser.add_argument(
+        "--checkpoint-eval-forecast-num-samples",
+        type=int,
+        default=None,
+        help="Forecast sample count for optional checkpoint evaluation.",
+    )
+    parser.add_argument(
+        "--checkpoint-eval-imputation-num-samples",
+        type=int,
+        default=None,
+        help="Imputation sample count for optional checkpoint evaluation.",
+    )
+    parser.add_argument(
+        "--checkpoint-eval-max-eval-batches",
+        type=int,
+        default=None,
+        help="Optional batch cap for optional checkpoint evaluation; 0 means no cap.",
+    )
+    parser.add_argument(
+        "--checkpoint-eval-random-mask-ratio",
+        type=float,
+        default=None,
+        help="Fraction of observed target entries hidden in optional random-mask imputation evaluation.",
     )
     parser.add_argument(
         "--target-mask-aux-p",
@@ -523,7 +581,13 @@ def main() -> Dict[int, Dict[str, object]]:
             recompute_summarizer=args.recompute_summarizer,
             latent_plot_only=args.latent_plot_only,
             use_shared_loaders=not args.no_shared_loaders,
+            run_checkpoint_eval=args.run_checkpoint_eval,
             allow_balanced_eval_failure=args.allow_balanced_eval_failure,
+            checkpoint_eval_num_samples=args.checkpoint_eval_num_samples,
+            checkpoint_eval_forecast_num_samples=args.checkpoint_eval_forecast_num_samples,
+            checkpoint_eval_imputation_num_samples=args.checkpoint_eval_imputation_num_samples,
+            checkpoint_eval_max_eval_batches=args.checkpoint_eval_max_eval_batches,
+            checkpoint_eval_random_mask_ratio=args.checkpoint_eval_random_mask_ratio,
             base_out_dir=base_out_dir,
             base_ckpt_dir=base_ckpt_dir,
             training_overrides=training_overrides,

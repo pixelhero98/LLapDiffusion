@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
 
 # Virtual environments
 .venv/
@@ -13,6 +14,7 @@ env/
 
 # Runtime outputs and model artifacts
 ldt/
+baseline_results/
 *.pt
 *.pth
 *.ckpt

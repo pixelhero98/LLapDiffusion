@@ -6,7 +6,7 @@ import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -23,8 +23,6 @@ from llapdiffusion.baselines.features import target_context
 from llapdiffusion.baselines.metrics import masked_error_sums, masked_mse, sample_crps_sums
 from llapdiffusion.baselines.registry import (
     BASELINES,
-    DATASET_KEYS,
-    EXTRAPOLATION_BASELINES,
 )
 from llapdiffusion.baselines.sources import SourceManager
 from llapdiffusion.configs.dataset_defaults import default_horizons
@@ -35,7 +33,7 @@ class TrainConfig:
     source_root: Path | str | None
     output_dir: Path | str | None = None
     work_cache_dir: Path | str | None = None
-    device: str = "cuda"
+    device: str = "auto"
     seed: int = 42
     num_samples: int = 25
     imputation_random_mask_ratio: float = 0.30
@@ -54,6 +52,8 @@ def set_seed(seed: int) -> None:
 
 
 def resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if requested.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"Requested {requested}, but CUDA is unavailable")
     return torch.device(requested)
@@ -472,59 +472,3 @@ def run_practical_matrix(baselines: Sequence[str], datasets: Sequence[str], conf
     ]
     write_rows(rows, run_root, prefix="baseline_practical")
     return rows
-
-
-def write_isambard_jobs(
-    output: Path | str,
-    *,
-    source_root: str | None = None,
-    datasets: Iterable[str] = DATASET_KEYS,
-    baselines: Iterable[str] = EXTRAPOLATION_BASELINES,
-    horizons: Iterable[int] | str | None = None,
-    time_limit: str = "08:00:00",
-) -> list[Path]:
-    out = output_dir(output)
-    scripts = []
-    selected_baselines = tuple(baselines)
-    if any(not BASELINES[baseline].first_party for baseline in selected_baselines) and not source_root:
-        raise ValueError("External baseline jobs require --baseline-source-root.")
-    for dataset in datasets:
-        if horizons is None:
-            selected_horizons = default_horizons(dataset)
-        elif isinstance(horizons, str):
-            if horizons != "all":
-                raise ValueError("horizons must be 'all' or a sequence of supported integers")
-            selected_horizons = default_horizons(dataset)
-        else:
-            selected_horizons = tuple(int(h) for h in horizons)
-        if not selected_horizons:
-            raise ValueError("At least one horizon must be selected")
-        supported_horizons = default_horizons(dataset)
-        supported = set(supported_horizons)
-        invalid = [h for h in selected_horizons if h not in supported]
-        if invalid:
-            raise ValueError(f"{dataset}: unsupported horizons {invalid}; supported horizons are {supported_horizons}")
-
-        for horizon in selected_horizons:
-            for baseline in selected_baselines:
-                source_arg = f"--baseline-source-root {source_root} " if source_root and not BASELINES[baseline].first_party else ""
-                script = out / f"llapdiff_{baseline}_{dataset}_h{horizon}.sh"
-                script.write_text(
-                    "#!/bin/bash\n"
-                    f"#SBATCH --job-name=llap-{baseline}-{dataset}-h{horizon}\n"
-                    "#SBATCH --partition=hopper\n"
-                    "#SBATCH --nodes=1\n"
-                    "#SBATCH --gpus=1\n"
-                    f"#SBATCH --time={time_limit}\n"
-                    "#SBATCH --output=%x.%j.out\n\n"
-                    "set -euo pipefail\n"
-                    "nvidia-smi\n"
-                    "llapdiff-baselines practical-extrapolation "
-                    f"--baseline {baseline} --dataset {dataset} --horizons {horizon} "
-                    f"{source_arg}"
-                    "--output-dir ${SCRATCHDIR:-$PWD}/llapdiffusion_baselines/runs "
-                    "--allow-cache-copy --work-cache-dir ${SCRATCHDIR:-$PWD}/llapdiffusion_baselines/cache_work\n",
-                    encoding="utf-8",
-                )
-                scripts.append(script)
-    return scripts

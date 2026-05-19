@@ -205,7 +205,7 @@ llapdiff-plot-poles \
   --pred 100 \
   --checkpoint /path/to/LLapDiffusion/ldt/output/crypto/llapdiff_pred-100_best_raw.pt \
   --dataset-zip /path/to/LLapDiff-evaluation-datasets.zip \
-  --output-dir ldt/results/pole_plot_smoke
+  --output-dir ldt/results/pole_plot
 ```
 
 The pole plot overlays global/base poles with conditioned effective poles built from real dataset context.
@@ -281,8 +281,8 @@ The dataset registry defines the public context lengths, horizons, latent dimens
 
 LLapDiff supports two practical imputation paths:
 
-1. Forecast-only checkpoint queried for imputation. The standard public pipeline trains with `TARGET_MASK_AUX_P=0.0`, so no target-imputation objective is mixed into training. `llapdiff-checkpoint-eval` can still query that checkpoint on held-out target masks and reports both forecast metrics and imputation cases such as regular keep-25 and random-mask settings.
-2. Dual-task target-mask training. Keep `IMPUTATION_TRAINING=True` and set a positive `TARGET_MASK_AUX_P` only when intentionally mixing target-mask reconstruction batches into LLapDiff training. The target-mask controls are `TARGET_MASK_AUX_KEEP_MODE`, `TARGET_MASK_AUX_KEEP_PROB`, `TARGET_MASK_AUX_KEEP_STRIDE`, and `TARGET_MASK_AUX_START_EPOCH`.
+1. Same-model imputation query from a forecast-only checkpoint. The standard public pipeline trains with `TARGET_MASK_AUX_P=0.0`, so no target-imputation objective is mixed into training. After training, run `llapdiff-checkpoint-eval` on the same checkpoint to hide target-horizon observations and query the model for those missing values.
+2. Dual-task target-mask training. Set a positive `TARGET_MASK_AUX_P` when intentionally mixing target-mask reconstruction batches into LLapDiff training, then evaluate the resulting checkpoint with the same `llapdiff-checkpoint-eval` imputation command. The target-mask controls are `TARGET_MASK_AUX_KEEP_MODE`, `TARGET_MASK_AUX_KEEP_PROB`, `TARGET_MASK_AUX_KEEP_STRIDE`, and `TARGET_MASK_AUX_START_EPOCH`.
 
 Forecast-only training plus imputation evaluation:
 
@@ -321,7 +321,7 @@ llapdiff-checkpoint-eval \
   --out-json ldt/results/crypto_dual_task_imputation.json
 ```
 
-When using CLI entry points that expose random-mask imputation evaluation, `--imputation-random-mask-ratio` is the fraction of observed target entries to hide for the random-mask imputation case. For example, `--imputation-random-mask-ratio 0.30` hides 30% and keeps 70% of observed target entries. Use this as an evaluation mask setting, not as evidence that the checkpoint was trained with an imputation loss.
+When using CLI entry points that expose random-mask imputation evaluation, `--imputation-random-mask-ratio` is the fraction of observed target-horizon entries to hide for the random-mask imputation case. For example, `--imputation-random-mask-ratio 0.30` hides 30% and keeps 70% of observed target-horizon entries. Use this as an evaluation mask setting, not as evidence that the checkpoint was trained with an imputation loss.
 
 ## Practical tuning guidance
 

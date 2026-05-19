@@ -200,9 +200,22 @@ def _flatten_dt(
     if m.shape != (B, N):
         raise ValueError(f"{key} batch/entity shape {tuple(dt.shape[:2])} does not match mask shape {tuple(m.shape)}")
 
-    if not torch.isfinite(dt).all():
-        raise ValueError(f"{key} contains non-finite values")
+    valid_dt = dt[m]
+    if valid_dt.numel() and not torch.isfinite(valid_dt).all():
+        raise ValueError(f"{key} contains non-finite values for valid entities")
+    if key == "delta_t_y":
+        for batch_idx in range(B):
+            valid = m[batch_idx]
+            if int(valid.sum().item()) <= 1:
+                continue
+            grids = dt[batch_idx, valid]
+            if not torch.allclose(grids, grids[:1], rtol=1e-5, atol=1e-6):
+                raise ValueError(
+                    "delta_t_y must use the same query grid for every valid entity in a batch; "
+                    "per-entity future query grids are not supported by the shared latent diffusion model"
+                )
     w = m.to(dtype=dt.dtype).unsqueeze(-1)
+    dt = torch.where(m.unsqueeze(-1), dt, torch.zeros_like(dt))
     denom = w.sum(dim=1).clamp(min=1.0)
     return (dt * w).sum(dim=1) / denom  # [B,L]
 

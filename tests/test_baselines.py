@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import importlib
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -539,6 +540,7 @@ def test_run_baselines_practical_defaults_are_full_comparison(monkeypatch):
     assert config.epochs == 600
     assert config.patience == 50
     assert config.num_samples == 25
+    assert config.device == "auto"
 
 
 def test_run_baselines_csdi_defaults_to_target_horizon_all_horizons(monkeypatch):
@@ -552,6 +554,7 @@ def test_run_baselines_csdi_defaults_to_target_horizon_all_horizons(monkeypatch)
     assert config.epochs == 600
     assert config.patience == 50
     assert config.num_samples == 25
+    assert config.device == "auto"
 
 
 def test_run_baselines_public_help_excludes_removed_surfaces(monkeypatch, capsys):
@@ -568,13 +571,17 @@ def test_run_baselines_public_help_excludes_removed_surfaces(monkeypatch, capsys
         "--fail-" + "fast",
         "--validate-" + "sources-only",
         "--num-" + "samples",
+        "write-" + "isam" + "bard-jobs",
+        "Sl" + "urm",
+        "#SB" + "ATCH",
+        "hop" + "per",
+        "am" + "pere",
     )
     help_text = []
     for argv in (
         ["llapdiff-baselines", "--help"],
         ["llapdiff-baselines", "practical-extrapolation", "--help"],
         ["llapdiff-baselines", "csdi-imputation", "--help"],
-        ["llapdiff-baselines", "write-isambard-jobs", "--help"],
     ):
         monkeypatch.setattr(sys, "argv", argv)
         with pytest.raises(SystemExit):
@@ -585,30 +592,40 @@ def test_run_baselines_public_help_excludes_removed_surfaces(monkeypatch, capsys
         assert token not in combined
 
 
-def test_write_jobs_omits_source_root_for_first_party_mr_diff(tmp_path):
-    from llapdiffusion.baselines.runner import write_isambard_jobs
-
-    scripts = write_isambard_jobs(
-        tmp_path,
-        source_root="/unused/external/root",
-        datasets=("crypto",),
-        baselines=("mr-diff",),
-        horizons=(100,),
+def test_public_docs_and_requirements_are_clone_ready():
+    root = Path(__file__).resolve().parents[1]
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8").strip()
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    tracked_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for base in ("README.md", "llapdiffusion", "tests")
+        for path in ([root / base] if (root / base).is_file() else sorted((root / base).rglob("*.py")))
     )
 
-    assert len(scripts) == 1
-    script = scripts[0].read_text(encoding="utf-8")
-    assert "--baseline mr-diff --dataset crypto --horizons 100" in script
-    assert "--baseline-source-root" not in script
-    assert "--" + "qui" + "ck" not in script
-    assert "--ma" + "x-" not in script
+    assert requirements == "-e ."
+    assert "Same-model imputation query" in readme
+    assert "Dual-task target-mask training" in readme
+    assert "hides 30% and keeps 70%" in readme
+    for token in (
+        "write-" + "isam" + "bard-jobs",
+        "isam" + "bard",
+        "Sl" + "urm",
+        "#SB" + "ATCH",
+        "hop" + "per",
+        "am" + "pere",
+    ):
+        assert token.lower() not in tracked_text.lower()
 
 
-def test_write_jobs_requires_source_root_for_external_baselines(tmp_path):
-    from llapdiffusion.baselines.runner import write_isambard_jobs
+def test_baseline_resolve_device_auto_uses_available_backend(monkeypatch):
+    from llapdiffusion.baselines import runner
 
-    with pytest.raises(ValueError, match="External baseline jobs require"):
-        write_isambard_jobs(tmp_path, source_root=None, datasets=("crypto",), baselines=("dlinear",))
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: False)
+    assert runner.resolve_device("auto").type == "cpu"
+    assert runner.resolve_device("cpu").type == "cpu"
+
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: True)
+    assert runner.resolve_device("auto").type == "cuda"
 
 
 def test_masked_metrics_and_point_crps_respect_valid_mask():

@@ -224,6 +224,7 @@ def _evaluate_impute_case(
     dynamic_thresh_max: float = 1.0,
     rho: float = 7.5,
     generator_seed: Optional[int] = None,
+    progress_label: Optional[str] = None,
 ) -> Dict[str, float]:
     abs_sum = sq_sum = elts = 0.0
     crps_sum = crps_elts = 0.0
@@ -234,7 +235,10 @@ def _evaluate_impute_case(
         generator = torch.Generator(device=device)
         generator.manual_seed(int(generator_seed))
 
+    processed_batches = 0
+    valid_batches = 0
     for xb, yb, meta in test_dl:
+        processed_batches += 1
         (V, T), yb, mask_bn = tv._sanitize_batch(xb, yb, meta, device)
         if not mask_bn.any():
             continue
@@ -273,6 +277,13 @@ def _evaluate_impute_case(
         valid_seq = keep_mask.any(dim=1) & (obs_any & (~keep_mask)).any(dim=1)
         if not valid_seq.any():
             continue
+        valid_batches += 1
+        if progress_label and (valid_batches == 1 or valid_batches % 50 == 0):
+            print(
+                f"[checkpoint-eval:{progress_label}] valid_batches={valid_batches} "
+                f"processed_batches={processed_batches}",
+                flush=True,
+            )
 
         cond_summary = cond_summary[valid_seq]
         cond_summary_raw = cond_summary_raw[valid_seq]
@@ -457,6 +468,7 @@ def evaluate_checkpoint(
         dynamic_thresh_max=float(test_sampling["dynamic_thresh_max"]),
         rho=float(test_sampling["rho"]),
         generator_seed=generator_seed,
+        progress_label="regular_keep25",
     ))
     random_keep_generator = torch.Generator(device=device)
     random_keep_generator.manual_seed(1234)
@@ -478,6 +490,7 @@ def evaluate_checkpoint(
         dynamic_thresh_max=float(test_sampling["dynamic_thresh_max"]),
         rho=float(test_sampling["rho"]),
         generator_seed=None if generator_seed is None else int(generator_seed) + 100003,
+        progress_label="random_mask",
     ))
 
     result = {

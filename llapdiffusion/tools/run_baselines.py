@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 from llapdiffusion.baselines.registry import DATASET_KEYS, EXTRAPOLATION_BASELINES, IMPUTATION_BASELINES, selected
-from llapdiffusion.baselines.runner import TrainConfig, export_notes, run_practical_matrix, write_isambard_jobs
+from llapdiffusion.baselines.runner import TrainConfig, export_notes, run_practical_matrix
 
 
 FULL_NUM_SAMPLES = 25
@@ -21,7 +20,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--output-dir", default="baseline_results")
     parser.add_argument("--work-cache-dir", default=None)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--imputation-random-mask-ratio",
@@ -78,21 +77,6 @@ def _run_export_notes(args: argparse.Namespace) -> None:
     print(path, flush=True)
 
 
-def _run_write_jobs(args: argparse.Namespace) -> None:
-    baselines = selected(EXTRAPOLATION_BASELINES, args.baseline)
-    datasets = selected(DATASET_KEYS, args.dataset)
-    scripts = write_isambard_jobs(
-        Path(args.output_dir),
-        source_root=args.source_root,
-        datasets=datasets,
-        baselines=baselines,
-        horizons=_parse_horizons(args.horizons),
-        time_limit=args.time_limit,
-    )
-    for script in scripts:
-        print(script, flush=True)
-
-
 def _add_horizon_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--horizons",
@@ -124,15 +108,6 @@ def parse_args() -> argparse.Namespace:
     notes = sub.add_parser("export-notes", help="Write baseline metadata and caveats.")
     notes.add_argument("--output-dir", default="baseline_results")
     notes.set_defaults(func=_run_export_notes)
-
-    jobs = sub.add_parser("write-isambard-jobs", help="Write Slurm scripts for full-data extrapolation baselines.")
-    jobs.add_argument("--baseline-source-root", dest="source_root", required=False)
-    jobs.add_argument("--output-dir", default="isambard_jobs")
-    jobs.add_argument("--baseline", choices=EXTRAPOLATION_BASELINES + ("all",), default="all")
-    jobs.add_argument("--dataset", choices=DATASET_KEYS + ("all",), default="all")
-    _add_horizon_arg(jobs)
-    jobs.add_argument("--time-limit", default="08:00:00")
-    jobs.set_defaults(func=_run_write_jobs)
     return parser.parse_args()
 
 

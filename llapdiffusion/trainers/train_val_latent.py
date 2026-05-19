@@ -567,7 +567,7 @@ def audit_checkpoint(
     (train_dl, val_dl, test_dl), sizes = _ensure_loaders(train_dl, val_dl, test_dl, sizes, config)
     _ensure_vae_num_entities(train_dl, config=config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp_enabled = device.type == "cuda"
+    amp_enabled = _vae_amp_enabled(device, config=config)
     beta = float(getattr(config, "VAE_BETA", 0.0))
     messages = []
 

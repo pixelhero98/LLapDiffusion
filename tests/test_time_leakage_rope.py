@@ -331,6 +331,69 @@ def test_run_single_pred_applies_output_dirs_after_pred_update(monkeypatch, tmp_
     assert cfg.POLE_PLOT_DIR == str(tmp_path / "out" / "pred-20" / "pole_plots")
 
 
+def test_run_single_pred_checkpoint_eval_is_opt_in(monkeypatch, tmp_path):
+    from llapdiffusion import pipeline
+
+    vae_ckpt = tmp_path / "pred-20_ch-12_entity_elbo.pt"
+    sum_ckpt = tmp_path / "20-12-summarizer.pt"
+    diff_ckpt = tmp_path / "llapdiff.pt"
+    for path in (vae_ckpt, sum_ckpt, diff_ckpt):
+        path.write_text("checkpoint")
+    cfg = SimpleNamespace(DATASET_KEY="crypto")
+    calls = []
+
+    def fake_update(pred, config):
+        config.PRED = pred
+        config.VAE_LATENT_CHANNELS = 12
+        config.VAE_CKPT = str(vae_ckpt)
+        config.SUM_CKPT = str(sum_ckpt)
+        config.OUT_DIR = "preset-output"
+        config.CKPT_DIR = "preset-checkpoints"
+
+    fake_latent = SimpleNamespace(run=lambda **kwargs: (_ for _ in ()).throw(AssertionError("latent should be skipped")))
+    fake_summarizer = SimpleNamespace(run=lambda **kwargs: (_ for _ in ()).throw(AssertionError("summarizer should be skipped")))
+    fake_llapdiff = SimpleNamespace(run=lambda **kwargs: {"eval_stats": {"mse": 1.0}, "loaded_checkpoint": str(diff_ckpt)})
+
+    def fake_evaluate_checkpoint(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"forecast_test": {"mse": 2.0}}
+
+    monkeypatch.setattr(pipeline, "_update_config_for_pred", fake_update)
+    monkeypatch.setattr(pipeline, "_import_trainers", lambda: (fake_latent, fake_summarizer, fake_llapdiff))
+    monkeypatch.setattr(pipeline, "prepare_dataloaders", lambda config: (None, None, None, (0, 0, 0)))
+    monkeypatch.setitem(
+        sys.modules,
+        "llapdiffusion.tools.llapdiff_checkpoint_eval",
+        SimpleNamespace(evaluate_checkpoint=fake_evaluate_checkpoint),
+    )
+
+    default_result = pipeline.run_single_pred(20, base_out_dir=tmp_path / "out", base_ckpt_dir=tmp_path / "ckpt", config=cfg)
+    assert calls == []
+    assert default_result["balanced_evaluation"] is None
+
+    explicit_result = pipeline.run_single_pred(
+        20,
+        run_checkpoint_eval=True,
+        checkpoint_eval_num_samples=3,
+        checkpoint_eval_forecast_num_samples=4,
+        checkpoint_eval_imputation_num_samples=5,
+        checkpoint_eval_max_eval_batches=6,
+        checkpoint_eval_random_mask_ratio=0.25,
+        base_out_dir=tmp_path / "out",
+        base_ckpt_dir=tmp_path / "ckpt",
+        config=cfg,
+    )
+    assert explicit_result["balanced_evaluation"] == {"forecast_test": {"mse": 2.0}}
+    assert calls[0][1] == {
+        "label": "crypto_pred20",
+        "random_mask_ratio": 0.25,
+        "num_samples": 3,
+        "forecast_num_samples": 4,
+        "imputation_num_samples": 5,
+        "max_eval_batches": 6,
+    }
+
+
 def test_llapdiff_train_target_mask_aux_cli_overrides(monkeypatch):
     from llapdiffusion import pipeline
 
@@ -510,7 +573,7 @@ def test_target_dt_flatten_then_laplace_preserves_offsets():
     assert torch.allclose(rel_t.squeeze(-1), torch.tensor([[1.0, 4.0, 5.0, 9.0]]))
 
 
-def test_target_dt_flatten_does_not_depend_on_target_values():
+def test_target_dt_flatten_rejects_mismatched_valid_entity_grids():
     from llapdiffusion.trainers import train_val_llapdiff as tv
 
     meta = {
@@ -520,9 +583,38 @@ def test_target_dt_flatten_does_not_depend_on_target_values():
     }
     mask = torch.tensor([[True, True]])
 
+    with pytest.raises(ValueError, match="same query grid"):
+        tv._flatten_dt(meta, mask, torch.device("cpu"), key="delta_t_y")
+
+
+def test_target_dt_flatten_ignores_padded_entity_grid():
+    from llapdiffusion.trainers import train_val_llapdiff as tv
+
+    meta = {
+        "delta_t_y": torch.tensor(
+            [[[1.0, 4.0, 5.0, 9.0], [100.0, 300.0, 500.0, 700.0]]]
+        )
+    }
+    mask = torch.tensor([[True, False]])
+
     dt_b = tv._flatten_dt(meta, mask, torch.device("cpu"), key="delta_t_y")
 
-    assert torch.allclose(dt_b, torch.tensor([[1.0, 2.5, 4.0, 5.5]]))
+    assert torch.allclose(dt_b, torch.tensor([[1.0, 4.0, 5.0, 9.0]]))
+
+
+def test_target_dt_flatten_ignores_padded_entity_nonfinite_grid():
+    from llapdiffusion.trainers import train_val_llapdiff as tv
+
+    meta = {
+        "delta_t_y": torch.tensor(
+            [[[1.0, 4.0, 5.0, 9.0], [float("nan"), float("inf"), 5.0, 7.0]]]
+        )
+    }
+    mask = torch.tensor([[True, False]])
+
+    dt_b = tv._flatten_dt(meta, mask, torch.device("cpu"), key="delta_t_y")
+
+    assert torch.allclose(dt_b, torch.tensor([[1.0, 4.0, 5.0, 9.0]]))
 
 
 def test_llapdiff_generate_forwards_context_end_query_offsets_unchanged():
