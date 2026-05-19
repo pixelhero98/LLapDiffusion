@@ -1,8 +1,6 @@
 # LLapDiff
 
 Official implementation of **Latent Laplace Diffusion for Irregular Multivariate Time Series**.
-
-> Accepted at ICML 2026.
 > 19/05/2026 - fixed incorrect mixed-precision training that affected baselines and llapdiff evaluation behavior.
 ## Highlights
 
