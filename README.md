@@ -2,7 +2,7 @@
 
 Official implementation of **Latent Laplace Diffusion for Irregular Multivariate Time Series**.
 > 19/05/2026 - fixed incorrect mixed-precision training that affected baselines and llapdiff evaluation behavior.
-> > 19/05/2026 - fixed incorrect data plumbing in baselines that affected baselines evaluation behavior.
+> 20/05/2026 - fixed incorrect data plumbing in baselines that affected baseline evaluation behavior.
 ## Highlights
 
 - **Irregular-time forecasting and imputation** through timestamp-aware latent trajectory generation.
