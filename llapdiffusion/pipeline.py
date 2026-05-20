@@ -32,6 +32,8 @@ def prepare_dataloaders(
         H=config.PRED,
         coverage=config.COVERAGE,
         ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
+        split_policy=getattr(config, "split_policy", "global_purged_horizon"),
+        exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
     )
 
 
@@ -79,7 +81,11 @@ def _resolve_dataset_key(config=config) -> str:
 
 
 def _update_config_for_pred(pred: int, config=config) -> None:
+    split_policy = getattr(config, "split_policy", "global_purged_horizon")
+    exact_timestamp_batches = bool(getattr(config, "exact_timestamp_batches", True))
     apply_dataset_preset(config, _resolve_dataset_key(config=config), pred=int(pred))
+    config.split_policy = split_policy
+    config.exact_timestamp_batches = exact_timestamp_batches
     config.SUM_CONTEXT_LEN = _resolve_sum_context_len(pred, config=config)
     config.SUM_CKPT = str(
         Path(config.SUM_DIR) / f"{pred}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
@@ -219,6 +225,14 @@ def run_single_pred(
         "summarizer": summarizer_stats,
         "llapdiff": llapdiff_stats,
         "eval_stats": eval_stats,
+        "data_policy": {
+            "split_policy": getattr(config, "split_policy", "global_purged_horizon"),
+            "batching_policy": (
+                "exact_context_end_timestamp"
+                if bool(getattr(config, "exact_timestamp_batches", True))
+                else "calendar_day"
+            ),
+        },
         "balanced_evaluation": balanced_evaluation,
         "best_val": best_val,
         "loaded_checkpoint": loaded_checkpoint,
@@ -398,6 +412,17 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional directory for extracting --dataset-zip. Defaults to the user cache directory.",
     )
+    parser.add_argument(
+        "--split-policy",
+        choices=("global_purged_horizon", "per_asset_purged_horizon", "contiguous"),
+        default=None,
+        help="Loader split policy. Defaults to the corrected global_purged_horizon policy.",
+    )
+    parser.add_argument(
+        "--calendar-day-batches",
+        action="store_true",
+        help="Use legacy calendar-day batch grouping instead of exact context-end timestamp grouping.",
+    )
     return parser.parse_args()
 
 
@@ -565,6 +590,10 @@ def main() -> Dict[int, Dict[str, object]]:
     configure_dataset_archive(args.dataset_zip, args.dataset_extract_dir)
     initial_pred = int(args.preds[0]) if args.preds else None
     apply_dataset_preset(config, args.dataset_key, pred=initial_pred)
+    if args.split_policy is not None:
+        config.split_policy = args.split_policy
+    if args.calendar_day_batches:
+        config.exact_timestamp_batches = False
     training_overrides = _training_overrides_from_args(args)
     preds = tuple(args.preds) if args.preds else _pred_list_from_config(config=config)
     if not preds:

@@ -429,6 +429,8 @@ def evaluate_checkpoint(
         H=cfg.PRED,
         coverage=cfg.COVERAGE,
         ratios=(cfg.train_ratio, cfg.val_ratio, cfg.test_ratio),
+        split_policy=getattr(cfg, "split_policy", "global_purged_horizon"),
+        exact_timestamp_batches=bool(getattr(cfg, "exact_timestamp_batches", True)),
     )
     if sizes is not None:
         print("eval sizes:", tuple(sizes))
@@ -496,6 +498,14 @@ def evaluate_checkpoint(
     result = {
         "label": label,
         "checkpoint": str(ckpt_path),
+        "data_policy": {
+            "split_policy": getattr(cfg, "split_policy", "global_purged_horizon"),
+            "batching_policy": (
+                "exact_context_end_timestamp"
+                if bool(getattr(cfg, "exact_timestamp_batches", True))
+                else "calendar_day"
+            ),
+        },
         "forecast_test": forecast,
         "regular_keep25": regular,
         "random_mask_ratio": random_mask_ratio,

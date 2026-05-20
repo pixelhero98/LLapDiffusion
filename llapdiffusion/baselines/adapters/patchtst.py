@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch.nn as nn
 
-from llapdiffusion.baselines.data import target_index
+from llapdiffusion.baselines.data import regular_feature_target_index
 from llapdiffusion.baselines.features import regular_features
 from llapdiffusion.baselines.sources import SourceManager
 
@@ -41,7 +41,7 @@ class PatchTSTAdapter(nn.Module):
             kernel_size=25,
         )
         self.model = module.Model(cfg)
-        self.target_idx = target_index(dataset_info)
+        self.target_idx = regular_feature_target_index(dataset_info)
 
     def forward(self, batch, dataset_info):
         feat = regular_features(batch, dataset_info)

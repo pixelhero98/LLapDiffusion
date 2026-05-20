@@ -854,34 +854,34 @@ def make_collate_level_and_firstdiff(
         K, F = V_list[0].shape
         H = y_list[0].shape[0]
 
-        def _infer_day_key(ctx_times, y_times):
-            for raw_times in (y_times, ctx_times):
+        def _infer_batch_key(ctx_times, y_times):
+            for raw_times in (ctx_times, y_times):
                 if raw_times is None:
                     continue
                 arr = np.asarray(raw_times)
                 if arr.size == 0:
                     continue
                 try:
-                    return int(np.asarray(arr.reshape(-1)[-1]).astype("datetime64[D]").astype(np.int64))
+                    return int(np.asarray(arr.reshape(-1)[-1]).astype("datetime64[ns]").astype(np.int64))
                 except Exception:
                     continue
             return None
 
-        day_keys = [_infer_day_key(ctx_times_list[j], y_times_list[j]) for j in range(len(items))]
+        batch_keys = [_infer_batch_key(ctx_times_list[j], y_times_list[j]) for j in range(len(items))]
         batch_rows = []
-        batch_day_keys = []
-        if day_keys and all(day_key is not None for day_key in day_keys):
-            row_by_day = {}
-            for day_key in day_keys:
-                if day_key not in row_by_day:
-                    row_by_day[day_key] = len(batch_day_keys)
-                    batch_day_keys.append(int(day_key))
-                batch_rows.append(row_by_day[day_key])
-            B = len(batch_day_keys)
+        batch_time_keys = []
+        if batch_keys and all(batch_key is not None for batch_key in batch_keys):
+            row_by_time = {}
+            for batch_key in batch_keys:
+                if batch_key not in row_by_time:
+                    row_by_time[batch_key] = len(batch_time_keys)
+                    batch_time_keys.append(int(batch_key))
+                batch_rows.append(row_by_time[batch_key])
+            B = len(batch_time_keys)
         else:
             B = 1
             batch_rows = [0] * len(items)
-            batch_day_keys = None
+            batch_time_keys = None
 
         V = np.stack(V_list, axis=0)   # [M,K,F]
         T = np.stack(T_list, axis=0)   # [M,K,F]
@@ -980,8 +980,10 @@ def make_collate_level_and_firstdiff(
             "delta_t": torch.from_numpy(delta_t),
             "delta_t_y": torch.from_numpy(delta_t_y),
         }
-        if batch_day_keys is not None:
-            meta["date_keys"] = torch.from_numpy(np.asarray(batch_day_keys, dtype=np.int64))
+        if batch_time_keys is not None:
+            time_keys = np.asarray(batch_time_keys, dtype=np.int64)
+            meta["context_end_time_keys"] = torch.from_numpy(time_keys)
+            meta["date_keys"] = torch.from_numpy(time_keys // np.int64(24 * 60 * 60 * 1_000_000_000))
         if x_obs_full is not None:
             meta["x_obs_mask"] = torch.from_numpy(x_obs_full)
         if y_obs_full is not None:
@@ -1140,12 +1142,17 @@ def _normalize_to_day(ts: np.ndarray) -> np.ndarray:
 def _build_date_batches_from_pairs(order_pairs: np.ndarray,
                                    end_times: np.ndarray,
                                    dates_per_batch: int,
-                                   min_real_entities: int) -> List[np.ndarray]:
-    # order_pairs: [M,2] (aid, start) sorted by end_times
-    days = _normalize_to_day(end_times)
-    order = np.argsort(days, kind='mergesort')
-    days_sorted = days[order]
-    _, starts = np.unique(days_sorted, return_index=True)
+                                   min_real_entities: int,
+                                   exact_timestamp: bool = False) -> List[np.ndarray]:
+    # order_pairs: [M,2] (aid, start) sorted by end_times.
+    keys = (
+        end_times.astype("datetime64[ns]").astype(np.int64)
+        if exact_timestamp
+        else _normalize_to_day(end_times)
+    )
+    order = np.argsort(keys, kind='mergesort')
+    keys_sorted = keys[order]
+    _, starts = np.unique(keys_sorted, return_index=True)
     groups = np.split(order, starts[1:])
     dense_groups = [g for g in groups if g.size >= int(min_real_entities)]
     batches = []
@@ -1154,6 +1161,126 @@ def _build_date_batches_from_pairs(order_pairs: np.ndarray,
         if chunk:
             batches.append(np.concatenate(chunk, axis=0))
     return batches
+
+
+def _split_counts(n: int, tr: float, vr: float, te: float) -> Tuple[int, int, int]:
+    s = float(tr + vr + te)
+    if s <= 0:
+        raise ValueError("Split ratios must sum to a positive value")
+    trn = int(np.floor(n * (tr / s)))
+    van = int(np.floor(n * (vr / s)))
+    ten = n - trn - van
+    if n >= 3:
+        if trn == 0:
+            trn, ten = 1, ten - 1
+        if van == 0 and n - trn >= 2:
+            van, ten = 1, ten - 1
+        if ten == 0:
+            ten = 1
+    return trn, van, ten
+
+
+def _canonical_split_policy(split_policy: str) -> str:
+    value = str(split_policy or "global_purged_horizon").strip().lower().replace("-", "_")
+    aliases = {
+        "purged_horizon": "global_purged_horizon",
+        "global_purged": "global_purged_horizon",
+        "global_purge": "global_purged_horizon",
+        "global": "global_purged_horizon",
+        "per_asset_purged": "per_asset_purged_horizon",
+        "per_asset_purge": "per_asset_purged_horizon",
+        "asset_purged_horizon": "per_asset_purged_horizon",
+        "asset_purge": "per_asset_purged_horizon",
+        "ratio": "contiguous",
+        "legacy": "contiguous",
+    }
+    value = aliases.get(value, value)
+    if value not in {"global_purged_horizon", "per_asset_purged_horizon", "contiguous"}:
+        raise ValueError(
+            "split_policy must be one of "
+            "{'global_purged_horizon', 'per_asset_purged_horizon', 'contiguous'}"
+        )
+    return value
+
+
+def _assign_ratio_splits(
+    pairs: np.ndarray,
+    end_times: np.ndarray,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    *,
+    per_asset: bool,
+    split_policy: str,
+    horizon: int,
+) -> np.ndarray:
+    """Assign rows to train/val/test using the configured chronological policy."""
+
+    assign = np.full(pairs.shape[0], 255, dtype=np.uint8)
+    policy = _canonical_split_policy(split_policy)
+
+    if pairs.size == 0:
+        return assign
+
+    if policy == "global_purged_horizon":
+        keys = end_times.astype("datetime64[ns]").astype(np.int64)
+        unique_keys = np.unique(keys)
+        purge = max(0, int(horizon))
+        available = int(unique_keys.size) - 2 * purge
+        if available < 3:
+            raise ValueError(
+                "Not enough unique context-end timestamps for "
+                f"global_purged_horizon with horizon={horizon}: {unique_keys.size}"
+            )
+        trn, van, _ = _split_counts(available, train_ratio, val_ratio, test_ratio)
+        val_start = trn + purge
+        val_end = val_start + van
+        test_start = val_end + purge
+        train_keys = unique_keys[:trn]
+        val_keys = unique_keys[val_start:val_end]
+        test_keys = unique_keys[test_start:]
+        assign[np.isin(keys, train_keys)] = 0
+        assign[np.isin(keys, val_keys)] = 1
+        assign[np.isin(keys, test_keys)] = 2
+        return assign
+
+    aids = pairs[:, 0].astype(np.int64)
+    if policy == "per_asset_purged_horizon":
+        purge = max(0, int(horizon))
+        for aid in np.unique(aids):
+            idx = np.nonzero(aids == aid)[0]
+            available = int(idx.size) - 2 * purge
+            if available < 3:
+                continue
+            trn, van, _ = _split_counts(available, train_ratio, val_ratio, test_ratio)
+            val_start = trn + purge
+            val_end = val_start + van
+            test_start = val_end + purge
+            assign[idx[:trn]] = 0
+            assign[idx[val_start:val_end]] = 1
+            assign[idx[test_start:]] = 2
+        return assign
+
+    if per_asset:
+        for aid in np.unique(aids):
+            idx = np.nonzero(aids == aid)[0]
+            trn, van, _ = _split_counts(int(idx.size), train_ratio, val_ratio, test_ratio)
+            assign[idx[:trn]] = 0
+            assign[idx[trn:trn + van]] = 1
+            assign[idx[trn + van:]] = 2
+    else:
+        trn, van, _ = _split_counts(int(pairs.shape[0]), train_ratio, val_ratio, test_ratio)
+        assign[:trn] = 0
+        assign[trn:trn + van] = 1
+        assign[trn + van:] = 2
+    return assign
+
+
+def split_policy_name(split_policy: str) -> str:
+    """Return the canonical public name for a split policy string."""
+
+    return _canonical_split_policy(split_policy)
+
 
 def _compute_train_only_norm_stats(
     data_dir: str,
@@ -1370,7 +1497,9 @@ def load_dataloaders_with_ratio_split(
     date_batching: Optional[bool] = None,
     dates_per_batch: int = 4,
     window: Optional[int] = None,
-    horizon: Optional[int] = None
+    horizon: Optional[int] = None,
+    split_policy: str = "global_purged_horizon",
+    exact_timestamp_batches: bool = True,
 ):
     paths = CachePaths.from_dir(data_dir)
 
@@ -1431,43 +1560,28 @@ def load_dataloaders_with_ratio_split(
         # We'll sort by (asset_id, end_time)
         
     aid = pairs[:, 0].astype(np.int32)
-    if per_asset:
+    policy = _canonical_split_policy(split_policy)
+    if policy == "global_purged_horizon":
+        order = np.argsort(end_times.astype('datetime64[ns]').astype(np.int64), kind='mergesort')
+    elif per_asset:
         order = np.lexsort((end_times.astype('datetime64[ns]').astype(np.int64), aid))
     else:
-        order = np.argsort(end_times.astype('datetime64[ns]').astype(np.int64))
+        order = np.argsort(end_times.astype('datetime64[ns]').astype(np.int64), kind='mergesort')
     pairs = pairs[order]
     end_times = end_times[order]
+    aid = pairs[:, 0].astype(np.int32)
     
     # Ratio assignment
-    def _split_counts(n, tr, vr, te):
-        s = float(tr + vr + te)
-        trn = int(np.floor(n * (tr / s)))
-        van = int(np.floor(n * (vr / s)))
-        ten = n - trn - van
-        if n >= 3:
-            if trn == 0:
-                trn, ten = 1, ten - 1
-            if van == 0 and n - trn >= 2:
-                van, ten = 1, ten - 1
-            if ten == 0:
-                ten = 1
-        return trn, van, ten
-    
-    assign = np.empty(pairs.shape[0], dtype=np.uint8)
-    if per_asset:
-        for a in np.unique(aid):
-            idx = np.nonzero(aid == a)[0]
-            na = idx.size
-            trn, van, ten = _split_counts(na, train_ratio, val_ratio, test_ratio)
-            assign[idx[:trn]] = 0
-            assign[idx[trn:trn+van]] = 1
-            assign[idx[trn+van:]] = 2
-    else:
-        n = pairs.shape[0]
-        trn, van, ten = _split_counts(n, train_ratio, val_ratio, test_ratio)
-        assign[:trn] = 0
-        assign[trn:trn+van] = 1
-        assign[trn+van:] = 2
+    assign = _assign_ratio_splits(
+        pairs,
+        end_times,
+        train_ratio,
+        val_ratio,
+        test_ratio,
+        per_asset=per_asset,
+        split_policy=policy,
+        horizon=horizon,
+    )
     
     tr_pairs = pairs[assign == 0]
     va_pairs = pairs[assign == 1]
@@ -1516,9 +1630,15 @@ def load_dataloaders_with_ratio_split(
         tr_mask = (assign == 0)
         va_mask = (assign == 1)
         te_mask = (assign == 2)
-        batches_tr = _build_date_batches_from_pairs(tr_pairs, end_times[tr_mask], dates_per_batch, min_real)
-        batches_va = _build_date_batches_from_pairs(va_pairs, end_times[va_mask], dates_per_batch, min_real)
-        batches_te = _build_date_batches_from_pairs(te_pairs, end_times[te_mask], dates_per_batch, min_real)
+        batches_tr = _build_date_batches_from_pairs(
+            tr_pairs, end_times[tr_mask], dates_per_batch, min_real, exact_timestamp=exact_timestamp_batches
+        )
+        batches_va = _build_date_batches_from_pairs(
+            va_pairs, end_times[va_mask], dates_per_batch, min_real, exact_timestamp=exact_timestamp_batches
+        )
+        batches_te = _build_date_batches_from_pairs(
+            te_pairs, end_times[te_mask], dates_per_batch, min_real, exact_timestamp=exact_timestamp_batches
+        )
         train_dl = DataLoader(ds_tr, batch_sampler=_ListBatchSampler(batches_tr), pin_memory=pin_memory,
                               num_workers=num_workers, persistent_workers=False, generator=gen,
                               collate_fn=collate_fn)
@@ -1580,10 +1700,12 @@ def run_experiment(
     batch_size=64,
     norm="train_only",    # default is "train_only" in the patched loader; set "cache" if you want fixed μ/σ
     reindex=True,         # set False if NOT using date batching and you don’t need to rebuild end_times
+    split_policy: str = "global_purged_horizon",
+    exact_timestamp_batches: bool = True,
 ):
     """
     Builds loaders for a given (K, H) using the already-downloaded cache.
-    - If date_batching=True, reindex first so day end_times align with K/H.
+    - If date_batching=True, reindex first so context end_times align with K/H.
     - Coverage threshold is applied per day; panel width is auto-detected from the cache.
     """
     if reindex:
@@ -1603,6 +1725,8 @@ def run_experiment(
         dates_per_batch=dates_per_batch,
         window=K,
         horizon=H,
+        split_policy=split_policy,
+        exact_timestamp_batches=exact_timestamp_batches,
     )
 
     return train_dl, val_dl, test_dl, lengths

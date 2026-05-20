@@ -473,6 +473,8 @@ def _ensure_loaders(
             H=config.PRED,
             coverage=config.COVERAGE,
             ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
+            split_policy=getattr(config, "split_policy", "global_purged_horizon"),
+            exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
         )
     elif sizes is None:
         try:
@@ -2509,6 +2511,14 @@ def run(
         "best_primary_metric_name": primary_eval_metric,
         "selected_val_metric_source": val_metric_source,
         "selected_test_metric_source": test_metric_source,
+        "data_policy": {
+            "split_policy": getattr(config, "split_policy", "global_purged_horizon"),
+            "batching_policy": (
+                "exact_context_end_timestamp"
+                if bool(getattr(config, "exact_timestamp_batches", True))
+                else "calendar_day"
+            ),
+        },
         "best_checkpoint": best_checkpoint,
         "best_checkpoint_raw": best_checkpoint_raw,
         "best_checkpoint_ema": best_checkpoint_ema,

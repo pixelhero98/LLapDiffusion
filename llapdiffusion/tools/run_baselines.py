@@ -23,6 +23,12 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--input-policy",
+        choices=("target_only", "all_features"),
+        default="target_only",
+        help="Feature policy for non-probabilistic adapters. Corrected benchmark default is target_only.",
+    )
+    parser.add_argument(
         "--imputation-random-mask-ratio",
         type=float,
         default=0.30,
@@ -58,6 +64,7 @@ def _train_config(args: argparse.Namespace) -> TrainConfig:
         patience=FULL_PATIENCE,
         lr=args.lr,
         horizons=_parse_horizons(getattr(args, "horizons", None)) or "all",
+        input_policy=args.input_policy,
     )
 
 

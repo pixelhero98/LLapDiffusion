@@ -67,10 +67,12 @@ def load_dataset_loaders(
         "per_asset": True,
         "date_batching": True,
         "coverage": 0.0,
-        "dates_per_batch": 1,
+        "dates_per_batch": preset.table_batch_size,
         "batch_size": preset.table_batch_size,
         "norm": "train_only",
         "reindex": reindex,
+        "split_policy": "global_purged_horizon",
+        "exact_timestamp_batches": True,
     }
     sig = inspect.signature(run_experiment)
     filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -86,6 +88,8 @@ def load_dataset_loaders(
         "assets": len(meta.get("assets", [])),
         "feature_cols": meta.get("feature_cols", []),
         "target_col": meta.get("target_col", ""),
+        "split_policy": "global_purged_horizon",
+        "batching_policy": "exact_context_end_timestamp",
     }
     return (train_dl, val_dl, test_dl), info
 
@@ -124,6 +128,12 @@ def target_index(dataset_info: dict[str, Any]) -> int:
     if target not in cols:
         raise ValueError(f"{dataset_info.get('dataset')}: target_col {target!r} not found in feature_cols")
     return cols.index(target)
+
+
+def regular_feature_target_index(dataset_info: dict[str, Any]) -> int:
+    if str(dataset_info.get("input_policy", "target_only")).lower() == "target_only":
+        return 0
+    return target_index(dataset_info)
 
 
 def context_target_mask(meta: dict[str, Any], V: torch.Tensor, dataset_info: dict[str, Any]) -> torch.Tensor:

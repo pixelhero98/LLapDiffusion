@@ -42,6 +42,7 @@ class TrainConfig:
     patience: int = 50
     lr: float = 1e-3
     horizons: tuple[int, ...] | str | None = "all"
+    input_policy: str = "target_only"
 
 
 def set_seed(seed: int) -> None:
@@ -221,6 +222,10 @@ def _config_payload(config: TrainConfig) -> dict[str, object]:
     return payload
 
 
+def _parameter_count(model: torch.nn.Module) -> int:
+    return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+
 def _flatten_csv_row(row: dict[str, object]) -> dict[str, object]:
     flat = dict(row)
     test = row.get("test")
@@ -249,6 +254,11 @@ def write_rows(rows: Sequence[dict[str, object]], output: Path | str, *, prefix:
         "window",
         "horizon",
         "entity_selection_mode",
+        "input_policy",
+        "split_policy",
+        "batching_policy",
+        "parameter_count",
+        "completion_mode",
         "num_entities_used",
         "valid_observations",
         "loss",
@@ -369,6 +379,7 @@ def run_practical_one(
         work_cache_dir=Path(config.work_cache_dir).expanduser().resolve() if config.work_cache_dir else None,
     )
     train_dl, val_dl, test_dl = loaders
+    dataset_info["input_policy"] = str(config.input_policy)
     sample_batch, _ = find_batch(
         train_dl,
         dataset_info,
@@ -383,6 +394,7 @@ def run_practical_one(
         num_samples=config.num_samples,
         imputation_random_mask_ratio=_validate_imputation_random_mask_ratio(config.imputation_random_mask_ratio),
     ).to(device)
+    parameter_count = _parameter_count(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     run_dir = output_dir(run_root) / f"{baseline}_{dataset}_h{dataset_info['horizon']}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -450,6 +462,11 @@ def run_practical_one(
         "num_entities_used": num_entities_used,
         "loader_batches": loader_batches,
         "train_config": _config_payload(config),
+        "input_policy": str(config.input_policy),
+        "split_policy": dataset_info.get("split_policy", "global_purged_horizon"),
+        "batching_policy": dataset_info.get("batching_policy", "exact_context_end_timestamp"),
+        "parameter_count": parameter_count,
+        "completion_mode": "full_train_loop",
         "best_epoch": best_epoch,
         "best_val_mse": best_val,
         "history": history,

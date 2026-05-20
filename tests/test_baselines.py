@@ -199,7 +199,21 @@ def test_baseline_loader_uses_longest_supported_horizon(monkeypatch, tmp_path):
     )
     seen = {}
 
-    def fake_run_experiment(data_dir, K, H, ratios, per_asset, date_batching, coverage, dates_per_batch, batch_size, norm, reindex):
+    def fake_run_experiment(
+        data_dir,
+        K,
+        H,
+        ratios,
+        per_asset,
+        date_batching,
+        coverage,
+        dates_per_batch,
+        batch_size,
+        norm,
+        reindex,
+        split_policy,
+        exact_timestamp_batches,
+    ):
         kwargs = {
             "data_dir": data_dir,
             "K": K,
@@ -212,6 +226,8 @@ def test_baseline_loader_uses_longest_supported_horizon(monkeypatch, tmp_path):
             "batch_size": batch_size,
             "norm": norm,
             "reindex": reindex,
+            "split_policy": split_policy,
+            "exact_timestamp_batches": exact_timestamp_batches,
         }
         seen.update(kwargs)
         return ["train"], ["val"], ["test"], (1, 2, 3)
@@ -228,6 +244,9 @@ def test_baseline_loader_uses_longest_supported_horizon(monkeypatch, tmp_path):
     assert loaders == (["train"], ["val"], ["test"])
     assert seen["K"] == 24
     assert seen["H"] == 12
+    assert seen["dates_per_batch"] == 3
+    assert seen["split_policy"] == "global_purged_horizon"
+    assert seen["exact_timestamp_batches"] is True
     assert info["horizon"] == 12
     assert info["window"] == 24
 
@@ -250,7 +269,21 @@ def test_baseline_loader_accepts_supported_explicit_horizon(monkeypatch, tmp_pat
     )
     seen = {}
 
-    def fake_run_experiment(data_dir, K, H, ratios, per_asset, date_batching, coverage, dates_per_batch, batch_size, norm, reindex):
+    def fake_run_experiment(
+        data_dir,
+        K,
+        H,
+        ratios,
+        per_asset,
+        date_batching,
+        coverage,
+        dates_per_batch,
+        batch_size,
+        norm,
+        reindex,
+        split_policy,
+        exact_timestamp_batches,
+    ):
         kwargs = {
             "data_dir": data_dir,
             "K": K,
@@ -263,6 +296,8 @@ def test_baseline_loader_accepts_supported_explicit_horizon(monkeypatch, tmp_pat
             "batch_size": batch_size,
             "norm": norm,
             "reindex": reindex,
+            "split_policy": split_policy,
+            "exact_timestamp_batches": exact_timestamp_batches,
         }
         seen.update(kwargs)
         return ["train"], ["val"], ["test"], (1, 2, 3)
@@ -279,6 +314,8 @@ def test_baseline_loader_accepts_supported_explicit_horizon(monkeypatch, tmp_pat
 
     assert loaders == (["train"], ["val"], ["test"])
     assert seen["H"] == 8
+    assert seen["split_policy"] == "global_purged_horizon"
+    assert seen["exact_timestamp_batches"] is True
     assert info["horizon"] == 8
 
 
@@ -541,6 +578,7 @@ def test_run_baselines_practical_defaults_are_full_comparison(monkeypatch):
     assert config.patience == 50
     assert config.num_samples == 25
     assert config.device == "auto"
+    assert config.input_policy == "target_only"
 
 
 def test_run_baselines_csdi_defaults_to_target_horizon_all_horizons(monkeypatch):

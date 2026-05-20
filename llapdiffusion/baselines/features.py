@@ -30,6 +30,25 @@ def progressing_context_time(meta: dict[str, Any], V: torch.Tensor) -> torch.Ten
 
 
 def regular_features(batch, dataset_info: dict[str, Any]) -> torch.Tensor:
+    if str(dataset_info.get("input_policy", "target_only")).lower() == "target_only":
+        (V, _), _, meta = batch
+        x, mask, _, _ = target_context(batch, dataset_info)
+        dx = torch.zeros_like(x)
+        dx[..., 1:] = x[..., 1:] - x[..., :-1]
+        t, gap, _ = time_features(meta, V)
+        return torch.stack(
+            [
+                x,
+                dx,
+                mask.to(dtype=x.dtype),
+                t,
+                torch.sin(2 * math.pi * t),
+                torch.cos(2 * math.pi * t),
+                gap,
+            ],
+            dim=-1,
+        )
+
     (V, T), _, meta = batch
     V = torch.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
     T = torch.nan_to_num(T, nan=0.0, posinf=0.0, neginf=0.0)

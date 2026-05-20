@@ -420,11 +420,19 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
 
 def load_bms_dataloaders_with_ratio_split(
     data_dir: PathLike,
+    *,
+    split_policy: str = "global_purged_horizon",
+    exact_timestamp_batches: bool = True,
     **loader_kwargs,
 ):
     """Wrapper around the financial ratio-split loader for BMS datasets."""
 
-    return _load_fin_ratio_split(data_dir=data_dir, **loader_kwargs)
+    return _load_fin_ratio_split(
+        data_dir=data_dir,
+        split_policy=split_policy,
+        exact_timestamp_batches=exact_timestamp_batches,
+        **loader_kwargs,
+    )
 
 
 def _is_hourly_frequency(freq: object) -> bool:
@@ -511,6 +519,8 @@ def run_experiment(
     shuffle_train: bool = True,
     num_workers: int = 0,
     pin_memory: Optional[bool] = None,
+    split_policy: str = "global_purged_horizon",
+    exact_timestamp_batches: bool = True,
 ):
     """Build train/val/test loaders for the prepared BMS cache.
 
@@ -572,6 +582,8 @@ def run_experiment(
         dates_per_batch=dates_per_batch,
         window=K,
         horizon=H,
+        split_policy=split_policy,
+        exact_timestamp_batches=exact_timestamp_batches,
         shuffle_train=shuffle_train,
         num_workers=num_workers,
         pin_memory=pin_memory,

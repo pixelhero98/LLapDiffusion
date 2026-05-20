@@ -242,7 +242,7 @@ def _configure(spec: RunSpec, args: argparse.Namespace) -> SimpleNamespace:
     cfg.SUM_CONTEXT_LEN_FIXED = int(args.window)
     cfg.SUM_CONTEXT_LEN = int(args.window)
     cfg.COVERAGE = 0.0
-    cfg.date_batching = False
+    cfg.date_batching = True
     cfg.DATES_PER_BATCH = 16
     cfg.BATCH_SIZE = 16
     cfg.VAE_LATENT_CHANNELS = 24
@@ -320,7 +320,7 @@ def _validate_forecast_only_config(cfg: SimpleNamespace) -> None:
 def _build_loaders(cfg: SimpleNamespace):
     return synthetic_run_experiment(
         data_dir=cfg.DATA_DIR,
-        date_batching=False,
+        date_batching=bool(getattr(cfg, "date_batching", True)),
         dates_per_batch=int(cfg.DATES_PER_BATCH),
         K=int(cfg.WINDOW),
         H=int(cfg.PRED),
@@ -329,6 +329,8 @@ def _build_loaders(cfg: SimpleNamespace):
         batch_size=int(cfg.BATCH_SIZE),
         norm="train_only",
         per_asset=True,
+        split_policy=getattr(cfg, "split_policy", "global_purged_horizon"),
+        exact_timestamp_batches=bool(getattr(cfg, "exact_timestamp_batches", True)),
         shuffle_train=False,
     )
 

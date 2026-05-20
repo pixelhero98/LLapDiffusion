@@ -18,6 +18,8 @@ WINDOW = 1
 COVERAGE = 0.0
 date_batching = True
 DATES_PER_BATCH = 1
+split_policy = "global_purged_horizon"
+exact_timestamp_batches = True
 
 # Table batch sizes are applied by the dataset preset registry. Runtime
 # date-panel batching still uses DATES_PER_BATCH=1.

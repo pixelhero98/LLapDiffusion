@@ -86,6 +86,8 @@ def _build_loaders(cfg):
         H=cfg.PRED,
         coverage=cfg.COVERAGE,
         ratios=(cfg.train_ratio, cfg.val_ratio, cfg.test_ratio),
+        split_policy=getattr(cfg, "split_policy", "global_purged_horizon"),
+        exact_timestamp_batches=bool(getattr(cfg, "exact_timestamp_batches", True)),
     )
 
 

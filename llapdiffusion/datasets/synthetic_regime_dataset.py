@@ -230,7 +230,7 @@ def run_experiment(
     *,
     ratios: Tuple[float, float, float] = (0.7, 0.1, 0.2),
     per_asset: bool = True,
-    date_batching: bool = False,
+    date_batching: bool = True,
     coverage: float = 0.0,
     dates_per_batch: int = 16,
     batch_size: int = 16,
@@ -239,6 +239,8 @@ def run_experiment(
     shuffle_train: bool = True,
     num_workers: int = 0,
     pin_memory: Optional[bool] = None,
+    split_policy: str = "global_purged_horizon",
+    exact_timestamp_batches: bool = True,
 ):
     paths = CachePaths.from_dir(data_dir)
     meta = _validate_cache(paths)
@@ -286,6 +288,8 @@ def run_experiment(
         dates_per_batch=dates_per_batch,
         window=K,
         horizon=H,
+        split_policy=split_policy,
+        exact_timestamp_batches=exact_timestamp_batches,
     )
     return train_dl, val_dl, test_dl, lengths
 

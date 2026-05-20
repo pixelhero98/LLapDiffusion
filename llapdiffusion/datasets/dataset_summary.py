@@ -23,7 +23,12 @@ from typing import Dict, Tuple, Optional
 
 import numpy as np
 
-from llapdiffusion.datasets.fin_dataset import CachePaths, _normalize_to_day
+from llapdiffusion.datasets.fin_dataset import (
+    CachePaths,
+    _assign_ratio_splits,
+    _normalize_to_day,
+    split_policy_name,
+)
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -129,6 +134,8 @@ def _apply_split(
     val_ratio: float,
     test_ratio: float,
     per_asset: bool,
+    split_policy: str,
+    horizon: int,
 ) -> Tuple[int, int, int]:
     """Replicate the ratio split logic from fin_dataset.load_dataloaders_with_ratio_split."""
     if pairs.size == 0:
@@ -142,23 +149,16 @@ def _apply_split(
         order = np.argsort(t_int)
     pairs = pairs[order]
     end_times = end_times[order]
-    aids = pairs[:, 0].astype(np.int32)
-
-    assign = np.empty(pairs.shape[0], dtype=np.uint8)
-    if per_asset:
-        for aid in np.unique(aids):
-            idx = np.nonzero(aids == aid)[0]
-            na = idx.size
-            trn, van, ten = _split_counts(na, train_ratio, val_ratio, test_ratio)
-            assign[idx[:trn]] = 0
-            assign[idx[trn : trn + van]] = 1
-            assign[idx[trn + van :]] = 2
-    else:
-        n = pairs.shape[0]
-        trn, van, ten = _split_counts(n, train_ratio, val_ratio, test_ratio)
-        assign[:trn] = 0
-        assign[trn : trn + van] = 1
-        assign[trn + van :] = 2
+    assign = _assign_ratio_splits(
+        pairs,
+        end_times,
+        train_ratio,
+        val_ratio,
+        test_ratio,
+        per_asset=per_asset,
+        split_policy=split_policy,
+        horizon=horizon,
+    )
 
     return int((assign == 0).sum()), int((assign == 1).sum()), int((assign == 2).sum())
 
@@ -170,6 +170,7 @@ def summarize_dataset(
     val_ratio: float,
     test_ratio: float,
     per_asset: bool,
+    split_policy: str,
 ) -> None:
     paths = CachePaths.from_dir(data_dir)
     meta = _load_meta(paths)
@@ -220,6 +221,8 @@ def summarize_dataset(
         val_ratio=val_ratio,
         test_ratio=test_ratio,
         per_asset=per_asset,
+        split_policy=split_policy,
+        horizon=horizon,
     )
 
     print(f"Package root   : {PACKAGE_ROOT}")
@@ -251,7 +254,7 @@ def summarize_dataset(
             f"max={filtered_cov_summary.max:.3f}"
         )
     print()
-    print("Windows by split (ratio-based):")
+    print(f"Windows by split (policy={split_policy_name(split_policy)}):")
     print(f"  train={tr_steps}  val={va_steps}  test={te_steps}")
 
 
@@ -298,6 +301,12 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Split by global chronological order instead of per-asset.",
     )
+    parser.add_argument(
+        "--split-policy",
+        default="global_purged_horizon",
+        choices=("global_purged_horizon", "per_asset_purged_horizon", "contiguous"),
+        help="Split policy used when computing step counts.",
+    )
     parser.set_defaults(per_asset=True)
     return parser.parse_args()
 
@@ -311,4 +320,5 @@ if __name__ == "__main__":
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
         per_asset=args.per_asset,
+        split_policy=args.split_policy,
     )

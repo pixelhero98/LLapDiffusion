@@ -509,11 +509,19 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
 
 def load_physionet_dataloaders_with_ratio_split(
     data_dir: PathLike,
+    *,
+    split_policy: str = "global_purged_horizon",
+    exact_timestamp_batches: bool = True,
     **loader_kwargs,
 ):
     """Wrapper around the financial ratio-split loader for PhysioNet datasets."""
 
-    return _load_fin_ratio_split(data_dir=data_dir, **loader_kwargs)
+    return _load_fin_ratio_split(
+        data_dir=data_dir,
+        split_policy=split_policy,
+        exact_timestamp_batches=exact_timestamp_batches,
+        **loader_kwargs,
+    )
 
 
 def _validate_physionet_cache(paths: CachePaths) -> Dict[str, object]:
@@ -550,6 +558,8 @@ def run_experiment(
     shuffle_train: bool = True,
     num_workers: int = 0,
     pin_memory: Optional[bool] = None,
+    split_policy: str = "global_purged_horizon",
+    exact_timestamp_batches: bool = True,
 ):
     """Mirror :func:`llapdiffusion.datasets.fin_dataset.run_experiment` for PhysioNet caches."""
 
@@ -600,6 +610,8 @@ def run_experiment(
         dates_per_batch=dates_per_batch,
         window=K,
         horizon=H,
+        split_policy=split_policy,
+        exact_timestamp_batches=exact_timestamp_batches,
         shuffle_train=shuffle_train,
         num_workers=num_workers,
         pin_memory=pin_memory,

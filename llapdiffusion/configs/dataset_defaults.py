@@ -217,6 +217,8 @@ def apply_dataset_preset(cfg: object, dataset_key: str, *, pred: int | None = No
     setattr(cfg, "WINDOW", preset.context_length)
     setattr(cfg, "COVERAGE", 0.0)
     setattr(cfg, "date_batching", True)
+    setattr(cfg, "split_policy", "global_purged_horizon")
+    setattr(cfg, "exact_timestamp_batches", True)
     setattr(cfg, "BATCH_SIZE", preset.table_batch_size)
     setattr(cfg, "DATES_PER_BATCH", 1)
 
@@ -307,6 +309,8 @@ def validate_dataset_presets(keys: Iterable[str] | None = None) -> dict[str, obj
                 "context_length": preset.context_length,
                 "table_batch_size": preset.table_batch_size,
                 "runtime_dates_per_batch": 1,
+                "split_policy": "global_purged_horizon",
+                "exact_timestamp_batches": True,
                 "vae_latent_channels": preset.vae_latent_channels,
                 "minsnr_gamma": preset.minsnr_gamma,
                 "epochs": preset.epochs,

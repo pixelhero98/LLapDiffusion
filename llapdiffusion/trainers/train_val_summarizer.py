@@ -76,6 +76,8 @@ def _ensure_loaders(
             H=config.PRED,
             coverage=config.COVERAGE,
             ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
+            split_policy=getattr(config, "split_policy", "global_purged_horizon"),
+            exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
         )
     elif sizes is None:
         try:
