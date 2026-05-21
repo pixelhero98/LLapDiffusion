@@ -347,6 +347,57 @@ def test_baseline_loader_accepts_supported_explicit_horizon(monkeypatch, tmp_pat
     assert info["horizon"] == 8
 
 
+def test_baseline_loader_forwards_induced_context_missingness(monkeypatch, tmp_path):
+    from llapdiffusion.baselines import data as baseline_data
+
+    data_dir = tmp_path / "demo"
+    meta_dir = data_dir / "cache_ratio_index"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(
+        '{"assets": ["a"], "feature_cols": ["target"], "target_col": "target"}',
+        encoding="utf-8",
+    )
+    preset = SimpleNamespace(
+        data_dir=data_dir,
+        horizons=(4,),
+        context_length=16,
+        table_batch_size=2,
+    )
+    seen = {}
+
+    def fake_run_experiment(
+        data_dir,
+        K,
+        H,
+        ratios,
+        per_asset,
+        date_batching,
+        coverage,
+        dates_per_batch,
+        batch_size,
+        norm,
+        reindex,
+        split_policy,
+        exact_timestamp_batches,
+    ):
+        seen["coverage"] = coverage
+        return ["train"], ["val"], ["test"], (1, 2, 3)
+
+    monkeypatch.setattr(baseline_data, "get_dataset_preset", lambda key: preset)
+    monkeypatch.setattr(baseline_data, "resolve_run_experiment", lambda path: fake_run_experiment)
+
+    _, info = baseline_data.load_dataset_loaders(
+        "demo",
+        horizon=4,
+        allow_cache_copy=False,
+        work_cache_dir=None,
+        coverage=0.35,
+    )
+
+    assert seen["coverage"] == 0.35
+    assert info["coverage"] == 0.35
+
+
 def test_baseline_loader_forwards_target_col_and_reports_effective_target(monkeypatch, tmp_path):
     from llapdiffusion.baselines import data as baseline_data
 
@@ -930,6 +981,7 @@ def test_run_baselines_practical_defaults_are_full_comparison(monkeypatch):
     assert config.device == "auto"
     assert config.input_policy == "target_only"
     assert config.target_cols is None
+    assert config.coverage == 0.0
     assert config.verbose is False
 
 
@@ -939,13 +991,23 @@ def test_run_baselines_accepts_target_cols(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
-        ["llapdiff-baselines", "practical-extrapolation", "--target-cols", "RET_OPEN", "RET_CLOSE", "--verbose"],
+        [
+            "llapdiff-baselines",
+            "practical-extrapolation",
+            "--target-cols",
+            "RET_OPEN",
+            "RET_CLOSE",
+            "--coverage",
+            "0.25",
+            "--verbose",
+        ],
     )
     args = run_baselines.parse_args()
     config = run_baselines._train_config(args)
 
     assert config.target_col is None
     assert config.target_cols == ("RET_OPEN", "RET_CLOSE")
+    assert config.coverage == 0.25
     assert config.verbose is True
 
 
@@ -1029,6 +1091,10 @@ def test_public_docs_and_requirements_are_clone_ready():
     assert "## Target Selection" in readme
     assert "--target-col" in readme
     assert "--target-cols" in readme
+    assert "--coverage" in readme
+    assert "fraction of observed context entries to hide" in readme
+    assert "Dense-date panel filtering" in readme
+    assert "panel_coverage" in readme
     assert "https://arxiv.org/abs/2605.19805" in readme
     private_patterns = (
         r"hf_[A-Za-z0-9]{20,}",
@@ -1277,7 +1343,11 @@ def test_practical_runner_reports_full_panel_scope(monkeypatch, tmp_path):
         "dependency_caveat": "",
         "dependency_sources": {},
     }))
-    monkeypatch.setattr(runner, "load_dataset_loaders", lambda *args, **kwargs: (([batch], [batch], [batch]), _sample_dataset_info(context=3, horizon=2)))
+    def fake_load_dataset_loaders(*args, **kwargs):
+        seen["loader_coverage"] = kwargs["coverage"]
+        return ([batch], [batch], [batch]), _sample_dataset_info(context=3, horizon=2)
+
+    monkeypatch.setattr(runner, "load_dataset_loaders", fake_load_dataset_loaders)
 
     def fake_build_adapter(baseline, dataset_info, sample_batch, *args, **kwargs):
         seen["sample_entities"] = sample_batch[0][0].shape[1]
@@ -1285,10 +1355,11 @@ def test_practical_runner_reports_full_panel_scope(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "build_adapter", fake_build_adapter)
 
-    config = runner.TrainConfig(source_root=None, epochs=1, patience=1)
+    config = runner.TrainConfig(source_root=None, epochs=1, patience=1, coverage=0.4)
     result = runner.run_practical_one("dlinear", "crypto", config, tmp_path, horizon=2)
 
     assert seen["sample_entities"] == 2
+    assert seen["loader_coverage"] == 0.4
     assert result["entity_selection_mode"] == "full_panel"
     assert result["num_entities_used"] == 2
     assert result["comparison_type"] == "extrapolation"

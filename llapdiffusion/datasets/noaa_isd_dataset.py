@@ -84,6 +84,7 @@ from llapdiffusion.datasets._normalization import NormalizationStatsAccumulator
 from llapdiffusion.datasets._types import PathLike
 from llapdiffusion.datasets.fin_dataset import (
     CachePaths,
+    _validate_context_missingness_rate,
     load_dataloaders_with_ratio_split as _load_fin_ratio_split,
     rebuild_window_index_only as _rebuild_window_index_only,
 )
@@ -750,7 +751,8 @@ def run_experiment(
     ratios=(0.7, 0.1, 0.2),
     per_asset: bool = True,
     date_batching: bool = True,
-    coverage: float = 0.85,
+    coverage: float = 0.0,
+    panel_coverage: float = 0.0,
     dates_per_batch: int = 30,
     batch_size: int = 64,
     norm: str = "train_only",
@@ -769,6 +771,7 @@ def run_experiment(
     code can switch datasets with minimal friction.
     """
 
+    coverage = _validate_context_missingness_rate(coverage, name="coverage")
     paths = CachePaths.from_dir(data_dir)
     meta = _validate_isd_cache(paths)
     max_window = int(meta.get("max_window", MAX_LOOKBACK))
@@ -824,7 +827,7 @@ def run_experiment(
         per_asset=per_asset,
         norm_scope=norm,
         date_batching=date_batching,
-        coverage_per_window=coverage,
+        coverage_per_window=panel_coverage,
         dates_per_batch=dates_per_batch,
         window=K,
         horizon=H,
@@ -835,6 +838,7 @@ def run_experiment(
         shuffle_train=shuffle_train,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        coverage=coverage,
     )
 
     return train_dl, val_dl, test_dl, lengths

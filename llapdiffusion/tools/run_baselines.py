@@ -9,6 +9,7 @@ from llapdiffusion.baselines.runner import TrainConfig, export_notes, run_practi
 FULL_NUM_SAMPLES = 25
 FULL_EPOCHS = 600
 FULL_PATIENCE = 50
+COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -48,6 +49,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         default=0.30,
         help="Fraction of observed target-horizon entries to hide for CSDI imputation comparisons.",
     )
+    parser.add_argument("--coverage", type=float, default=0.0, help=COVERAGE_HELP)
     parser.add_argument("--allow-cache-copy", action="store_true")
     parser.add_argument("--verbose", action="store_true", help="Print per-epoch baseline training progress.")
 
@@ -68,6 +70,9 @@ def _parse_horizons(values: list[str] | None) -> tuple[int, ...] | str | None:
 def _train_config(args: argparse.Namespace) -> TrainConfig:
     if getattr(args, "target_col", None) and getattr(args, "target_cols", None):
         raise SystemExit("Use either --target-col or --target-cols, not both.")
+    coverage = float(getattr(args, "coverage", 0.0))
+    if not 0.0 <= coverage < 1.0:
+        raise SystemExit("--coverage must satisfy 0 <= coverage < 1.")
     target_cols = tuple(args.target_cols) if getattr(args, "target_cols", None) else None
     return TrainConfig(
         source_root=args.source_root,
@@ -85,6 +90,7 @@ def _train_config(args: argparse.Namespace) -> TrainConfig:
         input_policy=args.input_policy,
         target_col=args.target_col,
         target_cols=target_cols,
+        coverage=coverage,
         verbose=bool(getattr(args, "verbose", False)),
     )
 

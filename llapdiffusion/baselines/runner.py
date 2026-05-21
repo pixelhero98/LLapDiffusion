@@ -46,6 +46,7 @@ class TrainConfig:
     input_policy: str = "target_only"
     target_col: str | None = None
     target_cols: tuple[str, ...] | None = None
+    coverage: float = 0.0
     verbose: bool = False
 
 
@@ -420,6 +421,7 @@ def run_practical_one(
         work_cache_dir=Path(config.work_cache_dir).expanduser().resolve() if config.work_cache_dir else None,
         target_col=config.target_col,
         target_cols=config.target_cols,
+        coverage=config.coverage,
     )
     train_dl, val_dl, test_dl = loaders
     dataset_info["input_policy"] = str(config.input_policy)

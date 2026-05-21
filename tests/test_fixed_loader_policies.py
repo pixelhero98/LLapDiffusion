@@ -194,6 +194,127 @@ def test_dataset_summary_split_counts_match_loader(tmp_path):
     assert loaders[3] == summary_counts
 
 
+def test_loader_coverage_zero_preserves_context_observations(tmp_path):
+    data_dir, _, _ = _write_tiny_cache(tmp_path, length=40, window=2, horizon=3)
+    train_dl, _, _, _ = load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=0.7,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        batch_size=1,
+        n_entities=2,
+        norm_scope="cache",
+        shuffle_train=False,
+        date_batching=False,
+        window=2,
+        horizon=3,
+        split_policy="contiguous",
+        exact_timestamp_batches=True,
+        coverage=0.0,
+    )
+
+    (V, _), _, meta = next(iter(train_dl))
+    present = meta["entity_mask"][0]
+
+    assert meta["x_obs_mask"][0, present].all()
+    assert torch.count_nonzero(V[0, present]).item() > 0
+
+
+def test_loader_coverage_hides_context_only_and_is_deterministic(tmp_path):
+    data_dir, _, _ = _write_tiny_cache(tmp_path, length=40, window=3, horizon=3)
+
+    def first_batch():
+        train_dl, _, _, _ = load_dataloaders_with_ratio_split(
+            data_dir=str(data_dir),
+            train_ratio=0.7,
+            val_ratio=0.1,
+            test_ratio=0.2,
+            batch_size=1,
+            n_entities=2,
+            norm_scope="cache",
+            shuffle_train=False,
+            date_batching=False,
+            window=3,
+            horizon=3,
+            split_policy="contiguous",
+            exact_timestamp_batches=True,
+            coverage=0.5,
+            seed=123,
+        )
+        return next(iter(train_dl))
+
+    (V1, _), _, meta1 = first_batch()
+    (V2, _), _, meta2 = first_batch()
+    present = meta1["entity_mask"][0]
+    x_obs = meta1["x_obs_mask"][0, present]
+    hidden = ~x_obs
+
+    assert torch.equal(meta1["x_obs_mask"], meta2["x_obs_mask"])
+    assert torch.equal(V1, V2)
+    assert int(x_obs.sum().item()) == 3
+    assert int(hidden.sum().item()) == 3
+    assert torch.all(V1[0, present][hidden] == 0.0)
+    assert meta1["y_obs_mask"][0, present].all()
+
+
+@pytest.mark.parametrize("coverage", [-0.1, 1.0])
+def test_loader_coverage_rejects_invalid_rates(tmp_path, coverage):
+    data_dir, _, _ = _write_tiny_cache(tmp_path, length=40, window=2, horizon=3)
+
+    with pytest.raises(ValueError, match="coverage"):
+        load_dataloaders_with_ratio_split(
+            data_dir=str(data_dir),
+            date_batching=False,
+            window=2,
+            horizon=3,
+            split_policy="contiguous",
+            coverage=coverage,
+        )
+
+
+def test_panel_coverage_preserves_dense_date_filter(tmp_path):
+    data_dir, pairs, end_times = _write_tiny_cache(tmp_path, num_assets=3, length=50, window=2, horizon=3)
+    days = end_times.astype("datetime64[D]")
+    partial_day = np.unique(days)[-1]
+    keep = ~((pairs[:, 0] == 2) & (days == partial_day))
+    paths = CachePaths.from_dir(data_dir)
+    np.save(paths.windows / "global_pairs.npy", pairs[keep])
+    np.save(paths.windows / "end_times.npy", end_times[keep])
+
+    low = load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=0.7,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        batch_size=1,
+        n_entities=3,
+        date_batching=True,
+        dates_per_batch=1,
+        window=2,
+        horizon=3,
+        split_policy="contiguous",
+        exact_timestamp_batches=False,
+        coverage_per_window=2 / 3,
+    )
+    high = load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=0.7,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        batch_size=1,
+        n_entities=3,
+        date_batching=True,
+        dates_per_batch=1,
+        window=2,
+        horizon=3,
+        split_policy="contiguous",
+        exact_timestamp_batches=False,
+        coverage_per_window=1.0,
+    )
+
+    assert sum(low[3]) > sum(high[3])
+
+
 def test_target_override_selects_non_default_feature_and_keeps_scalar_shape(tmp_path):
     data_dir, _, _ = _write_tiny_cache(tmp_path, length=40, window=2, horizon=3)
     train_dl, _, _, _ = load_dataloaders_with_ratio_split(
@@ -490,6 +611,39 @@ def test_synthetic_public_path_defaults_to_exact_timestamp_batching():
     assert cfg.date_batching is True
 
 
+def test_synthetic_public_path_accepts_induced_context_missingness():
+    from llapdiffusion.tools import run_synthetic_regime_shift
+
+    cfg = run_synthetic_regime_shift._configure(
+        run_synthetic_regime_shift.RunSpec(
+            task="synthetic_freq_shift",
+            seed=1,
+            shift_multiplier=2.0,
+            protocol_name="test",
+        ),
+        SimpleNamespace(
+            artifact_root=".",
+            data_root=".",
+            output_root=".",
+            protocol_name="test",
+            window=4,
+            horizon=2,
+            series_length=16,
+            change_point=8,
+            num_entities=2,
+            epochs=1,
+            samples=1,
+            overwrite_data=False,
+            smoke=False,
+            skip_existing=False,
+            force_rebuild=False,
+            coverage=0.2,
+        ),
+    )
+
+    assert cfg.COVERAGE == 0.2
+
+
 def test_pipeline_forwards_loader_policy(monkeypatch):
     from llapdiffusion import pipeline
 
@@ -506,7 +660,7 @@ def test_pipeline_forwards_loader_policy(monkeypatch):
         DATES_PER_BATCH=4,
         WINDOW=2,
         PRED=3,
-        COVERAGE=0.0,
+        COVERAGE=0.25,
         train_ratio=0.7,
         val_ratio=0.1,
         test_ratio=0.2,
@@ -519,6 +673,7 @@ def test_pipeline_forwards_loader_policy(monkeypatch):
     assert seen["split_policy"] == "global_purged_horizon"
     assert seen["exact_timestamp_batches"] is True
     assert seen["target_col"] == "ozone"
+    assert seen["coverage"] == 0.25
 
 
 @pytest.mark.parametrize(

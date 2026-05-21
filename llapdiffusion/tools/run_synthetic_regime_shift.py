@@ -31,6 +31,7 @@ from llapdiffusion.models.llapdiff_utils import set_torch
 
 
 DEFAULT_WORK_ROOT = Path.cwd()
+COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
 
 
 TASK_SPECS: Mapping[str, Mapping[str, object]] = {
@@ -142,6 +143,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--print-json", action="store_true", help="Print the full overall JSON payload to stdout.")
     parser.add_argument("--target-col", type=str, default=None, help="Optional scalar target feature column.")
     parser.add_argument("--target-cols", nargs="+", default=None, help="Optional target feature columns.")
+    parser.add_argument("--coverage", type=float, default=0.0, help=COVERAGE_HELP)
     parser.add_argument("--verbose", action="store_true", help="Print trainer diagnostics.")
     parser.add_argument("--debug", action="store_true", help="Print verbose trainer diagnostics.")
     parser.add_argument(
@@ -154,6 +156,13 @@ def _parse_args() -> argparse.Namespace:
 
 def _tag_float(value: float) -> str:
     return f"{float(value):g}".replace("-", "m").replace(".", "p")
+
+
+def _validate_coverage(value: object) -> float:
+    coverage = float(value)
+    if not 0.0 <= coverage < 1.0:
+        raise ValueError("--coverage must satisfy 0 <= coverage < 1.")
+    return coverage
 
 
 def _protocol_defaults(protocol_name: str) -> Tuple[int, int]:
@@ -247,7 +256,7 @@ def _configure(spec: RunSpec, args: argparse.Namespace) -> SimpleNamespace:
     cfg.PRED = int(args.horizon)
     cfg.SUM_CONTEXT_LEN_FIXED = int(args.window)
     cfg.SUM_CONTEXT_LEN = int(args.window)
-    cfg.COVERAGE = 0.0
+    cfg.COVERAGE = _validate_coverage(getattr(args, "coverage", 0.0))
     cfg.date_batching = True
     cfg.DATES_PER_BATCH = 16
     cfg.BATCH_SIZE = 16

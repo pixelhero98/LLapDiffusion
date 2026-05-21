@@ -17,6 +17,9 @@ from llapdiffusion.logging_utils import apply_verbosity
 from llapdiffusion.trainers import train_val_latent, train_val_summarizer, train_val_llapdiff
 
 
+COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
+
+
 def _import_trainers():
     """Return the trainer modules exposed through the public package layout."""
     return train_val_latent, train_val_summarizer, train_val_llapdiff
@@ -49,6 +52,13 @@ def _fmt_optional(value: object) -> str:
     if value is None:
         return "None"
     return str(value)
+
+
+def _validate_coverage(value: object) -> float:
+    coverage = float(value)
+    if not 0.0 <= coverage < 1.0:
+        raise ValueError("--coverage must satisfy 0 <= coverage < 1.")
+    return coverage
 
 
 def _summarizer_ckpt_path(config=config) -> Path:
@@ -389,6 +399,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Prediction horizons to run. Defaults to config.PIPELINE_PREDS or [config.PRED].",
     )
+    parser.add_argument("--coverage", type=float, default=0.0, help=COVERAGE_HELP)
     parser.add_argument(
         "--recompute-vae",
         action="store_true",
@@ -686,6 +697,7 @@ def main() -> Dict[int, Dict[str, object]]:
         config.split_policy = args.split_policy
     if args.calendar_day_batches:
         config.exact_timestamp_batches = False
+    config.COVERAGE = _validate_coverage(args.coverage)
     training_overrides = _training_overrides_from_args(args)
     preds = tuple(args.preds) if args.preds else _pred_list_from_config(config=config)
     if not preds:

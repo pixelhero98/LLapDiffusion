@@ -20,6 +20,9 @@ from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.datasets.target_selection import resolve_target_selection
 
 
+COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare VAE and summarizer artifacts using the public dataset presets.")
     parser.add_argument(
@@ -64,6 +67,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="JSON object or JSON file mapping dataset keys to target column lists.",
     )
+    parser.add_argument("--coverage", type=float, default=0.0, help=COVERAGE_HELP)
     parser.add_argument("--print-json", action="store_true", help="Print the full summary JSON to stdout.")
     parser.add_argument("--verbose", action="store_true", help="Print trainer diagnostics.")
     parser.add_argument("--debug", action="store_true", help="Print verbose trainer diagnostics.")
@@ -104,6 +108,13 @@ def _coerce_target_cols(value: object) -> tuple[str, ...] | None:
     return cols or None
 
 
+def _validate_coverage(value: object) -> float:
+    coverage = float(value)
+    if not 0.0 <= coverage < 1.0:
+        raise ValueError("--coverage must satisfy 0 <= coverage < 1.")
+    return coverage
+
+
 def _load_target_cols_map(value: str | None) -> dict[str, tuple[str, ...]]:
     if not value:
         return {}
@@ -141,6 +152,7 @@ def _artifact_config(
     *,
     target_col: str | None = None,
     target_cols: Sequence[str] | None = None,
+    coverage: float = 0.0,
 ):
     cfg = clone_config()
     apply_dataset_preset(cfg, dataset_key, pred=int(pred))
@@ -148,6 +160,7 @@ def _artifact_config(
         raise ValueError("Use either target_col or target_cols, not both.")
     cfg.TARGET_COL = target_col
     cfg.TARGET_COLS = list(target_cols) if target_cols else None
+    cfg.COVERAGE = _validate_coverage(coverage)
     # Artifact prep prioritizes stable loader semantics over the table batch-size row.
     cfg.BATCH_SIZE = 1
     cfg.DATES_PER_BATCH = 1
@@ -283,6 +296,7 @@ def main() -> None:
     if args.target_col and (args.target_cols or args.target_cols_map):
         raise ValueError("Use either --target-col or --target-cols/--target-cols-map, not both.")
     target_cols_map = _load_target_cols_map(args.target_cols_map)
+    coverage = _validate_coverage(args.coverage)
     spec_validation = _validate_dataset_specs()
 
     records = []
@@ -294,7 +308,13 @@ def main() -> None:
                 global_target_cols=args.target_cols,
                 target_cols_map=target_cols_map,
             )
-            cfg = _artifact_config(dataset_key, int(pred), target_col=args.target_col, target_cols=target_cols)
+            cfg = _artifact_config(
+                dataset_key,
+                int(pred),
+                target_col=args.target_col,
+                target_cols=target_cols,
+                coverage=coverage,
+            )
             records.append(
                 {
                     "dataset": dataset_key,
@@ -333,7 +353,13 @@ def main() -> None:
                 global_target_cols=args.target_cols,
                 target_cols_map=target_cols_map,
             )
-            cfg = _artifact_config(dataset_key, int(pred), target_col=args.target_col, target_cols=target_cols)
+            cfg = _artifact_config(
+                dataset_key,
+                int(pred),
+                target_col=args.target_col,
+                target_cols=target_cols,
+                coverage=coverage,
+            )
             apply_verbosity(cfg, verbose=args.verbose, debug=args.debug)
             if args.verbose or args.debug:
                 print(f"\n=== dataset={dataset_key} pred={pred} context={preset.context_length} ===")

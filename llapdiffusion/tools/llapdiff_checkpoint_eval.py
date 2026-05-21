@@ -33,12 +33,16 @@ from llapdiffusion.models.llapdiff_utils import (
 )
 
 
+COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
+
+
 def build_eval_config(
     dataset_key: str,
     pred: int,
     *,
     target_col: str | None = None,
     target_cols: Sequence[str] | None = None,
+    coverage: float = 0.0,
 ) -> SimpleNamespace:
     cfg = clone_config()
     apply_dataset_preset(cfg, dataset_key, pred=pred)
@@ -46,6 +50,7 @@ def build_eval_config(
         raise ValueError("Use either target_col or target_cols, not both.")
     cfg.TARGET_COL = target_col
     cfg.TARGET_COLS = list(target_cols) if target_cols else None
+    cfg.COVERAGE = _validate_coverage(coverage)
     return cfg
 
 
@@ -82,6 +87,13 @@ def _validate_random_mask_ratio(value: float) -> float:
     if not 0.0 < ratio < 1.0:
         raise ValueError("imputation random mask ratio must be in the open interval (0, 1)")
     return ratio
+
+
+def _validate_coverage(value: object) -> float:
+    coverage = float(value)
+    if not 0.0 <= coverage < 1.0:
+        raise ValueError("--coverage must satisfy 0 <= coverage < 1.")
+    return coverage
 
 
 def _validate_sample_count(value: int, *, name: str) -> int:
@@ -647,6 +659,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional target feature columns for multi-target evaluation.",
     )
+    parser.add_argument("--coverage", type=float, default=0.0, help=COVERAGE_HELP)
     parser.add_argument("--print-json", action="store_true", help="Print the full evaluation JSON to stdout.")
     parser.add_argument("--verbose", action="store_true", help="Print extra evaluation progress details.")
     parser.add_argument("--debug", action="store_true", help="Print verbose diagnostics.")
@@ -701,7 +714,13 @@ def main() -> None:
     pred = int(args.pred) if args.pred is not None else int(default_horizons(args.dataset_key)[-1])
     if args.target_col and args.target_cols:
         raise ValueError("Use either --target-col or --target-cols, not both.")
-    cfg = build_eval_config(args.dataset_key, pred, target_col=args.target_col, target_cols=args.target_cols)
+    cfg = build_eval_config(
+        args.dataset_key,
+        pred,
+        target_col=args.target_col,
+        target_cols=args.target_cols,
+        coverage=args.coverage,
+    )
     apply_verbosity(cfg, verbose=args.verbose, debug=args.debug)
     label = args.label or f"{args.dataset_key}_pred{pred}"
     result = evaluate_checkpoint(

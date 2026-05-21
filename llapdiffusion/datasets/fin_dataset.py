@@ -15,6 +15,7 @@ under ``<data_dir>/cache_ratio_index`` using the following layout::
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 from dataclasses import dataclass, field
 from math import ceil as _ceil
@@ -337,6 +338,55 @@ def _compute_relative_time_deltas(times: np.ndarray, native_scale_seconds: float
         return np.array([], dtype=np.float32)
 
     return _compute_time_offsets_from_anchor(arr, arr.reshape(-1)[0], native_scale_seconds)
+
+
+def _validate_context_missingness_rate(rate: float, *, name: str = "coverage") -> float:
+    """Validate the induced context-missingness rate."""
+    value = float(rate)
+    if not np.isfinite(value) or value < 0.0 or value >= 1.0:
+        raise ValueError(f"{name} must satisfy 0 <= {name} < 1.")
+    return value
+
+
+def _sample_identity_seed(seed: int, aid: int, start: int) -> int:
+    key = f"{int(seed)}:{int(aid)}:{int(start)}".encode("ascii")
+    return int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "little")
+
+
+def _apply_context_missingness(
+    obs_mask: np.ndarray,
+    rate: float,
+    seed: int,
+    aid: int,
+    start: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Hide floor(rate * observed_entries) observed context entries deterministically."""
+    obs = np.asarray(obs_mask, dtype=bool).copy()
+    observed = np.flatnonzero(obs.reshape(-1))
+    n_hide = int(np.floor(float(rate) * observed.size))
+    if n_hide <= 0:
+        return obs, None
+
+    rng = np.random.default_rng(_sample_identity_seed(seed, aid, start))
+    hidden_idx = rng.choice(observed, size=n_hide, replace=False)
+    hidden = np.zeros(obs.size, dtype=bool)
+    hidden[hidden_idx] = True
+    hidden = hidden.reshape(obs.shape)
+    obs[hidden] = False
+    return obs, hidden
+
+
+def _zero_hidden_context_values(x: np.ndarray, hidden_mask: Optional[np.ndarray]) -> None:
+    if hidden_mask is None:
+        return
+    hidden = np.asarray(hidden_mask, dtype=bool)
+    if hidden.shape == x.shape:
+        x[hidden] = 0.0
+        return
+    if hidden.ndim == 1 and x.ndim == 2 and hidden.shape[0] == x.shape[0]:
+        x[hidden, :] = 0.0
+        return
+    x[np.broadcast_to(hidden, x.shape)] = 0.0
 
 
 def build_calendar_frame(idx: pd.DatetimeIndex, cfg: CalendarConfig) -> pd.DataFrame:
@@ -1062,6 +1112,8 @@ class _IndexBackedDataset(Dataset):
                  target_indices: Optional[Sequence[int]] = None,
                  target_dim: int = 1,
                  target_source: str = "cache_target",
+                 context_missingness_rate: float = 0.0,
+                 seed: int = 1337,
                  ): 
         self.pairs = pairs
         self.assets = assets
@@ -1085,6 +1137,11 @@ class _IndexBackedDataset(Dataset):
         self.target_index = int(self.target_indices[0])
         self.target_dim = len(self.target_indices)
         self.target_source = str(target_source)
+        self.context_missingness_rate = _validate_context_missingness_rate(
+            context_missingness_rate,
+            name="coverage",
+        )
+        self.seed = int(seed)
 
         # Cache per-asset arrays lazily. We avoid mmap here because keeping
         # train/val/test datasets alive at once can exhaust the default open-file
@@ -1131,6 +1188,16 @@ class _IndexBackedDataset(Dataset):
         if obs_slice is None:
             obs_slice = np.isfinite(x)
         fill_slice = Fill[s:e] if Fill is not None else obs_slice
+        hidden_context_mask = None
+        context_missingness_rate = float(getattr(self, "context_missingness_rate", 0.0))
+        if context_missingness_rate > 0.0:
+            obs_slice, hidden_context_mask = _apply_context_missingness(
+                obs_slice,
+                context_missingness_rate,
+                int(getattr(self, "seed", 1337)),
+                int(aid),
+                s,
+            )
         target_source = getattr(self, "target_source", "cache_target")
         target_indices = tuple(int(idx) for idx in getattr(self, "target_indices", (getattr(self, "target_index", 0),)))
         target_dim = int(getattr(self, "target_dim", len(target_indices) or 1))
@@ -1191,6 +1258,7 @@ class _IndexBackedDataset(Dataset):
         y_vec = np.clip(y_vec, lo_y, hi_y, out=y_vec)
         y_vec = (y_vec - my) / sy
         x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        _zero_hidden_context_values(x, hidden_context_mask)
         y_vec = np.nan_to_num(y_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Torch tensors expected by collate: X->float32, Y->float32 or int
@@ -1595,7 +1663,9 @@ def load_dataloaders_with_ratio_split(
     exact_timestamp_batches: bool = True,
     target_col: Optional[str] = None,
     target_cols: Optional[Sequence[str]] = None,
+    coverage: float = 0.0,
 ):
+    coverage = _validate_context_missingness_rate(coverage, name="coverage")
     paths = CachePaths.from_dir(data_dir)
 
     # Read meta + norm
@@ -1706,7 +1776,9 @@ def load_dataloaders_with_ratio_split(
                                 target_index=target_selection.target_index,
                                 target_indices=target_selection.target_indices,
                                 target_dim=target_selection.target_dim,
-                                target_source=target_selection.target_source)
+                                target_source=target_selection.target_source,
+                                context_missingness_rate=coverage,
+                                seed=seed)
     ds_va = _IndexBackedDataset(va_pairs, assets, data_dir, window, horizon, regression,
                                 keep_time_meta, norm_stats, clamp_sigma=float(meta.get('clamp_sigma', 5.0)),
                                 native_time_scale_seconds=float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
@@ -1714,7 +1786,9 @@ def load_dataloaders_with_ratio_split(
                                 target_index=target_selection.target_index,
                                 target_indices=target_selection.target_indices,
                                 target_dim=target_selection.target_dim,
-                                target_source=target_selection.target_source)
+                                target_source=target_selection.target_source,
+                                context_missingness_rate=coverage,
+                                seed=seed)
     ds_te = _IndexBackedDataset(te_pairs, assets, data_dir, window, horizon, regression,
                                 keep_time_meta, norm_stats, clamp_sigma=float(meta.get('clamp_sigma', 5.0)),
                                 native_time_scale_seconds=float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
@@ -1722,7 +1796,9 @@ def load_dataloaders_with_ratio_split(
                                 target_index=target_selection.target_index,
                                 target_indices=target_selection.target_indices,
                                 target_dim=target_selection.target_dim,
-                                target_source=target_selection.target_source)
+                                target_source=target_selection.target_source,
+                                context_missingness_rate=coverage,
+                                seed=seed)
 
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
@@ -1804,6 +1880,7 @@ def run_experiment(
     per_asset=True,
     date_batching=True,
     coverage=0.0,
+    panel_coverage=0.0,
     dates_per_batch=30,
     batch_size=64,
     norm="train_only",    # default is "train_only" in the patched loader; set "cache" if you want fixed μ/σ
@@ -1816,8 +1893,9 @@ def run_experiment(
     """
     Builds loaders for a given (K, H) using the already-downloaded cache.
     - If date_batching=True, reindex first so context end_times align with K/H.
-    - Coverage threshold is applied per day; panel width is auto-detected from the cache.
+    - coverage induces context missingness; panel_coverage applies the old per-day panel filter.
     """
+    coverage = _validate_context_missingness_rate(coverage, name="coverage")
     if reindex:
         rebuild_window_index_only(
             data_dir,
@@ -1839,7 +1917,7 @@ def run_experiment(
         per_asset=per_asset,     # freely tunable each run
         norm_scope=norm,         # "train_only" (recommended) or "cache"
         date_batching=date_batching,
-        coverage_per_window=coverage,
+        coverage_per_window=panel_coverage,
         dates_per_batch=dates_per_batch,
         window=K,
         horizon=H,
@@ -1847,6 +1925,7 @@ def run_experiment(
         exact_timestamp_batches=exact_timestamp_batches,
         target_col=target_col,
         target_cols=target_cols,
+        coverage=coverage,
     )
 
     return train_dl, val_dl, test_dl, lengths

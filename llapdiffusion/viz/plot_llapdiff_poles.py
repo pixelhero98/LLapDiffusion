@@ -25,6 +25,7 @@ from llapdiffusion.trainers import train_val_llapdiff as tv
 
 CHECKPOINT_KINDS = ("raw", "ema", "best", "last", "auto")
 SPLITS = ("train", "val", "test")
+COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
 
 
 def _infer_dataset_key_from_path(path: Path) -> Optional[str]:
@@ -48,6 +49,13 @@ def _build_config(dataset_key: str, pred: int):
     cfg = clone_config()
     apply_dataset_preset(cfg, dataset_key, pred=pred)
     return cfg
+
+
+def _validate_coverage(value: object) -> float:
+    coverage = float(value)
+    if not 0.0 <= coverage < 1.0:
+        raise ValueError("--coverage must satisfy 0 <= coverage < 1.")
+    return coverage
 
 
 def _checkpoint_filename(pred: int, kind: str) -> str:
@@ -413,6 +421,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=None, help="Directory for the saved PDF.")
     parser.add_argument("--use-ema", action="store_true", default=False, help="Apply EMA weights when available. Implied by --checkpoint-kind ema.")
     parser.add_argument("--num-timesteps", type=int, default=5, help="Number of diffusion timesteps to plot.")
+    parser.add_argument("--coverage", type=float, default=0.0, help=COVERAGE_HELP)
     parser.add_argument("--dataset-zip", type=str, default=None, help="Optional zipped dataset cache.")
     parser.add_argument("--dataset-extract-dir", type=str, default=None, help="Optional directory for extracting --dataset-zip.")
     return parser.parse_args()
@@ -440,6 +449,7 @@ def main() -> None:
         raise ValueError("Could not infer the prediction horizon. Pass --pred explicitly.")
 
     cfg = _build_config(dataset_key, int(pred))
+    cfg.COVERAGE = _validate_coverage(args.coverage)
     checkpoint = _resolve_checkpoint(
         str(checkpoint) if checkpoint is not None else None,
         cfg,

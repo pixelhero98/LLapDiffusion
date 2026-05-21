@@ -27,6 +27,7 @@ def load_dataset_loaders(
     horizon: int | None = None,
     target_col: str | None = None,
     target_cols: tuple[str, ...] | list[str] | None = None,
+    coverage: float = 0.0,
 ):
     preset = get_dataset_preset(dataset_key)
     data_dir = Path(preset.data_dir)
@@ -40,6 +41,9 @@ def load_dataset_loaders(
     exact_timestamp_batches = bool(getattr(preset, "exact_timestamp_batches", True))
     copied_cache = False
     reindex = False
+    coverage = float(coverage)
+    if not 0.0 <= coverage < 1.0:
+        raise ValueError("coverage must be in the half-open interval [0, 1)")
 
     if dataset_key == "noaa_us":
         meta_path = data_dir / "cache_ratio_index" / "meta.json"
@@ -86,7 +90,7 @@ def load_dataset_loaders(
         "ratios": (0.7, 0.1, 0.2),
         "per_asset": True,
         "date_batching": True,
-        "coverage": 0.0,
+        "coverage": coverage,
         "dates_per_batch": preset.table_batch_size,
         "batch_size": preset.table_batch_size,
         "norm": "train_only",
@@ -121,6 +125,7 @@ def load_dataset_loaders(
         "split_policy": split_policy,
         "split_scope": split_scope,
         "batching_policy": "exact_context_end_timestamp" if exact_timestamp_batches else "calendar_day",
+        "coverage": coverage,
         **split_protocol_metadata(
             dataset_key,
             split_policy=split_policy,

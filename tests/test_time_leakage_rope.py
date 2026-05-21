@@ -444,6 +444,55 @@ def test_llapdiff_train_target_mask_aux_cli_overrides(monkeypatch):
     assert cfg.TARGET_MASK_AUX_START_EPOCH == 7
 
 
+def test_primary_loader_clis_parse_induced_context_missingness(monkeypatch):
+    from llapdiffusion import pipeline
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+    from llapdiffusion.tools import run_multidataset_artifact_prep as prep
+    from llapdiffusion.tools import run_synthetic_regime_shift as synthetic
+    from llapdiffusion.viz import plot_llapdiff_poles
+
+    cases = [
+        (
+            pipeline._parse_args,
+            ["llapdiff-train", "--dataset-key", "crypto", "--coverage", "0.2"],
+        ),
+        (
+            prep._parse_args,
+            ["llapdiff-artifact-prep", "--datasets", "crypto", "--coverage", "0.2", "--dry-run"],
+        ),
+        (
+            ce._parse_args,
+            ["llapdiff-checkpoint-eval", "--dataset-key", "crypto", "--checkpoint", "model.pt", "--coverage", "0.2"],
+        ),
+        (
+            synthetic._parse_args,
+            ["llapdiff-synthetic-regime", "--coverage", "0.2", "--smoke"],
+        ),
+        (
+            plot_llapdiff_poles._parse_args,
+            ["llapdiff-plot-poles", "--dataset-key", "crypto", "--pred", "100", "--coverage", "0.2"],
+        ),
+    ]
+
+    for parse, argv in cases:
+        monkeypatch.setattr(sys, "argv", argv)
+        args = parse()
+        assert args.coverage == 0.2
+
+
+def test_primary_loader_coverage_help_uses_context_missingness_wording(monkeypatch, capsys):
+    from llapdiffusion import pipeline
+
+    monkeypatch.setattr(sys, "argv", ["llapdiff-train", "--help"])
+    with pytest.raises(SystemExit):
+        pipeline._parse_args()
+
+    help_text = capsys.readouterr().out
+    assert "--coverage" in help_text
+    compact_help = " ".join(help_text.split())
+    assert "fraction of observed context entries to hide; 0 disables induced missingness" in compact_help
+
+
 def test_llapdiff_train_main_applies_dataset_preset_with_requested_pred(monkeypatch):
     from llapdiffusion import pipeline
 

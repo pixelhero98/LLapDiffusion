@@ -70,6 +70,8 @@ llapdiff-train \
 
 The same settings can be provided with `LLAPDIFF_DATASET_ZIP` and `LLAPDIFF_DATASET_EXTRACT_DIR`. Extracted caches are written outside the installed package by default. The archive contains derived caches from public sources; each dataset remains governed by its original source terms.
 
+`--coverage` now means induced context missingness: the fraction of observed context entries to hide before modeling. Use `--coverage 0` for no induced missingness. Dense-date panel filtering, where supported by loader internals, is `panel_coverage` and separate from this setting.
+
 ## Main Commands
 
 Prepare VAE and summarizer artifacts:
