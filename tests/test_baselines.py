@@ -319,6 +319,73 @@ def test_baseline_loader_accepts_supported_explicit_horizon(monkeypatch, tmp_pat
     assert info["horizon"] == 8
 
 
+def test_baseline_loader_uses_physionet_preset_split_policy(monkeypatch, tmp_path):
+    from llapdiffusion.baselines import data as baseline_data
+
+    data_dir = tmp_path / "physionet"
+    meta_dir = data_dir / "cache_ratio_index"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(
+        '{"assets": ["p1"], "feature_cols": ["HR"], "target_col": "HR"}',
+        encoding="utf-8",
+    )
+    preset = SimpleNamespace(
+        data_dir=data_dir,
+        horizons=(4, 8, 12),
+        context_length=24,
+        table_batch_size=5,
+        split_policy="contiguous",
+        split_scope="physionet_patient_relative_time",
+        exact_timestamp_batches=True,
+    )
+    seen = {}
+
+    def fake_run_experiment(
+        data_dir,
+        K,
+        H,
+        ratios,
+        per_asset,
+        date_batching,
+        coverage,
+        dates_per_batch,
+        batch_size,
+        norm,
+        reindex,
+        split_policy,
+        exact_timestamp_batches,
+    ):
+        seen.update(
+            {
+                "split_policy": split_policy,
+                "exact_timestamp_batches": exact_timestamp_batches,
+                "per_asset": per_asset,
+                "H": H,
+            }
+        )
+        return ["train"], ["val"], ["test"], (10, 2, 3)
+
+    monkeypatch.setattr(baseline_data, "get_dataset_preset", lambda key: preset)
+    monkeypatch.setattr(baseline_data, "resolve_run_experiment", lambda path: fake_run_experiment)
+
+    _, info = baseline_data.load_dataset_loaders(
+        "physionet",
+        horizon=12,
+        allow_cache_copy=False,
+        work_cache_dir=None,
+    )
+
+    assert seen == {
+        "split_policy": "contiguous",
+        "exact_timestamp_batches": True,
+        "per_asset": True,
+        "H": 12,
+    }
+    assert info["split_policy"] == "contiguous"
+    assert info["split_scope"] == "physionet_patient_relative_time"
+    assert info["batching_policy"] == "exact_context_end_timestamp"
+
+
 def test_baseline_loader_rejects_split_argument(monkeypatch, tmp_path):
     from llapdiffusion.baselines import data as baseline_data
 

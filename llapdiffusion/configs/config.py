@@ -19,6 +19,7 @@ COVERAGE = 0.0
 date_batching = True
 DATES_PER_BATCH = 1
 split_policy = "global_purged_horizon"
+split_scope = "global_target_time"
 exact_timestamp_batches = True
 
 # Table batch sizes are applied by the dataset preset registry. Runtime

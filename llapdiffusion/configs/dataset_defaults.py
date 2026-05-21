@@ -63,6 +63,9 @@ class DatasetPreset:
     sum_lr: float | None = None
     sum_amp: bool | None = None
     model_overrides: Mapping[str, object] | None = None
+    split_policy: str = "global_purged_horizon"
+    split_scope: str = "global_target_time"
+    exact_timestamp_batches: bool = True
 
     @property
     def expected_data_dir(self) -> Path:
@@ -110,6 +113,8 @@ DATASET_PRESETS: Mapping[str, DatasetPreset] = {
         vae_latent_channels=16,
         minsnr_gamma=5.0,
         model_overrides=_IRREGULAR_PUBLIC_PRESET,
+        split_policy="contiguous",
+        split_scope="physionet_patient_relative_time",
     ),
     "noaa_us": DatasetPreset(
         key="noaa_us",
@@ -217,8 +222,9 @@ def apply_dataset_preset(cfg: object, dataset_key: str, *, pred: int | None = No
     setattr(cfg, "WINDOW", preset.context_length)
     setattr(cfg, "COVERAGE", 0.0)
     setattr(cfg, "date_batching", True)
-    setattr(cfg, "split_policy", "global_purged_horizon")
-    setattr(cfg, "exact_timestamp_batches", True)
+    setattr(cfg, "split_policy", preset.split_policy)
+    setattr(cfg, "split_scope", preset.split_scope)
+    setattr(cfg, "exact_timestamp_batches", preset.exact_timestamp_batches)
     setattr(cfg, "BATCH_SIZE", preset.table_batch_size)
     setattr(cfg, "DATES_PER_BATCH", 1)
 
@@ -309,8 +315,9 @@ def validate_dataset_presets(keys: Iterable[str] | None = None) -> dict[str, obj
                 "context_length": preset.context_length,
                 "table_batch_size": preset.table_batch_size,
                 "runtime_dates_per_batch": 1,
-                "split_policy": "global_purged_horizon",
-                "exact_timestamp_batches": True,
+                "split_policy": preset.split_policy,
+                "split_scope": preset.split_scope,
+                "exact_timestamp_batches": preset.exact_timestamp_batches,
                 "vae_latent_channels": preset.vae_latent_channels,
                 "minsnr_gamma": preset.minsnr_gamma,
                 "epochs": preset.epochs,

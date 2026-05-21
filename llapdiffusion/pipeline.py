@@ -82,9 +82,11 @@ def _resolve_dataset_key(config=config) -> str:
 
 def _update_config_for_pred(pred: int, config=config) -> None:
     split_policy = getattr(config, "split_policy", "global_purged_horizon")
+    split_scope = getattr(config, "split_scope", "global_target_time")
     exact_timestamp_batches = bool(getattr(config, "exact_timestamp_batches", True))
     apply_dataset_preset(config, _resolve_dataset_key(config=config), pred=int(pred))
     config.split_policy = split_policy
+    config.split_scope = split_scope
     config.exact_timestamp_batches = exact_timestamp_batches
     config.SUM_CONTEXT_LEN = _resolve_sum_context_len(pred, config=config)
     config.SUM_CKPT = str(
@@ -227,6 +229,7 @@ def run_single_pred(
         "eval_stats": eval_stats,
         "data_policy": {
             "split_policy": getattr(config, "split_policy", "global_purged_horizon"),
+            "split_scope": getattr(config, "split_scope", "global_target_time"),
             "batching_policy": (
                 "exact_context_end_timestamp"
                 if bool(getattr(config, "exact_timestamp_batches", True))

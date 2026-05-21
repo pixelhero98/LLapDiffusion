@@ -2513,6 +2513,7 @@ def run(
         "selected_test_metric_source": test_metric_source,
         "data_policy": {
             "split_policy": getattr(config, "split_policy", "global_purged_horizon"),
+            "split_scope": getattr(config, "split_scope", "global_target_time"),
             "batching_policy": (
                 "exact_context_end_timestamp"
                 if bool(getattr(config, "exact_timestamp_batches", True))

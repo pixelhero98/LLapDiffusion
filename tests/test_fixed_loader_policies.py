@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from llapdiffusion.baselines.data import regular_feature_target_index, target_mask
@@ -129,6 +130,40 @@ def test_global_purged_split_has_no_target_timestamp_overlap(tmp_path):
     assert val_targets.isdisjoint(test_targets)
 
 
+def test_physionet_relative_time_split_uses_legacy_per_patient_policy(tmp_path):
+    _, pairs, end_times = _write_tiny_cache(tmp_path, num_assets=4, length=49, window=24, horizon=12)
+    order = np.lexsort((end_times.astype("datetime64[ns]").astype(np.int64), pairs[:, 0].astype(np.int64)))
+    pairs = pairs[order]
+    end_times = end_times[order]
+
+    with pytest.raises(ValueError, match="Not enough unique context-end timestamps"):
+        _assign_ratio_splits(
+            pairs,
+            end_times,
+            0.7,
+            0.1,
+            0.2,
+            per_asset=True,
+            split_policy="global_purged_horizon",
+            horizon=12,
+        )
+
+    assign = _assign_ratio_splits(
+        pairs,
+        end_times,
+        0.7,
+        0.1,
+        0.2,
+        per_asset=True,
+        split_policy="contiguous",
+        horizon=12,
+    )
+
+    assert (assign == 0).sum() > 0
+    assert (assign == 1).sum() > 0
+    assert (assign == 2).sum() > 0
+
+
 def test_dataset_summary_split_counts_match_loader(tmp_path):
     data_dir, pairs, end_times = _write_tiny_cache(tmp_path, length=40, window=2, horizon=3)
     loaders = load_dataloaders_with_ratio_split(
@@ -250,6 +285,26 @@ def test_public_ratio_loader_helpers_expose_split_and_batching_policy():
         signature = inspect.signature(getattr(module, helper_name))
         assert "split_policy" in signature.parameters
         assert "exact_timestamp_batches" in signature.parameters
+
+
+def test_physionet_public_wrapper_defaults_to_legacy_split():
+    from llapdiffusion.configs.dataset_defaults import get_dataset_preset
+    from llapdiffusion.datasets.physionet_cinc_dataset import (
+        load_physionet_dataloaders_with_ratio_split,
+        run_experiment,
+    )
+
+    preset = get_dataset_preset("physionet")
+
+    assert preset.split_policy == "contiguous"
+    assert preset.split_scope == "physionet_patient_relative_time"
+    assert inspect.signature(run_experiment).parameters["split_policy"].default == "contiguous"
+    assert (
+        inspect.signature(load_physionet_dataloaders_with_ratio_split)
+        .parameters["split_policy"]
+        .default
+        == "contiguous"
+    )
 
 
 def test_synthetic_public_path_defaults_to_exact_timestamp_batching():

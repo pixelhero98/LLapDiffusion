@@ -500,6 +500,7 @@ def evaluate_checkpoint(
         "checkpoint": str(ckpt_path),
         "data_policy": {
             "split_policy": getattr(cfg, "split_policy", "global_purged_horizon"),
+            "split_scope": getattr(cfg, "split_scope", "global_target_time"),
             "batching_policy": (
                 "exact_context_end_timestamp"
                 if bool(getattr(cfg, "exact_timestamp_batches", True))

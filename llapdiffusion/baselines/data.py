@@ -31,6 +31,9 @@ def load_dataset_loaders(
         raise ValueError(f"{dataset_key}: horizon={requested_horizon} not in supported horizons {preset.horizons}")
     horizon = requested_horizon
     window = preset.context_length
+    split_policy = str(getattr(preset, "split_policy", "global_purged_horizon"))
+    split_scope = str(getattr(preset, "split_scope", "global_target_time"))
+    exact_timestamp_batches = bool(getattr(preset, "exact_timestamp_batches", True))
     copied_cache = False
     reindex = False
 
@@ -71,8 +74,8 @@ def load_dataset_loaders(
         "batch_size": preset.table_batch_size,
         "norm": "train_only",
         "reindex": reindex,
-        "split_policy": "global_purged_horizon",
-        "exact_timestamp_batches": True,
+        "split_policy": split_policy,
+        "exact_timestamp_batches": exact_timestamp_batches,
     }
     sig = inspect.signature(run_experiment)
     filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -88,8 +91,9 @@ def load_dataset_loaders(
         "assets": len(meta.get("assets", [])),
         "feature_cols": meta.get("feature_cols", []),
         "target_col": meta.get("target_col", ""),
-        "split_policy": "global_purged_horizon",
-        "batching_policy": "exact_context_end_timestamp",
+        "split_policy": split_policy,
+        "split_scope": split_scope,
+        "batching_policy": "exact_context_end_timestamp" if exact_timestamp_batches else "calendar_day",
     }
     return (train_dl, val_dl, test_dl), info
 

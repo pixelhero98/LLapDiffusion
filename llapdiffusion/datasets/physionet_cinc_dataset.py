@@ -510,7 +510,7 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
 def load_physionet_dataloaders_with_ratio_split(
     data_dir: PathLike,
     *,
-    split_policy: str = "global_purged_horizon",
+    split_policy: str = "contiguous",
     exact_timestamp_batches: bool = True,
     **loader_kwargs,
 ):
@@ -558,7 +558,7 @@ def run_experiment(
     shuffle_train: bool = True,
     num_workers: int = 0,
     pin_memory: Optional[bool] = None,
-    split_policy: str = "global_purged_horizon",
+    split_policy: str = "contiguous",
     exact_timestamp_batches: bool = True,
 ):
     """Mirror :func:`llapdiffusion.datasets.fin_dataset.run_experiment` for PhysioNet caches."""
