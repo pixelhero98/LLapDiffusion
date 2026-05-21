@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from llapdiffusion.benchmark_protocol import split_protocol_metadata
 from llapdiffusion.configs.dataset_defaults import get_dataset_preset
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 
@@ -94,6 +95,11 @@ def load_dataset_loaders(
         "split_policy": split_policy,
         "split_scope": split_scope,
         "batching_policy": "exact_context_end_timestamp" if exact_timestamp_batches else "calendar_day",
+        **split_protocol_metadata(
+            dataset_key,
+            split_policy=split_policy,
+            split_scope=split_scope,
+        ),
     }
     return (train_dl, val_dl, test_dl), info
 

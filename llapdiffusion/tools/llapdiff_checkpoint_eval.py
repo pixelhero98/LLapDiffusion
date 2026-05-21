@@ -10,6 +10,7 @@ from typing import Callable, Dict, Optional
 
 import torch
 
+from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
 from llapdiffusion.trainers import train_val_llapdiff as tv
 from llapdiffusion.configs.dataset_archives import configure_dataset_archive
 from llapdiffusion.configs.config_utils import clone_config, make_jsonable
@@ -498,6 +499,7 @@ def evaluate_checkpoint(
     result = {
         "label": label,
         "checkpoint": str(ckpt_path),
+        "benchmark_protocol": llapdiff_protocol_metadata(),
         "data_policy": {
             "split_policy": getattr(cfg, "split_policy", "global_purged_horizon"),
             "split_scope": getattr(cfg, "split_scope", "global_target_time"),
@@ -505,6 +507,11 @@ def evaluate_checkpoint(
                 "exact_context_end_timestamp"
                 if bool(getattr(cfg, "exact_timestamp_batches", True))
                 else "calendar_day"
+            ),
+            **split_protocol_metadata(
+                getattr(cfg, "DATASET_KEY", ""),
+                split_policy=getattr(cfg, "split_policy", "global_purged_horizon"),
+                split_scope=getattr(cfg, "split_scope", "global_target_time"),
             ),
         },
         "forecast_test": forecast,

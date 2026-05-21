@@ -35,6 +35,30 @@ def test_baseline_registry_records_public_contracts():
     assert BASELINES["contiformer"].dependency_sources == (("physiopro", "5486d1ccaff8f33d635753e3debd7465234b09f1"),)
 
 
+def test_benchmark_protocol_metadata_declares_comparison_scopes():
+    from llapdiffusion.benchmark_protocol import baseline_protocol_metadata, llapdiff_protocol_metadata
+    from llapdiffusion.baselines.runner import notes_payload
+
+    dlinear = baseline_protocol_metadata("dlinear", requested_input_policy="all_features")
+    timegrad = baseline_protocol_metadata("timegrad", requested_input_policy="all_features")
+    csdi = baseline_protocol_metadata("csdi")
+    llapdiff = llapdiff_protocol_metadata()
+    notes = notes_payload()
+
+    assert dlinear["comparison_type"] == "extrapolation"
+    assert dlinear["input_scope"] == "all_features"
+    assert dlinear["input_policy_effective"] == "all_features"
+    assert timegrad["input_scope"] == "target_only"
+    assert timegrad["input_policy_effective"] == "target_only"
+    assert timegrad["missingness_scope"] == "target_mask"
+    assert csdi["comparison_type"] == "imputation"
+    assert "target_horizon" in csdi["missingness_scope"]
+    assert llapdiff["modeling_scope"] == "joint global"
+    assert llapdiff["missingness_scope"] == "per_feature_covariate_mask"
+    assert notes["csdi"]["comparison_type"] == "imputation"
+    assert notes["dlinear"]["modeling_scope"] == "uni-average/shared-weight"
+
+
 def _require_mr_diff_adapter():
     module = pytest.importorskip("llapdiffusion.baselines.adapters.mr_diff")
     return module.MRDiffAdapter
@@ -383,6 +407,8 @@ def test_baseline_loader_uses_physionet_preset_split_policy(monkeypatch, tmp_pat
     }
     assert info["split_policy"] == "contiguous"
     assert info["split_scope"] == "physionet_patient_relative_time"
+    assert info["split_note"] == "patient_relative_contiguous_split"
+    assert info["split_caveat"] == "special_case_insufficient_horizon_windows_for_purged_split"
     assert info["batching_policy"] == "exact_context_end_timestamp"
 
 
@@ -837,8 +863,17 @@ def test_write_rows_flattens_practical_metrics(tmp_path):
                 "status": "ok",
                 "baseline": "mr-diff",
                 "dataset": "crypto",
+                "comparison_type": "extrapolation",
                 "horizon": 100,
                 "entity_selection_mode": "full_panel",
+                "input_policy": "target_only",
+                "input_policy_effective": "target_only",
+                "input_scope": "target_only",
+                "missingness_scope": "target_mask",
+                "modeling_scope": "multi-series",
+                "split_note": "global_purged_horizon_split",
+                "split_caveat": "none",
+                "time_feature_protocol": "context features use delta_t only",
                 "best_epoch": 3,
                 "best_val_mse": 1.25,
                 "loader_batches": {"train": 10, "val": 2, "test": 4},
@@ -861,6 +896,11 @@ def test_write_rows_flattens_practical_metrics(tmp_path):
     assert row["test_valid_observations"] == "99"
     assert row["test_metric_aggregation"] == "valid_observation_weighted"
     assert row["best_epoch"] == "3"
+    assert row["comparison_type"] == "extrapolation"
+    assert row["input_scope"] == "target_only"
+    assert row["missingness_scope"] == "target_mask"
+    assert row["modeling_scope"] == "multi-series"
+    assert row["split_note"] == "global_purged_horizon_split"
     assert row["train_loader_batches"] == "10"
     assert row["val_loader_batches"] == "2"
     assert row["test_loader_batches"] == "4"
@@ -960,6 +1000,10 @@ def test_practical_runner_reports_full_panel_scope(monkeypatch, tmp_path):
     assert seen["sample_entities"] == 2
     assert result["entity_selection_mode"] == "full_panel"
     assert result["num_entities_used"] == 2
+    assert result["comparison_type"] == "extrapolation"
+    assert result["input_scope"] == "target_only"
+    assert result["missingness_scope"] == "target_mask"
+    assert result["modeling_scope"] == "uni-average/shared-weight"
     assert "selected" + "_entities" not in result
     assert "entity_cap" not in result
     assert "train_batch_cap" not in result

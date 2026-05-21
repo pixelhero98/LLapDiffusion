@@ -12,6 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
+from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.latent_space.latent_vae import LatentVAE
 from llapdiffusion.models.summarizer import LaplaceAE
@@ -2493,6 +2494,7 @@ def run(
     )
 
     return {
+        "benchmark_protocol": llapdiff_protocol_metadata(),
         "baseline_target_variance": baseline_target_variance,
         "latent_probe": latent_probe,
         "train_losses": train_losses,
@@ -2518,6 +2520,11 @@ def run(
                 "exact_context_end_timestamp"
                 if bool(getattr(config, "exact_timestamp_batches", True))
                 else "calendar_day"
+            ),
+            **split_protocol_metadata(
+                getattr(config, "DATASET_KEY", ""),
+                split_policy=getattr(config, "split_policy", "global_purged_horizon"),
+                split_scope=getattr(config, "split_scope", "global_target_time"),
             ),
         },
         "best_checkpoint": best_checkpoint,

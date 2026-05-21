@@ -11,6 +11,7 @@ from typing import Sequence
 import numpy as np
 import torch
 
+from llapdiffusion.benchmark_protocol import baseline_protocol_metadata
 from llapdiffusion.baselines.adapters import build_adapter
 from llapdiffusion.baselines.data import (
     batch_to_device,
@@ -100,6 +101,7 @@ def notes_payload() -> dict[str, dict[str, object]]:
             "official_reference": spec.official_reference,
             "metric_type": spec.metric_type,
             "time_handling": spec.time_handling,
+            **baseline_protocol_metadata(key),
             "dependency_caveat": spec.dependency_caveat,
         }
         for key, spec in BASELINES.items()
@@ -251,13 +253,21 @@ def write_rows(rows: Sequence[dict[str, object]], output: Path | str, *, prefix:
         "dataset",
         "metric_type",
         "metric_target_type",
+        "comparison_type",
         "window",
         "horizon",
         "entity_selection_mode",
         "input_policy",
+        "input_policy_effective",
+        "input_scope",
+        "missingness_scope",
+        "modeling_scope",
         "split_policy",
         "split_scope",
+        "split_note",
+        "split_caveat",
         "batching_policy",
+        "time_feature_protocol",
         "parameter_count",
         "completion_mode",
         "num_entities_used",
@@ -448,6 +458,7 @@ def run_practical_one(
     test = _evaluate_loader(model, baseline, test_dl, dataset_info, device)
     num_entities_used = int(sample_batch[0][0].shape[1])
     loader_batches = {"train": _loader_length(train_dl), "val": _loader_length(val_dl), "test": _loader_length(test_dl)}
+    protocol = baseline_protocol_metadata(baseline, requested_input_policy=config.input_policy)
     result = {
         "status": "ok",
         "baseline": baseline,
@@ -455,6 +466,7 @@ def run_practical_one(
         "dataset": dataset,
         "metric_type": spec.metric_type,
         "metric_target_type": test.get("metric_target_type", "target_horizon_imputation" if baseline == "csdi" else "forecast_horizon"),
+        **protocol,
         "window": dataset_info["window"],
         "horizon": dataset_info["horizon"],
         "dataset_lengths": dataset_info["lengths"],
@@ -466,6 +478,8 @@ def run_practical_one(
         "input_policy": str(config.input_policy),
         "split_policy": dataset_info.get("split_policy", "global_purged_horizon"),
         "split_scope": dataset_info.get("split_scope", "global_target_time"),
+        "split_note": dataset_info.get("split_note", ""),
+        "split_caveat": dataset_info.get("split_caveat", ""),
         "batching_policy": dataset_info.get("batching_policy", "exact_context_end_timestamp"),
         "parameter_count": parameter_count,
         "completion_mode": "full_train_loop",

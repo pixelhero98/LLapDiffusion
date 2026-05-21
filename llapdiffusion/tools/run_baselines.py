@@ -26,7 +26,10 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--input-policy",
         choices=("target_only", "all_features"),
         default="target_only",
-        help="Feature policy for non-probabilistic adapters. Corrected benchmark default is target_only.",
+        help=(
+            "Feature policy for baseline adapters. target_only is the primary comparison; "
+            "all_features currently affects only DLinear and PatchTST, while other adapters remain target-only."
+        ),
     )
     parser.add_argument(
         "--imputation-random-mask-ratio",

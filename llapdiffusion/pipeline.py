@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple
 
 from llapdiffusion.configs import config
+from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
 from llapdiffusion.configs.config_utils import make_jsonable
 from llapdiffusion.configs.dataset_archives import configure_dataset_archive
 from llapdiffusion.configs.dataset_defaults import apply_dataset_preset, dataset_keys, default_horizons, infer_dataset_key
@@ -223,6 +224,7 @@ def run_single_pred(
 
     return {
         "pred": pred,
+        "benchmark_protocol": llapdiff_protocol_metadata(),
         "vae": latent_stats,
         "summarizer": summarizer_stats,
         "llapdiff": llapdiff_stats,
@@ -234,6 +236,11 @@ def run_single_pred(
                 "exact_context_end_timestamp"
                 if bool(getattr(config, "exact_timestamp_batches", True))
                 else "calendar_day"
+            ),
+            **split_protocol_metadata(
+                _resolve_dataset_key(config=config),
+                split_policy=getattr(config, "split_policy", "global_purged_horizon"),
+                split_scope=getattr(config, "split_scope", "global_target_time"),
             ),
         },
         "balanced_evaluation": balanced_evaluation,
