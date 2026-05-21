@@ -82,7 +82,7 @@ llapdiff-artifact-prep \
   --summary-json ldt/results/artifact_prep_summary.json
 ```
 
-Evaluate a checkpoint on raw scale:
+Evaluate a checkpoint on raw forecast scale and LLapDiff target-horizon imputation:
 
 ```bash
 llapdiff-checkpoint-eval \
@@ -91,6 +91,17 @@ llapdiff-checkpoint-eval \
   --checkpoint /path/to/checkpoint.pt \
   --imputation-random-mask-ratio 0.30 \
   --out-json ldt/results/crypto_eval.json
+```
+
+Two imputation paths are supported. The checkpoint command above evaluates an LLapDiff forecast checkpoint by hiding observed target-horizon entries; `--imputation-random-mask-ratio 0.30` hides 30% of observed target-horizon entries. To run the separate CSDI imputation-only baseline:
+
+```bash
+llapdiff-baselines csdi-imputation \
+  --dataset all \
+  --horizons all \
+  --baseline-source-root /path/to/baseline-sources \
+  --imputation-random-mask-ratio 0.30 \
+  --output-dir ldt/results/csdi_runs
 ```
 
 Plot learned poles:
