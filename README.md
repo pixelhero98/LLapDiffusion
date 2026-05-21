@@ -82,7 +82,13 @@ llapdiff-artifact-prep \
   --summary-json ldt/results/artifact_prep_summary.json
 ```
 
-Evaluate a checkpoint on raw forecast scale and LLapDiff target-horizon imputation:
+Train LLapDiff extrapolation checkpoints:
+
+```bash
+llapdiff-train --dataset-key crypto --preds 100
+```
+
+Evaluate a forecast checkpoint on raw forecast scale and LLapDiff target-horizon imputation:
 
 ```bash
 llapdiff-checkpoint-eval \
@@ -93,16 +99,20 @@ llapdiff-checkpoint-eval \
   --out-json ldt/results/crypto_eval.json
 ```
 
-Two imputation paths are supported. The checkpoint command above evaluates an LLapDiff forecast checkpoint by hiding observed target-horizon entries; `--imputation-random-mask-ratio 0.30` hides 30% of observed target-horizon entries. To run the separate CSDI imputation-only baseline:
+This evaluates a forecast checkpoint by hiding observed target-horizon entries at evaluation time; `--imputation-random-mask-ratio 0.30` hides 30% of observed target-horizon entries.
+
+Optional target-mask auxiliary training mixes target-horizon completion batches into LLapDiff training:
 
 ```bash
-llapdiff-baselines csdi-imputation \
-  --dataset all \
-  --horizons all \
-  --baseline-source-root /path/to/baseline-sources \
-  --imputation-random-mask-ratio 0.30 \
-  --output-dir ldt/results/csdi_runs
+llapdiff-train \
+  --dataset-key crypto \
+  --preds 100 \
+  --target-mask-aux-p 0.30 \
+  --target-mask-aux-keep-mode random \
+  --target-mask-aux-keep-prob 0.50
 ```
+
+The default `--target-mask-aux-p 0.0` is standard extrapolation training only. Use `--target-mask-aux-p > 0` to enable auxiliary completion batches; it is a training-time batch probability, not the same as evaluation-time `--imputation-random-mask-ratio`.
 
 Plot learned poles:
 
@@ -141,8 +151,6 @@ llapdiff-baselines practical-extrapolation --baseline dlinear --dataset crypto -
 ```
 
 Financial calendar features such as `DOW_*`, `DOM_*`, and `MOY_*` are context features only and cannot be selected as targets.
-
-For imputation-style evaluation, train the standard forecast checkpoint and use `llapdiff-checkpoint-eval --imputation-random-mask-ratio ...` to hide observed target-horizon entries at evaluation time.
 
 ## Baselines
 

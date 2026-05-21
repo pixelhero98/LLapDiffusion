@@ -1081,6 +1081,7 @@ def test_public_docs_and_requirements_are_clone_ready():
     requirements = (root / "requirements.txt").read_text(encoding="utf-8").strip()
     readme = (root / "README.md").read_text(encoding="utf-8")
     main_commands = readme.split("## Main Commands", 1)[1].split("## Target Selection", 1)[0]
+    baselines = readme.split("## Baselines", 1)[1].split("## Citation", 1)[0]
     tracked_text = "\n".join(
         path.read_text(encoding="utf-8")
         for base in ("README.md", "llapdiffusion", "tests")
@@ -1096,8 +1097,14 @@ def test_public_docs_and_requirements_are_clone_ready():
     assert "fraction of observed context entries to hide" in readme
     assert "Dense-date panel filtering" in readme
     assert "panel_coverage" in readme
+    assert "llapdiff-train" in main_commands
     assert "llapdiff-checkpoint-eval" in main_commands
-    assert "llapdiff-baselines csdi-imputation" in main_commands
+    assert "--target-mask-aux-p" in main_commands
+    assert "--imputation-random-mask-ratio" in main_commands
+    assert "llapdiff-baselines csdi-imputation" not in main_commands
+    assert "llapdiff-baselines csdi-imputation" in baselines
+    assert "--target-mask-aux-p 0.0" in readme
+    assert "--target-mask-aux-p > 0" in readme
     assert "hides 30% of observed target-horizon entries" in readme
     assert "https://arxiv.org/abs/2605.19805" in readme
     private_patterns = (
