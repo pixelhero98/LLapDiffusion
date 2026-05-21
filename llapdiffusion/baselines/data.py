@@ -13,6 +13,7 @@ import torch
 from llapdiffusion.benchmark_protocol import split_protocol_metadata
 from llapdiffusion.configs.dataset_defaults import get_dataset_preset
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
+from llapdiffusion.datasets.target_selection import resolve_target_selection
 
 
 _COPIED_CACHES: dict[tuple[str, str, str, int], Path] = {}
@@ -24,6 +25,8 @@ def load_dataset_loaders(
     allow_cache_copy: bool,
     work_cache_dir: Path | None,
     horizon: int | None = None,
+    target_col: str | None = None,
+    target_cols: tuple[str, ...] | list[str] | None = None,
 ):
     preset = get_dataset_preset(dataset_key)
     data_dir = Path(preset.data_dir)
@@ -63,6 +66,19 @@ def load_dataset_loaders(
     else:
         run_experiment = resolve_run_experiment(data_dir)
 
+    requested_target_cols = tuple(str(col).strip() for col in (target_cols or ()) if str(col).strip())
+    if target_col and requested_target_cols:
+        raise ValueError("Use either target_col or target_cols, not both.")
+
+    sig = inspect.signature(run_experiment)
+    if requested_target_cols and len(requested_target_cols) > 1 and "target_cols" not in sig.parameters:
+        raise RuntimeError(
+            f"{dataset_key}: multi-target baseline runs require dataset loader support for target_cols."
+        )
+    loader_target_col = target_col
+    if requested_target_cols and len(requested_target_cols) == 1 and "target_cols" not in sig.parameters:
+        loader_target_col = requested_target_cols[0]
+
     kwargs = {
         "data_dir": str(data_dir),
         "K": window,
@@ -77,11 +93,13 @@ def load_dataset_loaders(
         "reindex": reindex,
         "split_policy": split_policy,
         "exact_timestamp_batches": exact_timestamp_batches,
+        "target_col": loader_target_col,
+        "target_cols": requested_target_cols or None,
     }
-    sig = inspect.signature(run_experiment)
     filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
     train_dl, val_dl, test_dl, lengths = run_experiment(**filtered)
     meta = json.loads((data_dir / "cache_ratio_index" / "meta.json").read_text(encoding="utf-8"))
+    target_selection = resolve_target_selection(meta, target_col, requested_target_cols=requested_target_cols or None)
     info = {
         "dataset": dataset_key,
         "data_dir": str(data_dir),
@@ -91,7 +109,15 @@ def load_dataset_loaders(
         "horizon": horizon,
         "assets": len(meta.get("assets", [])),
         "feature_cols": meta.get("feature_cols", []),
-        "target_col": meta.get("target_col", ""),
+        "target_col": target_selection.target_col,
+        "target_cols": list(target_selection.target_cols),
+        "target_index": target_selection.target_index,
+        "target_indices": list(target_selection.target_indices),
+        "target_dim": target_selection.target_dim,
+        "target_source": target_selection.target_source,
+        "requested_target_col": target_selection.requested_target_col,
+        "requested_target_cols": list(target_selection.requested_target_cols or []),
+        "calendar_feature_cols": list(target_selection.calendar_feature_cols),
         "split_policy": split_policy,
         "split_scope": split_scope,
         "batching_policy": "exact_context_end_timestamp" if exact_timestamp_batches else "calendar_day",
@@ -129,30 +155,71 @@ def target_mask(meta: dict[str, Any], y: torch.Tensor) -> torch.Tensor:
         observed = torch.isfinite(y)
     else:
         observed = observed.to(device=y.device, dtype=torch.bool)
-    return entity.unsqueeze(-1) & observed & torch.isfinite(y)
+    while observed.ndim < y.ndim:
+        observed = observed.unsqueeze(-1)
+    for _ in range(max(0, y.ndim - entity.ndim)):
+        entity = entity.unsqueeze(-1)
+    return entity & observed & torch.isfinite(y)
+
+
+def target_cols(dataset_info: dict[str, Any]) -> tuple[str, ...]:
+    cols = tuple(str(col) for col in (dataset_info.get("target_cols") or []) if str(col))
+    if cols:
+        return cols
+    target = str(dataset_info.get("target_col") or "")
+    return (target,) if target else ()
+
+
+def target_indices(dataset_info: dict[str, Any]) -> tuple[int, ...]:
+    feature_cols = list(dataset_info.get("feature_cols") or [])
+    cols = target_cols(dataset_info)
+    if not cols:
+        raise ValueError(f"{dataset_info.get('dataset')}: target_cols is empty")
+    missing = [col for col in cols if col not in feature_cols]
+    if missing:
+        raise ValueError(f"{dataset_info.get('dataset')}: target columns {missing!r} not found in feature_cols")
+    resolved = dataset_info.get("target_indices")
+    if resolved is not None:
+        indices = tuple(int(idx) for idx in resolved)
+        if len(indices) == len(cols) and all(0 <= idx < len(feature_cols) and feature_cols[idx] == col for idx, col in zip(indices, cols)):
+            return indices
+    if len(cols) == 1:
+        resolved_one = dataset_info.get("target_index")
+        if resolved_one is not None:
+            idx = int(resolved_one)
+            if 0 <= idx < len(feature_cols) and feature_cols[idx] == cols[0]:
+                return (idx,)
+    return tuple(feature_cols.index(col) for col in cols)
 
 
 def target_index(dataset_info: dict[str, Any]) -> int:
-    cols = list(dataset_info.get("feature_cols") or [])
-    target = str(dataset_info.get("target_col") or "")
-    if target not in cols:
-        raise ValueError(f"{dataset_info.get('dataset')}: target_col {target!r} not found in feature_cols")
-    return cols.index(target)
+    indices = target_indices(dataset_info)
+    if len(indices) != 1:
+        raise ValueError(f"{dataset_info.get('dataset')}: target_index is scalar-only; use target_indices for multi-target runs")
+    return indices[0]
+
+
+def regular_feature_target_indices(dataset_info: dict[str, Any]) -> tuple[int, ...]:
+    if str(dataset_info.get("input_policy", "target_only")).lower() == "target_only":
+        return tuple(range(len(target_indices(dataset_info))))
+    return target_indices(dataset_info)
 
 
 def regular_feature_target_index(dataset_info: dict[str, Any]) -> int:
-    if str(dataset_info.get("input_policy", "target_only")).lower() == "target_only":
-        return 0
-    return target_index(dataset_info)
+    indices = regular_feature_target_indices(dataset_info)
+    if len(indices) != 1:
+        raise ValueError(f"{dataset_info.get('dataset')}: regular_feature_target_index is scalar-only")
+    return indices[0]
 
 
 def context_target_mask(meta: dict[str, Any], V: torch.Tensor, dataset_info: dict[str, Any]) -> torch.Tensor:
-    idx = target_index(dataset_info)
+    indices = target_indices(dataset_info)
     x_obs = canonical_x_obs(meta, V)
-    if idx >= x_obs.shape[-1]:
-        raise ValueError(f"{dataset_info.get('dataset')}: target index {idx} outside context feature mask")
+    if any(idx >= x_obs.shape[-1] for idx in indices):
+        raise ValueError(f"{dataset_info.get('dataset')}: target indices {indices} outside context feature mask")
     entity = meta["entity_mask"].to(device=V.device, dtype=torch.bool)
-    return entity & x_obs[..., idx].any(dim=-1)
+    selected = x_obs.index_select(-1, torch.as_tensor(indices, device=V.device))
+    return entity & selected.any(dim=-1).any(dim=-1)
 
 
 def find_batch(

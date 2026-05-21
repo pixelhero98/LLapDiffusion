@@ -1,6 +1,7 @@
 """Train latent VAE, summarizer, and LLapDiff in one pipeline."""
 
 import argparse
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple
@@ -11,6 +12,8 @@ from llapdiffusion.configs.config_utils import make_jsonable
 from llapdiffusion.configs.dataset_archives import configure_dataset_archive
 from llapdiffusion.configs.dataset_defaults import apply_dataset_preset, dataset_keys, default_horizons, infer_dataset_key
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
+from llapdiffusion.datasets.target_selection import resolve_target_selection
+from llapdiffusion.logging_utils import apply_verbosity
 from llapdiffusion.trainers import train_val_latent, train_val_summarizer, train_val_llapdiff
 
 
@@ -35,6 +38,8 @@ def prepare_dataloaders(
         ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
         split_policy=getattr(config, "split_policy", "global_purged_horizon"),
         exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
+        target_col=None if getattr(config, "TARGET_COLS", None) else getattr(config, "TARGET_COL", None),
+        target_cols=getattr(config, "TARGET_COLS", None),
     )
 
 
@@ -81,14 +86,69 @@ def _resolve_dataset_key(config=config) -> str:
     raise ValueError("DATASET_KEY is required for preset-driven pipeline runs.")
 
 
+def _target_policy(config=config) -> Dict[str, object]:
+    requested = getattr(config, "TARGET_COL", None)
+    requested_cols = getattr(config, "TARGET_COLS", None)
+    meta_path = Path(str(getattr(config, "DATA_DIR", ""))) / "cache_ratio_index" / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        selected = resolve_target_selection(
+            meta,
+            None if requested_cols else requested,
+            requested_target_cols=requested_cols,
+        )
+        return {
+            "target_col": selected.target_col,
+            "target_cols": list(selected.target_cols),
+            "target_indices": list(selected.target_indices),
+            "target_dim": selected.target_dim,
+            "target_source": selected.target_source,
+            "requested_target_col": selected.requested_target_col,
+            "requested_target_cols": list(selected.requested_target_cols or []),
+            "calendar_feature_cols": list(selected.calendar_feature_cols),
+        }
+    except Exception as exc:
+        if requested not in (None, "") or requested_cols not in (None, "", []):
+            raise ValueError(f"Could not resolve requested target columns.") from exc
+        return {
+            "target_col": requested,
+            "target_cols": (
+                list(requested_cols)
+                if requested_cols
+                else ([requested] if requested else [])
+            ),
+            "target_indices": [],
+            "target_dim": 1,
+            "target_source": "unresolved",
+            "requested_target_col": requested,
+            "requested_target_cols": list(requested_cols) if requested_cols else [],
+            "calendar_feature_cols": [],
+        }
+
+
+def _sync_target_shape_config(config=config) -> Dict[str, object]:
+    policy = _target_policy(config=config)
+    target_dim = int(policy.get("target_dim") or 1)
+    config.TARGET_DIM = target_dim
+    config.TARGET_COL = policy.get("target_col")
+    config.TARGET_COLS = list(policy.get("target_cols") or [])
+    config.VAE_OUTPUT_DIM = target_dim
+    config.VAE_INPUT_DIM = 2 * target_dim
+    return policy
+
+
 def _update_config_for_pred(pred: int, config=config) -> None:
     split_policy = getattr(config, "split_policy", "global_purged_horizon")
     split_scope = getattr(config, "split_scope", "global_target_time")
     exact_timestamp_batches = bool(getattr(config, "exact_timestamp_batches", True))
+    target_col = getattr(config, "TARGET_COL", None)
+    target_cols = getattr(config, "TARGET_COLS", None)
     apply_dataset_preset(config, _resolve_dataset_key(config=config), pred=int(pred))
     config.split_policy = split_policy
     config.split_scope = split_scope
     config.exact_timestamp_batches = exact_timestamp_batches
+    config.TARGET_COL = target_col
+    config.TARGET_COLS = target_cols
     config.SUM_CONTEXT_LEN = _resolve_sum_context_len(pred, config=config)
     config.SUM_CKPT = str(
         Path(config.SUM_DIR) / f"{pred}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
@@ -141,6 +201,7 @@ def run_single_pred(
             config=config,
         )
     _apply_training_overrides(training_overrides, config=config)
+    data_policy = _sync_target_shape_config(config=config)
 
     train_val_latent, train_val_summarizer, train_val_llapdiff = _import_trainers()
 
@@ -230,6 +291,7 @@ def run_single_pred(
         "llapdiff": llapdiff_stats,
         "eval_stats": eval_stats,
         "data_policy": {
+            **data_policy,
             "split_policy": getattr(config, "split_policy", "global_purged_horizon"),
             "split_scope": getattr(config, "split_scope", "global_target_time"),
             "batching_policy": (
@@ -306,6 +368,19 @@ def _parse_args() -> argparse.Namespace:
         choices=dataset_keys(),
         required=True,
         help="Dataset preset key to run.",
+    )
+    parser.add_argument(
+        "--target-col",
+        type=str,
+        default=None,
+        help="Optional scalar target feature column. Defaults to the dataset cache target_col.",
+    )
+    parser.add_argument(
+        "--target-cols",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional target feature columns for multi-target forecasting.",
     )
     parser.add_argument(
         "--preds",
@@ -433,6 +508,8 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use legacy calendar-day batch grouping instead of exact context-end timestamp grouping.",
     )
+    parser.add_argument("--verbose", action="store_true", help="Print trainer diagnostics.")
+    parser.add_argument("--debug", action="store_true", help="Print verbose trainer diagnostics.")
     return parser.parse_args()
 
 
@@ -600,6 +677,11 @@ def main() -> Dict[int, Dict[str, object]]:
     configure_dataset_archive(args.dataset_zip, args.dataset_extract_dir)
     initial_pred = int(args.preds[0]) if args.preds else None
     apply_dataset_preset(config, args.dataset_key, pred=initial_pred)
+    apply_verbosity(config, verbose=args.verbose, debug=args.debug)
+    if args.target_col and args.target_cols:
+        raise ValueError("Use either --target-col or --target-cols, not both.")
+    config.TARGET_COL = args.target_col
+    config.TARGET_COLS = args.target_cols
     if args.split_policy is not None:
         config.split_policy = args.split_policy
     if args.calendar_day_batches:

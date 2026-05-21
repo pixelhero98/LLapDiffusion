@@ -15,6 +15,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from llapdiffusion.configs.config_utils import clone_config, make_jsonable
+from llapdiffusion.logging_utils import apply_verbosity
 from llapdiffusion.datasets.synthetic_regime_dataset import (
     SyntheticRegimeCacheConfig,
     build_context_end_eval_loader,
@@ -138,6 +139,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--validate-split-only", action="store_true")
     parser.add_argument("--recompute-artifacts", action="store_true")
     parser.add_argument("--overwrite-data", action="store_true")
+    parser.add_argument("--print-json", action="store_true", help="Print the full overall JSON payload to stdout.")
+    parser.add_argument("--target-col", type=str, default=None, help="Optional scalar target feature column.")
+    parser.add_argument("--target-cols", nargs="+", default=None, help="Optional target feature columns.")
+    parser.add_argument("--verbose", action="store_true", help="Print trainer diagnostics.")
+    parser.add_argument("--debug", action="store_true", help="Print verbose trainer diagnostics.")
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -305,6 +311,11 @@ def _configure(spec: RunSpec, args: argparse.Namespace) -> SimpleNamespace:
     cfg.SYNTHETIC_SERIES_LENGTH = _resolve_series_length(args)
     cfg.SYNTHETIC_CHANGE_POINT = _resolve_change_point(args)
     cfg.SYNTHETIC_NUM_ENTITIES = int(args.num_entities)
+    if getattr(args, "target_col", None) and getattr(args, "target_cols", None):
+        raise ValueError("Use either --target-col or --target-cols, not both.")
+    cfg.TARGET_COL = getattr(args, "target_col", None)
+    cfg.TARGET_COLS = list(args.target_cols) if getattr(args, "target_cols", None) else None
+    apply_verbosity(cfg, verbose=bool(getattr(args, "verbose", False)), debug=bool(getattr(args, "debug", False)))
     return cfg
 
 
@@ -331,6 +342,8 @@ def _build_loaders(cfg: SimpleNamespace):
         per_asset=True,
         split_policy=getattr(cfg, "split_policy", "global_purged_horizon"),
         exact_timestamp_batches=bool(getattr(cfg, "exact_timestamp_batches", True)),
+        target_col=None if getattr(cfg, "TARGET_COLS", None) else getattr(cfg, "TARGET_COL", None),
+        target_cols=getattr(cfg, "TARGET_COLS", None),
         shuffle_train=False,
     )
 
@@ -671,6 +684,9 @@ def _row_from_eval(
         "window": int(cfg.WINDOW),
         "horizon": int(cfg.PRED),
         "num_entities": int(cfg.SYNTHETIC_NUM_ENTITIES),
+        "target_col": getattr(cfg, "TARGET_COL", None),
+        "target_cols": json.dumps(list(getattr(cfg, "TARGET_COLS", None) or [])),
+        "target_dim": int(getattr(cfg, "TARGET_DIM", 1)),
         "checkpoint": checkpoint,
         "strict_geometry_valid": bool(split_payload["strict"]["valid"]),
         "boundary_crossing_subset_size": int(crossing_subset_size),
@@ -708,6 +724,7 @@ def _evaluate_checkpoint(
         ema=None,
         self_cond=bool(getattr(cfg, "SELF_COND", False)),
         disable_conditioning=disable_conditioning,
+        verbose=bool(args.verbose or args.debug),
     )
     forecast = tv.evaluate_regression(diff_model, vae, summarizer, test_dl, **common, **sampling)
     change_point = int(split_payload["change_point"])
@@ -810,7 +827,13 @@ def main() -> None:
     }
     overall_path = result_root / "synthetic_regime_overall.json"
     overall_path.write_text(json.dumps(make_jsonable(overall), indent=2, sort_keys=True))
-    print(json.dumps(make_jsonable(overall), indent=2, sort_keys=True))
+    if args.print_json:
+        print(json.dumps(make_jsonable(overall), indent=2, sort_keys=True))
+    else:
+        print(
+            f"{overall['status']}: geometry_rows={overall['num_geometry_rows']} "
+            f"raw_rows={overall['num_raw_rows']} result_root={result_root}"
+        )
 
 
 if __name__ == "__main__":

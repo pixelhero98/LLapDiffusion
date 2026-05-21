@@ -379,15 +379,16 @@ def flatten_targets(
     mask_bn: torch.Tensor,
     device: torch.device,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """yb: [B,N,H] -> y_in: [Beff,H,1], batch_ids: [Beff] mapping to B."""
-    y = yb.to(device)
-    finite_mask = torch.isfinite(y)
-    for _ in range(y.dim() - 2):
-        finite_mask = finite_mask.all(dim=-1)
+    """yb: [B,N,H] or [B,N,H,C] -> y_in: [Beff,H,C], batch_ids: [Beff]."""
+    y_bhnc = targets_to_bhnc(yb, mask_bn, device=device)
+    if y_bhnc is None:
+        return None, None
+    y_bnhc = y_bhnc.permute(0, 2, 1, 3).contiguous()
+    finite_mask = torch.isfinite(y_bnhc).all(dim=(2, 3))
 
-    y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-    B, N, Hcur = y.shape
-    y_flat = y.reshape(B * N, Hcur).unsqueeze(-1)
+    y = torch.nan_to_num(y_bnhc, nan=0.0, posinf=0.0, neginf=0.0)
+    B, N, Hcur, C = y.shape
+    y_flat = y.reshape(B * N, Hcur, C)
 
     mask = mask_bn.to(device=device, dtype=torch.bool).reshape(B * N)
     m_flat = mask & finite_mask.reshape(B * N)
@@ -499,6 +500,135 @@ def normalize_cond_per_batch(cs: torch.Tensor, eps: float = 1e-6) -> torch.Tenso
     return (cs - m) / (v.sqrt() + eps)
 
 
+def infer_target_dim(yb: torch.Tensor, mask_bn: Optional[torch.Tensor] = None) -> int:
+    """Return the target channel count for scalar or multi-target batches."""
+    y = torch.as_tensor(yb)
+    if y.dim() == 3:
+        return 1
+    if y.dim() != 4:
+        raise ValueError(f"target tensor must be [B,N,H] or [B,N,H,C], got {tuple(y.shape)}")
+    if mask_bn is not None:
+        mask = torch.as_tensor(mask_bn)
+        if mask.dim() != 2 or mask.shape[0] != y.shape[0]:
+            raise ValueError(f"entity mask shape {tuple(mask.shape)} is incompatible with target shape {tuple(y.shape)}")
+        if y.shape[1] != mask.shape[1] and y.shape[2] != mask.shape[1]:
+            raise ValueError(f"target shape {tuple(y.shape)} does not contain entity axis N={mask.shape[1]}")
+    return int(y.shape[-1])
+
+
+def infer_target_dim_from_loader(loader) -> int:
+    """Infer target channel count from the first batch of a dataloader."""
+    try:
+        _, yb, meta = next(iter(loader))
+    except StopIteration as exc:
+        raise RuntimeError("Cannot infer target_dim from an empty dataloader.") from exc
+    return infer_target_dim(yb, meta.get("entity_mask") if isinstance(meta, dict) else None)
+
+
+def vae_io_dims_for_target_dim(config_obj: object, target_dim: int) -> Tuple[int, int]:
+    """Resolve VAE token input/output dimensions for a target channel count."""
+    target_dim = int(target_dim)
+    if target_dim <= 0:
+        raise ValueError(f"target_dim must be positive, got {target_dim}")
+    expected_input_dim = 2 * target_dim
+    configured_input_dim = int(getattr(config_obj, "VAE_INPUT_DIM", expected_input_dim))
+    configured_output_dim = int(getattr(config_obj, "VAE_OUTPUT_DIM", target_dim))
+
+    if target_dim == 1:
+        if configured_input_dim != expected_input_dim:
+            raise ValueError(f"Scalar target VAE expects VAE_INPUT_DIM=2, got {configured_input_dim}")
+        if configured_output_dim != 1:
+            raise ValueError(f"Scalar target VAE expects VAE_OUTPUT_DIM=1, got {configured_output_dim}")
+        return configured_input_dim, configured_output_dim
+
+    if configured_output_dim == 1 and configured_input_dim in {2, expected_input_dim}:
+        return expected_input_dim, target_dim
+    if configured_input_dim != expected_input_dim or configured_output_dim != target_dim:
+        raise ValueError(
+            "Multi-target VAE dims must match selected targets: "
+            f"target_dim={target_dim}, expected VAE_INPUT_DIM={expected_input_dim}, "
+            f"VAE_OUTPUT_DIM={target_dim}; got {configured_input_dim}/{configured_output_dim}."
+        )
+    return configured_input_dim, configured_output_dim
+
+
+def targets_to_bhnc(
+    yb: torch.Tensor,
+    mask_bn: torch.Tensor,
+    *,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Canonicalize target values to [B,H,N,C]."""
+    y = torch.as_tensor(yb, device=device)
+    mask = torch.as_tensor(mask_bn, device=device, dtype=torch.bool)
+    if mask.dim() != 2:
+        return None
+    B, N = mask.shape
+    if y.dim() == 3:
+        if y.shape[:2] != (B, N):
+            return None
+        return y.permute(0, 2, 1).contiguous().unsqueeze(-1)
+    if y.dim() == 4:
+        if y.shape[0] != B:
+            return None
+        if y.shape[1] == N:
+            return y.permute(0, 2, 1, 3).contiguous()
+        if y.shape[2] == N:
+            return y.contiguous()
+    return None
+
+
+def target_obs_mask_to_bhnc(
+    y_obs_mask: Optional[torch.Tensor],
+    y_bhnc: torch.Tensor,
+    mask_bn: torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Canonicalize optional target observation masks to [B,H,N,C]."""
+    B, H, N, C = y_bhnc.shape
+    mask_bn = torch.as_tensor(mask_bn, device=device, dtype=torch.bool)
+    if y_obs_mask is None:
+        if torch.is_floating_point(y_bhnc):
+            obs = torch.isfinite(y_bhnc)
+        else:
+            obs = torch.ones_like(y_bhnc, dtype=torch.bool)
+        return obs & mask_bn[:, None, :, None]
+
+    obs = torch.as_tensor(y_obs_mask, device=device, dtype=torch.bool)
+    if obs.shape == (B, N, H):
+        obs = obs.permute(0, 2, 1).contiguous().unsqueeze(-1).expand(B, H, N, C)
+    elif obs.shape == (B, H, N):
+        obs = obs.unsqueeze(-1).expand(B, H, N, C)
+    elif obs.shape == (B, N, H, C):
+        obs = obs.permute(0, 2, 1, 3).contiguous()
+    elif obs.shape == (B, H, N, C):
+        obs = obs.contiguous()
+    elif obs.shape == (B, N, H, 1):
+        obs = obs.permute(0, 2, 1, 3).contiguous().expand(B, H, N, C)
+    elif obs.shape == (B, H, N, 1):
+        obs = obs.expand(B, H, N, C)
+    else:
+        raise ValueError(
+            f"y_obs_mask shape {tuple(obs.shape)} is incompatible with target shape [B,H,N,C]={(B, H, N, C)}"
+        )
+
+    bad_observed = obs & mask_bn[:, None, :, None] & ~torch.isfinite(y_bhnc)
+    if bad_observed.any():
+        raise ValueError("y_obs_mask marks non-finite target values as observed")
+    return obs & torch.isfinite(y_bhnc) & mask_bn[:, None, :, None]
+
+
+def target_time_observed(obs: torch.Tensor) -> torch.Tensor:
+    """Reduce target observations to [B,H] latent-supervision availability."""
+    obs = torch.as_tensor(obs, dtype=torch.bool)
+    if obs.dim() == 3:
+        return obs.any(dim=2)
+    if obs.dim() == 4:
+        return obs.any(dim=(2, 3))
+    raise ValueError(f"target observation mask must be [B,H,N] or [B,H,N,C], got {tuple(obs.shape)}")
+
+
 @torch.no_grad()
 def pack_targets_tokens(
     yb: torch.Tensor,
@@ -511,45 +641,19 @@ def pack_targets_tokens(
     Prepare tokenized targets for the set-attention VAE.
 
     Returns:
-        x_tok: [B,H,N,2] = [value*obs, obs]
+        x_tok: [B,H,N,2*C] = [values*obs, obs]
         entity_pad: [B,N] bool (True for padded entities)
-        obs: [B,H,N] bool
+        obs: [B,H,N,C] bool
     """
-    yb = torch.as_tensor(yb, device=device)
     mask_bn = torch.as_tensor(mask_bn, device=device, dtype=torch.bool)
-
-    if yb.dim() != 3 or mask_bn.dim() != 2:
-        return None, None, None
-    B, N, H = yb.shape
-    if mask_bn.shape != (B, N):
+    y = targets_to_bhnc(yb, mask_bn, device=device)
+    if y is None:
         return None, None, None
 
-    y = yb.permute(0, 2, 1).contiguous()  # [B,H,N]
-
-    obs = None
-    if y_obs_mask is not None:
-        yom = torch.as_tensor(y_obs_mask, device=device, dtype=torch.bool)
-        if yom.shape == (B, N, H):
-            yom = yom.permute(0, 2, 1).contiguous()
-        elif yom.shape != (B, H, N):
-            raise ValueError(
-                f"y_obs_mask shape {tuple(yom.shape)} is incompatible with target shape {(B, N, H)}"
-            )
-        bad_observed = yom & mask_bn[:, None, :] & ~torch.isfinite(y)
-        if bad_observed.any():
-            raise ValueError("y_obs_mask marks non-finite target values as observed")
-        obs = yom
-
-    if obs is None:
-        if torch.is_floating_point(y):
-            obs = torch.isfinite(y)
-        else:
-            obs = torch.ones_like(y, dtype=torch.bool)
-
-    obs = obs & mask_bn[:, None, :]
+    obs = target_obs_mask_to_bhnc(y_obs_mask, y, mask_bn, device=device)
     y_clean = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
     x_val = y_clean * obs.to(dtype=y_clean.dtype)
-    x_tok = torch.stack([x_val, obs.to(dtype=y_clean.dtype)], dim=-1)  # [B,H,N,2]
+    x_tok = torch.cat([x_val, obs.to(dtype=y_clean.dtype)], dim=-1)  # [B,H,N,2*C]
     entity_pad = ~mask_bn
     return x_tok, entity_pad, obs
 
@@ -585,7 +689,7 @@ def compute_latent_stats(
         _, mu, _ = vae(x_tok, entity_pad)  # [B,H,Z]
         if not torch.isfinite(mu).all():
             raise FloatingPointError("VAE encoder produced non-finite latent means")
-        obs_any = obs.any(dim=2)  # [B,H]
+        obs_any = target_time_observed(obs)  # [B,H]
         if not obs_any.any():
             continue
         mu = mu.detach().float()
@@ -632,7 +736,7 @@ def decode_latents_with_vae(
 ) -> torch.Tensor:
     """
     Invert μ-normalization and decode set-attention VAE.
-    Returns x_hat: [B,H,N,1]
+    Returns x_hat: [B,H,N,C]
     """
     mu_est = invert_simple_norm(x0_norm, mu_mean, mu_std)
     if mu_est.dim() != 3:
@@ -987,7 +1091,7 @@ def calculate_v_variance(
             if x_tok is None or not obs.any():
                 continue
             x0 = encode_mu_norm(vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std)
-            obs_any = obs.any(dim=2)
+            obs_any = target_time_observed(obs)
             if not obs_any.any():
                 continue
             x0 = x0[obs_any]
@@ -1059,7 +1163,7 @@ def calculate_x0_latent_variance_setvae(dataloader, vae, device, latent_stats):
         if x_tok is None or obs is None or not obs.any():
             continue
         x0 = encode_mu_norm(vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std)
-        obs_any = obs.any(dim=2)
+        obs_any = target_time_observed(obs)
         if obs_any.any():
             all_x0.append(x0[obs_any].detach().cpu())
 

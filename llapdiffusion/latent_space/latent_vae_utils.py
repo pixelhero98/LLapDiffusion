@@ -12,7 +12,7 @@ def compute_per_dim_stats(all_mu: torch.Tensor):
     return mu_per_dim, std_per_dim
 
 
-def normalize_and_check(all_mu: torch.Tensor, plot: bool = False):
+def normalize_and_check(all_mu: torch.Tensor, plot: bool = False, verbose: bool = True):
     """
     Per-dimension normalize and (optionally) plot a histogram.
 
@@ -28,16 +28,18 @@ def normalize_and_check(all_mu: torch.Tensor, plot: bool = False):
 
     # global check
     all_vals = all_mu_norm.reshape(-1)
-    print(f"Global mean (post-norm): {all_vals.mean().item():.6f}")
-    print(f"Global std  (post-norm): {all_vals.std().item():.6f}")
+    if verbose:
+        print(f"Global mean (post-norm): {all_vals.mean().item():.6f}")
+        print(f"Global std  (post-norm): {all_vals.std().item():.6f}")
 
     # per-dim printout (first few)
     per_dim_mean = all_mu_norm.mean(dim=(0, 1))
     per_dim_std  = all_mu_norm.std(dim=(0, 1))
     D = all_mu_norm.size(-1)
-    print("\nPer-dim stats (first 10 dims or D if smaller):")
-    for i in range(min(10, D)):
-        print(f"  dim {i:2d}: mean={per_dim_mean[i]:7.4f}, std={per_dim_std[i]:7.4f}")
+    if verbose:
+        print("\nPer-dim stats (first 10 dims or D if smaller):")
+        for i in range(min(10, D)):
+            print(f"  dim {i:2d}: mean={per_dim_mean[i]:7.4f}, std={per_dim_std[i]:7.4f}")
 
     if plot:
         import matplotlib.pyplot as plt
@@ -48,6 +50,7 @@ def normalize_and_check(all_mu: torch.Tensor, plot: bool = False):
         plt.ylabel("Count")
         plt.show()
 
-    print(f"NaNs: {torch.isnan(all_mu_norm).sum().item()} | Infs: {torch.isinf(all_mu_norm).sum().item()}")
-    print(f"Min: {all_mu_norm.min().item():.6f} | Max: {all_mu_norm.max().item():.6f}")
+    if verbose:
+        print(f"NaNs: {torch.isnan(all_mu_norm).sum().item()} | Infs: {torch.isinf(all_mu_norm).sum().item()}")
+        print(f"Min: {all_mu_norm.min().item():.6f} | Max: {all_mu_norm.max().item():.6f}")
     return all_mu_norm, mu_per_dim, std_per_dim

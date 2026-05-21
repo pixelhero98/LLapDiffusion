@@ -47,11 +47,11 @@ class LatentVAE(nn.Module):
     Set-attention VAE.
 
     Expected inputs:
-      - x_tok: [B, T, N, input_dim] where input_dim=2 is [value*obs, obs]
+      - x_tok: [B, T, N, input_dim] where input_dim=2*C is [values*obs, obs]
       - entity_pad: [B, N] (bool), True for padded/non-existent entities
 
     Outputs:
-      - x_hat: [B, T, N, 1]
+      - x_hat: [B, T, N, output_dim]
       - mu: [B, T, C]
       - logvar: [B, T, C]
     """
@@ -68,6 +68,7 @@ class LatentVAE(nn.Module):
         dec_heads: int = 4,
         dec_ff: int = 256,
         input_dim: int = 2,
+        output_dim: int = 1,
         dropout: float = 0.1,
         num_entities: Optional[int] = None,
         entity_conditioned: bool = False,
@@ -76,6 +77,14 @@ class LatentVAE(nn.Module):
         self.seq_len = int(seq_len)
         self.latent_channel = int(latent_channel)
         self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        if self.output_dim <= 0:
+            raise ValueError(f"output_dim must be positive, got {self.output_dim}")
+        if self.input_dim < 2 * self.output_dim:
+            raise ValueError(
+                f"input_dim={self.input_dim} is too small for output_dim={self.output_dim}; "
+                f"expected at least {2 * self.output_dim} token channels."
+            )
         self.entity_conditioned = bool(entity_conditioned)
         self.num_entities = None if num_entities is None else int(num_entities)
         if self.entity_conditioned and (self.num_entities is None or self.num_entities <= 0):
@@ -94,7 +103,7 @@ class LatentVAE(nn.Module):
         else:
             self.entity_emb = None
         self.decoder = _SetTransformer(latent_dim, dec_heads, dec_ff, dec_layers, dropout=dropout)
-        self.out_proj = nn.Linear(latent_dim, 1)
+        self.out_proj = nn.Linear(latent_dim, self.output_dim)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -148,7 +157,12 @@ class LatentVAE(nn.Module):
         h = self.in_proj(x_bt)
         h = self.encoder(h, key_padding_mask=pad_bt)
 
-        obs = x_bt[..., 1].float()
+        obs_channels = x_bt[..., self.output_dim : self.output_dim * 2].float()
+        if obs_channels.numel() == 0:
+            raise ValueError(
+                f"x_tok input_dim={D} does not contain observation channels for output_dim={self.output_dim}"
+            )
+        obs = obs_channels.amax(dim=-1)
         w = obs.masked_fill(pad_bt, 0.0)
         valid_bt = w.sum(dim=1) > 0
         denom = w.sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -189,7 +203,7 @@ class LatentVAE(nn.Module):
             dec = dec + self.entity_emb(ids).unsqueeze(0).to(dtype=dec.dtype)
         dec = self.decoder(dec, key_padding_mask=pad_bt)
         x_hat_bt = self.out_proj(dec)
-        return x_hat_bt.reshape(B, T, N, 1)
+        return x_hat_bt.reshape(B, T, N, self.output_dim)
 
     def forward(self, x_tok: torch.Tensor, entity_pad: Optional[torch.Tensor] = None):
         x_tok, entity_pad, B, T, N, _ = self._prepare_entity_pad(x_tok, entity_pad)

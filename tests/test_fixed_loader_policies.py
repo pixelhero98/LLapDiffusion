@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,9 +10,10 @@ import numpy as np
 import pytest
 import torch
 
-from llapdiffusion.baselines.data import regular_feature_target_index, target_mask
-from llapdiffusion.baselines.features import regular_features
+from llapdiffusion.baselines.data import regular_feature_target_index, target_index, target_mask
+from llapdiffusion.baselines.features import regular_features, target_context
 from llapdiffusion.datasets.dataset_summary import _apply_split
+from llapdiffusion.datasets.target_selection import resolve_target_selection, valid_scalar_target_cols
 from llapdiffusion.datasets.fin_dataset import (
     CachePaths,
     _assign_ratio_splits,
@@ -192,6 +194,134 @@ def test_dataset_summary_split_counts_match_loader(tmp_path):
     assert loaders[3] == summary_counts
 
 
+def test_target_override_selects_non_default_feature_and_keeps_scalar_shape(tmp_path):
+    data_dir, _, _ = _write_tiny_cache(tmp_path, length=40, window=2, horizon=3)
+    train_dl, _, _, _ = load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=0.7,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        batch_size=1,
+        n_entities=2,
+        norm_scope="cache",
+        shuffle_train=False,
+        date_batching=False,
+        window=2,
+        horizon=3,
+        split_policy="contiguous",
+        exact_timestamp_batches=True,
+        target_col="noise",
+    )
+
+    (_, _), y, meta = next(iter(train_dl))
+
+    assert y.shape == (1, 2, 3)
+    assert meta["y_obs_mask"].shape == y.shape
+    assert torch.equal(y[0, 0], torch.tensor([2.0, 3.0, 4.0]))
+
+
+def test_finance_calendar_feature_cannot_be_selected_as_target():
+    meta = {
+        "dataset": "fin_dataset",
+        "feature_cols": ["RET_CLOSE", "DOW_SIN", "DOW_COS"],
+        "target_col": "RET_CLOSE",
+        "calendar_feature_cols": ["DOW_SIN", "DOW_COS"],
+    }
+
+    with pytest.raises(ValueError, match="calendar feature"):
+        resolve_target_selection(meta, "DOW_SIN")
+    assert valid_scalar_target_cols(meta) == ("RET_CLOSE",)
+
+
+def test_calendar_feature_rejection_is_metadata_driven():
+    meta = {
+        "dataset": "custom_cache",
+        "feature_cols": ["RET_CLOSE", "RET_OPEN", "DOW_SIN"],
+        "target_cols": ["RET_CLOSE"],
+        "calendar_feature_cols": ["DOW_SIN"],
+    }
+
+    with pytest.raises(ValueError, match="calendar feature"):
+        resolve_target_selection(meta, requested_target_cols=["RET_OPEN", "DOW_SIN"])
+
+
+def test_multi_target_selection_reports_indices_and_dimension():
+    meta = {
+        "dataset": "demo",
+        "feature_cols": ["x", "y", "z"],
+        "target_col": "x",
+    }
+
+    selected = resolve_target_selection(meta, requested_target_cols=["z", "y"])
+
+    assert selected.target_col == "z"
+    assert selected.target_cols == ("z", "y")
+    assert selected.target_indices == (2, 1)
+    assert selected.target_dim == 2
+    assert selected.target_source == "feature_columns"
+
+
+def test_scalar_target_col_rejects_comma_list():
+    meta = {"dataset": "demo", "feature_cols": ["x", "y"], "target_col": "x"}
+
+    with pytest.raises(ValueError, match="target_col accepts exactly one"):
+        resolve_target_selection(meta, "x,y")
+
+
+def test_target_index_accepts_single_target_cols_metadata():
+    info = {"dataset": "demo", "feature_cols": ["x", "y"], "target_cols": ["y"]}
+
+    assert target_index(info) == 1
+
+    selected = resolve_target_selection({"dataset": "demo", "feature_cols": ["x", "y"], "target_col": "y"})
+    assert selected.target_col == "y"
+    assert selected.target_source == "cache_target"
+
+
+def test_pack_targets_tokens_supports_multi_target_shape():
+    from llapdiffusion.models.llapdiff_utils import pack_targets_tokens, target_time_observed
+
+    y = torch.tensor([[[[1.0, 2.0], [3.0, float("nan")]]]])
+    entity_mask = torch.tensor([[True]])
+    y_obs_mask = torch.tensor([[[[True, True], [True, False]]]])
+
+    x_tok, entity_pad, obs = pack_targets_tokens(y, entity_mask, torch.device("cpu"), y_obs_mask=y_obs_mask)
+
+    assert x_tok.shape == (1, 2, 1, 4)
+    assert entity_pad.shape == (1, 1)
+    assert obs.shape == (1, 2, 1, 2)
+    assert target_time_observed(obs).tolist() == [[True, True]]
+    assert torch.equal(x_tok[..., :2], torch.tensor([[[[1.0, 2.0]], [[3.0, 0.0]]]]))
+
+
+def test_latent_vae_decodes_multi_target_channels():
+    from llapdiffusion.latent_space.latent_vae import LatentVAE
+
+    model = LatentVAE(
+        seq_len=2,
+        latent_dim=8,
+        latent_channel=4,
+        enc_layers=1,
+        enc_heads=2,
+        enc_ff=16,
+        dec_layers=1,
+        dec_heads=2,
+        dec_ff=16,
+        input_dim=4,
+        output_dim=2,
+        dropout=0.0,
+    )
+    x_tok = torch.randn(1, 2, 3, 4)
+    x_tok[..., 2:] = 1.0
+    entity_pad = torch.tensor([[False, False, True]])
+
+    x_hat, mu, logvar = model(x_tok, entity_pad)
+
+    assert x_hat.shape == (1, 2, 3, 2)
+    assert mu.shape == (1, 2, 4)
+    assert logvar.shape == (1, 2, 4)
+
+
 def test_exact_timestamp_collate_preserves_hourly_rows_on_same_day():
     collate = make_collate_level_and_firstdiff(n_entities=1, return_entity_mask=True)
     first = (
@@ -257,6 +387,21 @@ def test_target_only_regular_features_and_output_channel_use_transformed_target(
     assert regular_feature_target_index(info) == 1
 
 
+def test_target_context_rejects_feature_width_mismatch():
+    V = torch.ones(1, 1, 2, 1)
+    T = torch.zeros_like(V)
+    y = torch.ones(1, 1, 1)
+    meta = {
+        "x_obs_mask": torch.ones_like(V, dtype=torch.bool),
+        "y_obs_mask": torch.ones_like(y, dtype=torch.bool),
+        "entity_mask": torch.ones(1, 1, dtype=torch.bool),
+    }
+    info = {"dataset": "demo", "feature_cols": ["x", "target"], "target_col": "target"}
+
+    with pytest.raises(ValueError, match="outside the input feature width"):
+        target_context(((V, T), y, meta), info)
+
+
 def test_public_dataset_wrappers_expose_split_and_batching_policy():
     modules = [
         "llapdiffusion.datasets.fin_dataset",
@@ -271,6 +416,7 @@ def test_public_dataset_wrappers_expose_split_and_batching_policy():
         signature = inspect.signature(module.run_experiment)
         assert "split_policy" in signature.parameters
         assert "exact_timestamp_batches" in signature.parameters
+        assert "target_col" in signature.parameters
 
 
 def test_public_ratio_loader_helpers_expose_split_and_batching_policy():
@@ -285,6 +431,7 @@ def test_public_ratio_loader_helpers_expose_split_and_batching_policy():
         signature = inspect.signature(getattr(module, helper_name))
         assert "split_policy" in signature.parameters
         assert "exact_timestamp_batches" in signature.parameters
+        assert "target_col" in signature.parameters
 
 
 def test_physionet_public_wrapper_defaults_to_legacy_split():
@@ -365,11 +512,56 @@ def test_pipeline_forwards_loader_policy(monkeypatch):
         test_ratio=0.2,
         split_policy="global_purged_horizon",
         exact_timestamp_batches=True,
+        TARGET_COL="ozone",
     )
 
     assert pipeline.prepare_dataloaders(config=cfg)[3] == (1, 2, 3)
     assert seen["split_policy"] == "global_purged_horizon"
     assert seen["exact_timestamp_batches"] is True
+    assert seen["target_col"] == "ozone"
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "llapdiffusion.trainers.train_val_latent",
+        "llapdiffusion.trainers.train_val_summarizer",
+        "llapdiffusion.trainers.train_val_llapdiff",
+    ],
+)
+def test_trainer_fallback_loaders_forward_target_col(monkeypatch, module_name):
+    module = importlib.import_module(module_name)
+    seen = {}
+
+    def fake_resolve_run_experiment(data_dir):
+        seen["data_dir"] = data_dir
+
+        def fake_run_experiment(**kwargs):
+            seen.update(kwargs)
+            return object(), object(), object(), (1, 2, 3)
+
+        return fake_run_experiment
+
+    monkeypatch.setattr(module, "resolve_run_experiment", fake_resolve_run_experiment)
+    cfg = SimpleNamespace(
+        DATA_DIR="demo-cache",
+        date_batching=True,
+        DATES_PER_BATCH=2,
+        WINDOW=4,
+        PRED=2,
+        COVERAGE=0.0,
+        train_ratio=0.7,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        split_policy="global_purged_horizon",
+        exact_timestamp_batches=True,
+        TARGET_COL="alt",
+    )
+
+    module._ensure_loaders(None, None, None, None, config=cfg)
+
+    assert seen["data_dir"] == "demo-cache"
+    assert seen["target_col"] == "alt"
 
 
 def test_target_mask_excludes_missing_targets_even_when_entity_present():

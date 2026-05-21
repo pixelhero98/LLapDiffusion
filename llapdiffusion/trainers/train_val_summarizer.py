@@ -14,6 +14,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
+from llapdiffusion.logging_utils import is_debug, is_verbose
 from llapdiffusion.models.summarizer import LaplaceAE
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
 
@@ -78,6 +79,8 @@ def _ensure_loaders(
             ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
             split_policy=getattr(config, "split_policy", "global_purged_horizon"),
             exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
+            target_col=None if getattr(config, "TARGET_COLS", None) else getattr(config, "TARGET_COL", None),
+            target_cols=getattr(config, "TARGET_COLS", None),
         )
     elif sizes is None:
         try:
@@ -388,27 +391,32 @@ def run(
     (train_loader, val_loader, test_loader), sizes = _ensure_loaders(
         train_loader, val_loader, test_loader, sizes, config
     )
+    verbose = is_verbose(config)
+    debug = is_debug(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = bool(config.SUM_AMP and device.type == "cuda")
     grad_clip = getattr(config, "SUM_GRAD_CLIP", getattr(config, "GRAD_CLIP", 0.0))
-    print(f"Using device: {device}")
+    if verbose:
+        print(f"Using device: {device}")
 
     set_seed(config.SEED)
 
-    model = _build_model(train_loader, sizes, device, config=config, verbose=True)
-    print(f"Model params: {count_params(model) / 1e6:.2f}M")
+    model = _build_model(train_loader, sizes, device, config=config, verbose=verbose)
+    if verbose:
+        print(f"Model params: {count_params(model) / 1e6:.2f}M")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.SUM_LR, weight_decay=config.SUM_WEIGHT_DECAY)
     scaler = GradScaler(enabled=amp)
     loss_weights = _loss_weights(config)
-    print(
-        "Summarizer loss weights: "
-        f"x={loss_weights[0]:.3f} "
-        f"v={loss_weights[1]:.3f} "
-        f"t={loss_weights[2]:.3f} "
-        f"dt={loss_weights[3]:.3f} "
-        f"obs={loss_weights[4]:.3f}"
-    )
+    if debug:
+        print(
+            "Summarizer loss weights: "
+            f"x={loss_weights[0]:.3f} "
+            f"v={loss_weights[1]:.3f} "
+            f"t={loss_weights[2]:.3f} "
+            f"dt={loss_weights[3]:.3f} "
+            f"obs={loss_weights[4]:.3f}"
+        )
 
     epochs = config.SUM_EPOCHS
     patience = config.SUM_PATIENCE
@@ -451,10 +459,11 @@ def run(
         else:
             patience_ctr += 1
 
-        print(
-            f"Epoch {epoch:03d}/{epochs:03d} | train {train_loss:.6f} | val {val_loss:.6f} | "
-            f"best {best_val:.6f} @ {best_epoch:03d} | patience {patience_ctr}/{patience} | {elapsed:.1f}s"
-        )
+        if verbose:
+            print(
+                f"Epoch {epoch:03d}/{epochs:03d} | train {train_loss:.6f} | val {val_loss:.6f} | "
+                f"best {best_val:.6f} @ {best_epoch:03d} | patience {patience_ctr}/{patience} | {elapsed:.1f}s"
+            )
 
         if patience_ctr >= patience:
             print(f"\nEarly stopping at epoch {epoch}: validation loss plateaued.")
@@ -469,7 +478,8 @@ def run(
     with torch.no_grad():
         test_loss = _run_epoch(test_loader, model, device, loss_weights=loss_weights, amp=amp)
 
-    print(f"Best val loss: {best_val:.6f} | Test loss: {test_loss:.6f}")
+    if verbose:
+        print(f"Best val loss: {best_val:.6f} | Test loss: {test_loss:.6f}")
 
     return {
         "train_loader": train_loader,

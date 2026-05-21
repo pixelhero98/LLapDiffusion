@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
+from llapdiffusion.logging_utils import is_debug, is_verbose
 from llapdiffusion.latent_space.latent_vae import LatentVAE
 from llapdiffusion.models.summarizer import LaplaceAE
 from llapdiffusion.models.llapdiff import LLapDiff
@@ -28,8 +29,12 @@ from llapdiffusion.models.llapdiff_utils import (
     build_context,
     normalize_cond_per_batch,
     pack_targets_tokens,
+    infer_target_dim_from_loader,
     sample_training_timesteps,
     decode_latents_with_vae,
+    target_time_observed,
+    targets_to_bhnc,
+    vae_io_dims_for_target_dim,
 )
 from llapdiffusion.models.time_utils import relative_time_offsets
 
@@ -116,15 +121,33 @@ def _canon_target_obs_mask_like(
     if obs_mask is None:
         return None
     mask = torch.as_tensor(obs_mask, device=device, dtype=torch.bool)
-    B, N, H = yb.shape
-    if mask.shape == (B, N, H):
+    if yb.dim() == 3:
+        B, N, H = yb.shape
+        if mask.shape == (B, N, H):
+            return mask
+        if mask.shape == (B, H, N):
+            return mask.permute(0, 2, 1).contiguous()
+        if mask.shape == (B, N, H, 1):
+            return mask.squeeze(-1)
+        if mask.shape == (B, H, N, 1):
+            return mask.squeeze(-1).permute(0, 2, 1).contiguous()
+        raise ValueError(f"y_obs_mask shape {tuple(mask.shape)} is incompatible with target shape {tuple(yb.shape)}")
+
+    if yb.dim() != 4:
+        raise ValueError(f"target shape must be [B,N,H] or [B,N,H,C], got {tuple(yb.shape)}")
+    B, N, H, C = yb.shape
+    if mask.shape == (B, N, H, C):
         return mask
-    if mask.shape == (B, H, N):
-        return mask.permute(0, 2, 1).contiguous()
+    if mask.shape == (B, H, N, C):
+        return mask.permute(0, 2, 1, 3).contiguous()
     if mask.shape == (B, N, H, 1):
-        return mask.squeeze(-1)
+        return mask.expand(B, N, H, C)
     if mask.shape == (B, H, N, 1):
-        return mask.squeeze(-1).permute(0, 2, 1).contiguous()
+        return mask.permute(0, 2, 1, 3).contiguous().expand(B, N, H, C)
+    if mask.shape == (B, N, H):
+        return mask.unsqueeze(-1).expand(B, N, H, C)
+    if mask.shape == (B, H, N):
+        return mask.permute(0, 2, 1).contiguous().unsqueeze(-1).expand(B, N, H, C)
     raise ValueError(f"y_obs_mask shape {tuple(mask.shape)} is incompatible with target shape {tuple(yb.shape)}")
 
 
@@ -156,7 +179,10 @@ def _sanitize_batch(
 
     y_obs = _canon_target_obs_mask_like(meta.get("y_obs_mask"), yb, device=device)
     if y_obs is not None:
-        _raise_if_observed_nonfinite("yb", yb, y_obs & mask[:, :, None])
+        entity_target_mask = mask[:, :, None]
+        if yb.dim() == 4:
+            entity_target_mask = entity_target_mask.unsqueeze(-1)
+        _raise_if_observed_nonfinite("yb", yb, y_obs & entity_target_mask)
 
     if x_obs is None:
         mask = mask & _entity_finite_mask(V) & _entity_finite_mask(T)
@@ -476,6 +502,8 @@ def _ensure_loaders(
             ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
             split_policy=getattr(config, "split_policy", "global_purged_horizon"),
             exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
+            target_col=None if getattr(config, "TARGET_COLS", None) else getattr(config, "TARGET_COL", None),
+            target_cols=getattr(config, "TARGET_COLS", None),
         )
     elif sizes is None:
         try:
@@ -619,7 +647,7 @@ def _collect_latent_probe(
         )
         if x_tok is None or not obs.any():
             continue
-        obs_any = obs.any(dim=2)
+        obs_any = target_time_observed(obs)
         mu_norm = encode_mu_norm(
             vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std
         )
@@ -805,7 +833,7 @@ def evaluate_val_diagnostics(
         if x_tok is None or not obs.any():
             continue
 
-        obs_any = obs.any(dim=2)
+        obs_any = target_time_observed(obs)
         mu_norm = encode_mu_norm(
             vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std
         )
@@ -973,12 +1001,16 @@ def _sampling_kwargs(config_obj: object, *, prefix: str = "EVAL") -> Dict[str, o
 
 
 def _summarize_dataset(
-    train_dl: DataLoader, sizes: Optional[Sequence[int]]
+    train_dl: DataLoader,
+    sizes: Optional[Sequence[int]],
+    *,
+    verbose: bool = True,
 ) -> Tuple[int, int, int, int]:
-    if sizes is not None:
-        print("sizes:", tuple(sizes))
-    else:
-        print("sizes: (unknown)")
+    if verbose:
+        if sizes is not None:
+            print("sizes:", tuple(sizes))
+        else:
+            print("sizes: (unknown)")
 
     try:
         xb0, yb0, _ = next(iter(train_dl))
@@ -989,7 +1021,8 @@ def _summarize_dataset(
     B0, N0, K0, Fv = V0.shape
     Ft = T0.shape[-1]
     assert Fv == Ft, f"Expected Fv == Ft, got {Fv} vs {Ft}"
-    print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
+    if verbose:
+        print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
     return B0, N0, K0, Fv
 
 
@@ -1017,6 +1050,7 @@ def evaluate_regression(
     rho: float = 7.5,
     generator_seed: Optional[int] = None,
     crps_pair_samples: int = 200,
+    verbose: bool = False,
 ):
     """
     Evaluate probabilistic forecasts in observation space (set-VAE pipeline).
@@ -1034,6 +1068,9 @@ def evaluate_regression(
     abs_sum, sq_sum, elts = 0.0, 0.0, 0.0
     crps_sum, crps_elts = 0.0, 0.0
     pinball_sums = {float(q): 0.0 for q in quantiles}
+    per_target_abs_sum = None
+    per_target_sq_sum = None
+    per_target_elts = None
 
     num_samples = int(getattr(config, "NUM_EVAL_SAMPLES", 16))
     generator = None
@@ -1080,13 +1117,26 @@ def evaluate_regression(
         B, Hcur, Z = x_tok.size(0), x_tok.size(1), int(mu_mean.shape[-1])
         dt_model = _match_dt_to_horizon(dt_b, Hcur)
 
-        y_true = (
-            torch.nan_to_num(yb, nan=0.0, posinf=0.0, neginf=0.0)
-            .permute(0, 2, 1)
-            .contiguous()
-            .unsqueeze(-1)
+        y_true = torch.nan_to_num(
+            targets_to_bhnc(yb, mask_bn, device=device),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
-        valid = obs.unsqueeze(-1).to(dtype=y_true.dtype)
+        if obs.dim() == 3:
+            obs_entries = obs.unsqueeze(-1)
+        elif obs.dim() == 4:
+            obs_entries = obs
+        else:
+            raise ValueError(f"target observation mask must be [B,H,N] or [B,H,N,C], got {tuple(obs.shape)}")
+        if obs_entries.shape != y_true.shape:
+            try:
+                obs_entries = obs_entries.expand_as(y_true)
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"target observation mask shape {tuple(obs_entries.shape)} does not match target shape {tuple(y_true.shape)}"
+                ) from exc
+        valid = obs_entries.to(dtype=y_true.dtype)
 
         all_y_hats = []
         for _ in range(num_samples):
@@ -1111,7 +1161,7 @@ def evaluate_regression(
             )
             all_y_hats.append(y_hat_sample)
 
-        all_samples = torch.stack(all_y_hats, dim=0)  # [S,B,H,N,1]
+        all_samples = torch.stack(all_y_hats, dim=0)  # [S,B,H,N,C]
 
         if aggregation_method == "mean":
             point_forecast = all_samples.mean(dim=0)
@@ -1122,6 +1172,18 @@ def evaluate_regression(
         abs_sum += res.abs().sum().item()
         sq_sum += (res**2).sum().item()
         elts += valid.sum().item()
+        target_reduce_dims = (0, 1, 2)
+        batch_abs = res.abs().sum(dim=target_reduce_dims).detach().cpu()
+        batch_sq = (res**2).sum(dim=target_reduce_dims).detach().cpu()
+        batch_elts = valid.sum(dim=target_reduce_dims).detach().cpu()
+        if per_target_abs_sum is None:
+            per_target_abs_sum = batch_abs
+            per_target_sq_sum = batch_sq
+            per_target_elts = batch_elts
+        else:
+            per_target_abs_sum += batch_abs
+            per_target_sq_sum += batch_sq
+            per_target_elts += batch_elts
 
         M = all_samples.shape[0]
         term1 = (all_samples - y_true.unsqueeze(0)).abs().mean(dim=0)
@@ -1157,9 +1219,10 @@ def evaluate_regression(
     crps = crps_sum / crps_elts
     pinball = {q: (pinball_sums[q] / elts) for q in pinball_sums.keys()}
     qs_fmt = ", ".join(f"{q:.2f}:{pinball[q]:.6f}" for q in sorted(pinball.keys()))
-    print(f"[eval ({num_samples} samples, aggregation: {aggregation_method})]")
-    print(f" CRPS: {crps:.6f} | MAE: {mae:.6f} | MSE: {mse:.6f} | Pinball[{qs_fmt}]")
-    return {
+    if verbose:
+        print(f"[eval ({num_samples} samples, aggregation: {aggregation_method})]")
+        print(f" CRPS: {crps:.6f} | MAE: {mae:.6f} | MSE: {mse:.6f} | Pinball[{qs_fmt}]")
+    metrics = {
         "crps": crps,
         "mae": mae,
         "mse": mse,
@@ -1167,12 +1230,30 @@ def evaluate_regression(
         "num_samples": num_samples,
         "aggregation": aggregation_method,
     }
+    if per_target_abs_sum is not None and int(per_target_abs_sum.numel()) > 1:
+        denom = per_target_elts.clamp_min(1.0)
+        target_cols = getattr(config, "TARGET_COLS", None) or getattr(config, "target_cols", None)
+        if target_cols is None:
+            target_cols = [f"target_{idx}" for idx in range(int(per_target_abs_sum.numel()))]
+        elif isinstance(target_cols, str):
+            target_cols = [part.strip() for part in target_cols.split(",") if part.strip()]
+        target_cols = list(target_cols)
+        while len(target_cols) < int(per_target_abs_sum.numel()):
+            target_cols.append(f"target_{len(target_cols)}")
+        metrics["per_target"] = {
+            str(name): {
+                "mae": float((per_target_abs_sum[idx] / denom[idx]).item()),
+                "mse": float((per_target_sq_sum[idx] / denom[idx]).item()),
+                "observed_entries": int(per_target_elts[idx].item()),
+            }
+            for idx, name in enumerate(target_cols[: int(per_target_abs_sum.numel())])
+        }
+    return metrics
 
 
 def _save_checkpoint(out_path: Path, payload: Dict[str, object]) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(f"[saved] {out_path}")
 
 
 def _llapdiff_model_kwargs(config_obj: object) -> Dict[str, object]:
@@ -1237,6 +1318,7 @@ def _load_eval_checkpoint(
     diff_model: nn.Module,
     ema: Optional[EMA],
     device: torch.device,
+    verbose: bool = False,
 ) -> Optional[str]:
     """Load a checkpoint for evaluation and return the loaded path.
 
@@ -1255,7 +1337,8 @@ def _load_eval_checkpoint(
     if ema is not None and isinstance(payload, dict) and payload.get("ema") is not None:
         ema.load_state_dict(payload["ema"])
 
-    print(f"[loaded for eval] {checkpoint_path}")
+    if verbose:
+        print(f"[loaded for eval] {checkpoint_path}")
     return str(checkpoint_path)
 
 
@@ -1518,13 +1601,25 @@ def run(
     (train_dl, val_dl, test_dl), sizes = _ensure_loaders(
         train_dl, val_dl, test_dl, sizes, config
     )
-    _, N0, K0, Fv = _summarize_dataset(train_dl, sizes)
+    verbose = is_verbose(config)
+    debug = is_debug(config)
+    _, N0, K0, Fv = _summarize_dataset(train_dl, sizes, verbose=verbose)
+    target_dim = int(getattr(config, "TARGET_DIM", 0) or 0)
+    if target_dim <= 0:
+        target_dim = infer_target_dim_from_loader(train_dl)
+        setattr(config, "TARGET_DIM", target_dim)
+    vae_input_dim, vae_output_dim = vae_io_dims_for_target_dim(config, target_dim)
+    setattr(config, "VAE_INPUT_DIM", vae_input_dim)
+    setattr(config, "VAE_OUTPUT_DIM", vae_output_dim)
+    if verbose:
+        print(f"LLapDiff target_dim: {target_dim}")
 
     device = set_torch(
         seed=int(getattr(config, "SEED", 42)),
         deterministic=bool(getattr(config, "DETERMINISTIC", False)),
     )
-    print(f"Using device: {device}")
+    if verbose:
+        print(f"Using device: {device}")
 
     # ---------------- VAE (frozen) ----------------
     vae = LatentVAE(
@@ -1537,7 +1632,8 @@ def run(
         dec_layers=config.VAE_LAYERS,
         dec_heads=config.VAE_HEADS,
         dec_ff=config.VAE_FF,
-        input_dim=int(getattr(config, "VAE_INPUT_DIM", 2)),
+        input_dim=vae_input_dim,
+        output_dim=vae_output_dim,
         num_entities=N0,
         entity_conditioned=bool(getattr(config, "VAE_ENTITY_CONDITION", False)),
     ).to(device)
@@ -1621,7 +1717,8 @@ def run(
         _load_module_state(diff_model, init_state, strict=True)
         if isinstance(init_payload, dict):
             init_ema_state = init_payload.get("ema")
-        print(f"[init] loaded diffusion weights from {init_ckpt_path} strict=True")
+        if verbose:
+            print(f"[init] loaded diffusion weights from {init_ckpt_path} strict=True")
 
     scheduler = diff_model.scheduler
     optimizer_param_groups = [
@@ -1659,7 +1756,8 @@ def run(
     )
     if ema is not None and init_ema_state is not None:
         ema.load_state_dict(init_ema_state)
-        print(f"[init] loaded EMA weights from {init_ckpt_path}")
+        if verbose:
+            print(f"[init] loaded EMA weights from {init_ckpt_path}")
     use_ema_eval = ema is not None and bool(getattr(config, "USE_EMA_EVAL", False))
     val_metric_source = _resolve_metric_source(
         getattr(config, "VAL_METRIC_SOURCE", "ema"),
@@ -1676,26 +1774,27 @@ def run(
     )
     ema_compare = use_ema_eval and bool(getattr(config, "EMA_COMPARE", True))
     trainable_params = sum(p.numel() for p in diff_model.parameters() if p.requires_grad)
-    print(
-        "[capacity/reg] "
-        f"params={trainable_params:,} "
-        f"width={config.MODEL_WIDTH} "
-        f"layers={config.NUM_LAYERS} "
-        f"heads={config.NUM_HEADS} "
-        f"dropout={float(config.DROPOUT):.3f}/{float(config.ATTN_DROPOUT):.3f} "
-        f"weight_decay={float(config.WEIGHT_DECAY):.2e} "
-        f"ema={bool(getattr(config, 'USE_EMA_EVAL', False))}/{float(getattr(config, 'EMA_DECAY', 0.0)):.3f} "
-        f"drop_cond_p={float(getattr(config, 'DROP_COND_P', 0.0)):.2f}"
-    )
-    print(
-        "[conditioning] "
-        f"pool_mode={cond_pool_mode} "
-        f"pool_use_raw={cond_pool_use_raw} "
-        f"block_summary_adaln={block_summary_adaln} "
-        f"analysis_summary_qk={analysis_summary_qk} "
-        f"analysis_qk_use_raw={analysis_qk_use_raw}"
-    )
-    if sum_ft_named_params:
+    if debug:
+        print(
+            "[capacity/reg] "
+            f"params={trainable_params:,} "
+            f"width={config.MODEL_WIDTH} "
+            f"layers={config.NUM_LAYERS} "
+            f"heads={config.NUM_HEADS} "
+            f"dropout={float(config.DROPOUT):.3f}/{float(config.ATTN_DROPOUT):.3f} "
+            f"weight_decay={float(config.WEIGHT_DECAY):.2e} "
+            f"ema={bool(getattr(config, 'USE_EMA_EVAL', False))}/{float(getattr(config, 'EMA_DECAY', 0.0)):.3f} "
+            f"drop_cond_p={float(getattr(config, 'DROP_COND_P', 0.0)):.2f}"
+        )
+        print(
+            "[conditioning] "
+            f"pool_mode={cond_pool_mode} "
+            f"pool_use_raw={cond_pool_use_raw} "
+            f"block_summary_adaln={block_summary_adaln} "
+            f"analysis_summary_qk={analysis_summary_qk} "
+            f"analysis_qk_use_raw={analysis_qk_use_raw}"
+        )
+    if sum_ft_named_params and verbose:
         print(
             "[summ ft] "
             f"mode={sum_ft_mode} "
@@ -1704,7 +1803,7 @@ def run(
             f"weight_decay={sum_ft_weight_decay:.2e} "
             f"start_epoch={sum_ft_start_epoch}"
         )
-    if cond_adapter_mode != "none":
+    if cond_adapter_mode != "none" and debug:
         print(
             "[cond adapter] "
             f"mode={cond_adapter_mode} "
@@ -1724,19 +1823,25 @@ def run(
         vae=vae,
         latent_stats=(mu_mean, mu_std),
     )
-    print(
-        f"Baseline target variance ({config.PREDICT_TYPE}): {baseline_target_variance:.6f}"
+    if debug:
+        print(
+            f"Baseline target variance ({config.PREDICT_TYPE}): {baseline_target_variance:.6f}"
+        )
+        print(f"[latent stats] mode={latent_norm_mode}")
+    latent_probe_batches = max(0, int(getattr(config, "LATENT_PROBE_BATCHES", 4)))
+    latent_probe = (
+        _collect_latent_probe(
+            vae,
+            train_dl,
+            device,
+            mu_mean,
+            mu_std,
+            max_batches=latent_probe_batches,
+        )
+        if debug and latent_probe_batches > 0
+        else None
     )
-    print(f"[latent stats] mode={latent_norm_mode}")
-    latent_probe = _collect_latent_probe(
-        vae,
-        train_dl,
-        device,
-        mu_mean,
-        mu_std,
-        max_batches=max(1, int(getattr(config, "LATENT_PROBE_BATCHES", 4))),
-    )
-    if latent_probe is not None:
+    if latent_probe is not None and debug:
         print(
             "[latent probe] "
             f"mean={latent_probe['mean']:.4f} std={latent_probe['std']:.4f} "
@@ -1768,16 +1873,17 @@ def run(
         config,
         aux_prob=target_mask_aux_p,
     )
-    print(
-        "[diffusion train] "
-        f"lr_schedule={lr_schedule_name} "
-        f"t_sampler={train_t_sampler} "
-        f"t_karras_rho={train_t_karras_rho:.2f} "
-        f"minsnr_norm={minsnr_normalize} "
-        f"cond_mode={cond_train_mode} "
-        f"drop_cond_p={float(getattr(config, 'DROP_COND_P', 0.0)):.2f}"
-    )
-    if target_mask_aux_p > 0.0:
+    if debug:
+        print(
+            "[diffusion train] "
+            f"lr_schedule={lr_schedule_name} "
+            f"t_sampler={train_t_sampler} "
+            f"t_karras_rho={train_t_karras_rho:.2f} "
+            f"minsnr_norm={minsnr_normalize} "
+            f"cond_mode={cond_train_mode} "
+            f"drop_cond_p={float(getattr(config, 'DROP_COND_P', 0.0)):.2f}"
+        )
+    if target_mask_aux_p > 0.0 and verbose:
         print(
             "[target-mask aux] "
             f"p={target_mask_aux_p:.2f} "
@@ -1786,12 +1892,13 @@ def run(
             f"keep_prob={target_mask_aux_keep_prob:.2f} "
             f"keep_stride={target_mask_aux_keep_stride}"
         )
-    print(
-        "[eval selection] "
-        f"val_source={val_metric_source} "
-        f"test_source={test_metric_source} "
-        f"ema_compare={ema_compare}"
-    )
+    if debug:
+        print(
+            "[eval selection] "
+            f"val_source={val_metric_source} "
+            f"test_source={test_metric_source} "
+            f"ema_compare={ema_compare}"
+        )
 
     # ---------------- Training loop ----------------
     def train_one_epoch(epoch: int) -> Dict[str, object]:
@@ -1853,7 +1960,7 @@ def run(
             if x_tok is None or not obs.any():
                 continue
 
-            obs_any = obs.any(dim=2)  # [B,H]
+            obs_any = target_time_observed(obs)  # [B,H]
             mu_norm = encode_mu_norm(
                 vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std
             )
@@ -2144,26 +2251,27 @@ def run(
         train_history.append({"epoch": epoch + 1, **epoch_stats})
         last_epoch = epoch + 1
         lr_now = optimizer.param_groups[0]["lr"]
-        if (epoch + 1) in {1, 71}:
+        if debug and (epoch + 1) in {1, 71}:
             print(f"[lr probe] epoch={epoch + 1} lr={lr_now:.8e}")
-        if sum_ft_named_params and (epoch + 1) == sum_ft_start_epoch:
+        if sum_ft_named_params and verbose and (epoch + 1) == sum_ft_start_epoch:
             print(f"[summ ft] activated at epoch {epoch + 1}")
-        if target_mask_aux_p > 0.0 and (epoch + 1) == target_mask_aux_start_epoch:
+        if target_mask_aux_p > 0.0 and verbose and (epoch + 1) == target_mask_aux_start_epoch:
             print(f"[target-mask aux] activated at epoch {epoch + 1}")
-        print(
-            f"[epoch {epoch + 1}/{epochs}] "
-            f"train_loss={train_loss:.6f} "
-            f"raw_loss={float(epoch_stats['raw_loss']):.6f} "
-            f"cond_frac={float(epoch_stats['cond_fraction']):.3f} "
-            f"lr={lr_now:.3e}"
-        )
+        if verbose:
+            print(
+                f"[epoch {epoch + 1}/{epochs}] "
+                f"train_loss={train_loss:.6f} "
+                f"raw_loss={float(epoch_stats['raw_loss']):.6f} "
+                f"cond_frac={float(epoch_stats['cond_fraction']):.3f} "
+                f"lr={lr_now:.3e}"
+            )
         predict_type_name = str(getattr(config, "PREDICT_TYPE", "")).strip().lower()
         train_metric_key = (
             "train_x0_mse_raw"
             if predict_type_name == "x0"
             else f"train_{predict_type_name}_mse_raw"
         )
-        if train_metric_key in epoch_stats:
+        if train_metric_key in epoch_stats and debug:
             metric_label = "x0" if predict_type_name == "x0" else predict_type_name
             print(f" Train {metric_label}-MSE (unweighted): {float(epoch_stats[train_metric_key]):.6f}")
             cond_key = f"{train_metric_key}_cond"
@@ -2180,7 +2288,7 @@ def run(
                     else "n/a"
                 )
                 print(f" Train {metric_label}-MSE split: cond={cond_str} uncond={uncond_str}")
-        if target_mask_aux_p > 0.0:
+        if target_mask_aux_p > 0.0 and debug:
             print(
                 "[target-mask aux epoch] "
                 f"batches={int(epoch_stats['target_mask_aux_batches'])} "
@@ -2189,7 +2297,7 @@ def run(
                 f"hidden_frac={float(epoch_stats['target_mask_hidden_frac']):.3f}"
             )
         t_loss_bins = epoch_stats.get("timestep_loss_bins")
-        if t_loss_bins is not None:
+        if t_loss_bins is not None and debug:
             raw_bins = ", ".join(f"{v:.4f}" for v in t_loss_bins["raw"])
             weighted_bins = ", ".join(f"{v:.4f}" for v in t_loss_bins["weighted"])
             print(f"[train t-bins raw] {raw_bins}")
@@ -2199,13 +2307,14 @@ def run(
             pole_metrics = _collect_pole_probe(diff_model, pole_probe_state)
             if pole_metrics is not None:
                 pole_probe_history.append({"epoch": epoch + 1, **pole_metrics})
-                print(
-                    "[pole probe] "
-                    f"base_drho={pole_metrics['base_rho_delta_mean']:.6e} "
-                    f"base_domega={pole_metrics['base_omega_delta_mean']:.6e} "
-                    f"eff_drho={pole_metrics['eff_rho_delta_mean']:.6e} "
-                    f"eff_domega={pole_metrics['eff_omega_delta_mean']:.6e}"
-                )
+                if debug:
+                    print(
+                        "[pole probe] "
+                        f"base_drho={pole_metrics['base_rho_delta_mean']:.6e} "
+                        f"base_domega={pole_metrics['base_omega_delta_mean']:.6e} "
+                        f"eff_drho={pole_metrics['eff_rho_delta_mean']:.6e} "
+                        f"eff_domega={pole_metrics['eff_omega_delta_mean']:.6e}"
+                    )
 
         eval_due = len(val_dl) > 0
         run_downstream_eval = (
@@ -2240,6 +2349,7 @@ def run(
                 config,
                 ema=_maybe_metric_ema(val_metric_source, ema),
                 self_cond=bool(getattr(config, "SELF_COND", False)),
+                verbose=debug,
                 **_sampling_kwargs(config, prefix="EVAL"),
             )
 
@@ -2260,7 +2370,8 @@ def run(
             )
             predict_type_name = str(getattr(config, "PREDICT_TYPE", "")).strip().lower()
             metric_label = "x0" if predict_type_name in {"", "x0"} else predict_type_name
-            print(f" Val {metric_label}-MSE (unweighted): {val_diag['val_diag_mse_raw']:.6f}")
+            if debug:
+                print(f" Val {metric_label}-MSE (unweighted): {val_diag['val_diag_mse_raw']:.6f}")
             snr_bins = val_diag["val_diag_mse_by_snr_bin"]
             edges = snr_bins["log_snr_edges"]
             vals = snr_bins["raw"]
@@ -2269,7 +2380,8 @@ def run(
                 f"[{edges[i]:.1f},{edges[i + 1]:.1f}]:{vals[i]:.6f} (n={counts[i]})"
                 for i in range(len(vals))
             )
-            print(f" Val {metric_label}-MSE by log-SNR bin: {snr_fmt}")
+            if debug:
+                print(f" Val {metric_label}-MSE by log-SNR bin: {snr_fmt}")
             if not run_downstream_eval:
                 val_history.append({"epoch": epoch + 1, "source": val_metric_source, **val_diag})
 
@@ -2281,12 +2393,13 @@ def run(
                 diff_model=diff_model,
                 max_batches=int(getattr(config, "IRREG_CHECK_BATCHES", 4)),
             )
-            print(
-                "[irreg check] "
-                f"ctx_delta_no_dt={irreg['ctx_delta_no_dt']:.6f} "
-                f"ctx_delta_no_xmask={irreg['ctx_delta_no_xmask']:.6f} "
-                f"ctx_delta_zero_tsig={irreg['ctx_delta_zero_tsig']:.6f}"
-            )
+            if debug:
+                print(
+                    "[irreg check] "
+                    f"ctx_delta_no_dt={irreg['ctx_delta_no_dt']:.6f} "
+                    f"ctx_delta_no_xmask={irreg['ctx_delta_no_xmask']:.6f} "
+                    f"ctx_delta_zero_tsig={irreg['ctx_delta_zero_tsig']:.6f}"
+                )
 
         if run_downstream_eval:
             if val_diag is not None:
@@ -2308,17 +2421,19 @@ def run(
                     config,
                     ema=_maybe_metric_ema(compare_source, ema),
                     self_cond=bool(getattr(config, "SELF_COND", False)),
+                    verbose=debug,
                     **_sampling_kwargs(config, prefix="EVAL"),
                 )
                 if compare_source == "raw":
                     raw_val_metrics = compare_val_metrics
                 else:
                     ema_val_metrics = compare_val_metrics
-                print(
-                    "[ema compare] "
-                    f"raw_crps={float(raw_val_metrics['crps']):.6f} "
-                    f"ema_crps={float(ema_val_metrics['crps']):.6f}"
-                )
+                if debug:
+                    print(
+                        "[ema compare] "
+                        f"raw_crps={float(raw_val_metrics['crps']):.6f} "
+                        f"ema_crps={float(ema_val_metrics['crps']):.6f}"
+                    )
             val_history.append({"epoch": epoch + 1, "source": val_metric_source, **val_metrics})
             if raw_val_metrics is not None:
                 raw_val_history.append({"epoch": epoch + 1, **raw_val_metrics})
@@ -2336,6 +2451,9 @@ def run(
                             "ema": ema.state_dict() if ema is not None else None,
                             "optimizer": optimizer.state_dict(),
                             "epoch": epoch + 1,
+                            "target_dim": int(target_dim),
+                            "vae_input_dim": int(vae_input_dim),
+                            "vae_output_dim": int(vae_output_dim),
                             "mu_mean": mu_mean.detach().cpu(),
                             "mu_std": mu_std.detach().cpu(),
                             "val_metrics": raw_val_metrics,
@@ -2359,6 +2477,9 @@ def run(
                             "ema": ema.state_dict() if ema is not None else None,
                             "optimizer": optimizer.state_dict(),
                             "epoch": epoch + 1,
+                            "target_dim": int(target_dim),
+                            "vae_input_dim": int(vae_input_dim),
+                            "vae_output_dim": int(vae_output_dim),
                             "mu_mean": mu_mean.detach().cpu(),
                             "mu_std": mu_std.detach().cpu(),
                             "val_metrics": ema_val_metrics,
@@ -2405,6 +2526,9 @@ def run(
                             "ema": ema.state_dict() if ema is not None else None,
                             "optimizer": optimizer.state_dict(),
                             "epoch": epoch + 1,
+                            "target_dim": int(target_dim),
+                            "vae_input_dim": int(vae_input_dim),
+                            "vae_output_dim": int(vae_output_dim),
                             "mu_mean": mu_mean.detach().cpu(),
                             "mu_std": mu_std.detach().cpu(),
                             "val_metrics": primary_metrics,
@@ -2437,6 +2561,9 @@ def run(
             "ema": ema.state_dict() if ema is not None else None,
             "optimizer": optimizer.state_dict(),
             "epoch": last_epoch,
+            "target_dim": int(target_dim),
+            "vae_input_dim": int(vae_input_dim),
+            "vae_output_dim": int(vae_output_dim),
             "mu_mean": mu_mean.detach().cpu(),
             "mu_std": mu_std.detach().cpu(),
             "train_losses": train_losses,
@@ -2477,6 +2604,7 @@ def run(
         diff_model=diff_model,
         ema=ema,
         device=device,
+        verbose=verbose,
     )
 
     test_metrics = evaluate_regression(
@@ -2490,6 +2618,7 @@ def run(
         config,
         ema=_maybe_metric_ema(test_metric_source, ema),
         self_cond=bool(getattr(config, "SELF_COND", False)),
+        verbose=debug,
         **_sampling_kwargs(config, prefix="TEST"),
     )
 
@@ -2514,6 +2643,9 @@ def run(
         "selected_val_metric_source": val_metric_source,
         "selected_test_metric_source": test_metric_source,
         "data_policy": {
+            "target_dim": int(target_dim),
+            "vae_input_dim": int(vae_input_dim),
+            "vae_output_dim": int(vae_output_dim),
             "split_policy": getattr(config, "split_policy", "global_purged_horizon"),
             "split_scope": getattr(config, "split_scope", "global_target_time"),
             "batching_policy": (

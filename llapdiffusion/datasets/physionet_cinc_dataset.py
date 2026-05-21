@@ -512,6 +512,8 @@ def load_physionet_dataloaders_with_ratio_split(
     *,
     split_policy: str = "contiguous",
     exact_timestamp_batches: bool = True,
+    target_col: Optional[str] = None,
+    target_cols: Optional[Sequence[str]] = None,
     **loader_kwargs,
 ):
     """Wrapper around the financial ratio-split loader for PhysioNet datasets."""
@@ -520,6 +522,8 @@ def load_physionet_dataloaders_with_ratio_split(
         data_dir=data_dir,
         split_policy=split_policy,
         exact_timestamp_batches=exact_timestamp_batches,
+        target_col=target_col,
+        target_cols=target_cols,
         **loader_kwargs,
     )
 
@@ -560,6 +564,8 @@ def run_experiment(
     pin_memory: Optional[bool] = None,
     split_policy: str = "contiguous",
     exact_timestamp_batches: bool = True,
+    target_col: Optional[str] = None,
+    target_cols: Optional[Sequence[str]] = None,
 ):
     """Mirror :func:`llapdiffusion.datasets.fin_dataset.run_experiment` for PhysioNet caches."""
 
@@ -587,6 +593,8 @@ def run_experiment(
             horizon=H,
             update_meta=True,
             backup_old=False,
+            target_col=target_col,
+            target_cols=target_cols,
         )
         base_window, base_horizon = K, H
 
@@ -612,6 +620,8 @@ def run_experiment(
         horizon=H,
         split_policy=split_policy,
         exact_timestamp_batches=exact_timestamp_batches,
+        target_col=target_col,
+        target_cols=target_cols,
         shuffle_train=shuffle_train,
         num_workers=num_workers,
         pin_memory=pin_memory,

@@ -4,9 +4,13 @@
 
 DATASET_KEY = ""
 DATA_DIR = ""
+TARGET_COL = None
+TARGET_COLS = None
 MKT = "dataset"
 SEED = 42
 DETERMINISTIC = False
+VERBOSE = False
+DEBUG = False
 PIPELINE_PREDS = None
 ARTIFACT_ROOT = "./ldt"
 
@@ -33,6 +37,7 @@ test_ratio = 0.2
 # ============================ VAE (Set-VAE) ============================
 
 VAE_INPUT_DIM = 2
+VAE_OUTPUT_DIM = 1
 
 VAE_LATENT_CHANNELS = 24
 VAE_LATENT_DIM = 128
@@ -187,9 +192,9 @@ POLE_PLOT_DIR = f"{OUT_DIR}/pole_plots"
 
 # ============================ Diagnostics ============================
 
-TRAIN_LOSS_T_BINS = 8
-LATENT_PROBE_BATCHES = 4
-POLE_PROBE = True
+TRAIN_LOSS_T_BINS = 0
+LATENT_PROBE_BATCHES = 0
+POLE_PROBE = False
 POLE_PROBE_EVERY = 5
-VAL_DIAG_SNR_BINS = 8
+VAL_DIAG_SNR_BINS = 0
 IRREG_CHECK_BATCHES = 4

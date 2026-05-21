@@ -681,7 +681,7 @@ def test_vae_target_mask_excludes_zero_filled_missing_targets():
 
     assert prepared is not None
     x_tok, y_clean, obs, entity_pad = prepared
-    assert obs.tolist() == [[[True, False, True]]]
+    assert obs.tolist() == [[[[True], [False], [True]]]]
     assert entity_pad.tolist() == [[False]]
     assert x_tok[0, 1, 0, 0].item() == 0.0
     assert x_tok[0, 1, 0, 1].item() == 0.0
@@ -1149,6 +1149,85 @@ def test_checkpoint_eval_cli_parses_sample_and_batch_knobs(monkeypatch):
     assert args.forecast_num_samples == 7
     assert args.imputation_num_samples == 9
     assert args.max_eval_batches == 0
+
+
+def test_checkpoint_eval_main_prints_compact_summary_by_default(monkeypatch, capsys):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+
+    captured = {}
+    cfg = SimpleNamespace()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llapdiff-checkpoint-eval",
+            "--dataset-key",
+            "crypto",
+            "--checkpoint",
+            "model.pt",
+        ],
+    )
+    monkeypatch.setattr(ce, "configure_dataset_archive", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ce, "default_horizons", lambda dataset_key: (20,))
+    monkeypatch.setattr(ce, "build_eval_config", lambda *args, **kwargs: cfg)
+
+    def fake_evaluate_checkpoint(*args, **kwargs):
+        captured["verbose"] = kwargs["verbose"]
+        return {
+            "forecast_test": {"crps": 1.25},
+            "balanced_summary": {"avg_hidden_crps": 2.5},
+        }
+
+    monkeypatch.setattr(ce, "evaluate_checkpoint", fake_evaluate_checkpoint)
+
+    ce.main()
+
+    out = capsys.readouterr().out
+    assert captured["verbose"] is False
+    assert cfg.VERBOSE is False
+    assert cfg.DEBUG is False
+    assert not out.lstrip().startswith("{")
+    assert "crypto_pred20: forecast_crps=1.25 avg_hidden_crps=2.5" in out
+
+
+def test_checkpoint_eval_main_print_json_is_opt_in(monkeypatch, capsys):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+
+    cfg = SimpleNamespace()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llapdiff-checkpoint-eval",
+            "--dataset-key",
+            "crypto",
+            "--checkpoint",
+            "model.pt",
+            "--print-json",
+            "--debug",
+        ],
+    )
+    monkeypatch.setattr(ce, "configure_dataset_archive", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ce, "default_horizons", lambda dataset_key: (20,))
+    monkeypatch.setattr(ce, "build_eval_config", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(
+        ce,
+        "evaluate_checkpoint",
+        lambda *args, **kwargs: {
+            "forecast_test": {"crps": 1.25},
+            "balanced_summary": {"avg_hidden_crps": 2.5},
+        },
+    )
+
+    ce.main()
+
+    out = capsys.readouterr().out
+    assert cfg.VERBOSE is True
+    assert cfg.DEBUG is True
+    assert out.lstrip().startswith("{")
+    assert '"forecast_test"' in out
 
 
 def test_checkpoint_eval_routes_sample_counts(monkeypatch, tmp_path):

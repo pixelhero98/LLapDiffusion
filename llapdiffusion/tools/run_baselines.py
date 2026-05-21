@@ -23,6 +23,17 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--target-col",
+        default=None,
+        help="Optional scalar target feature column. Defaults to the dataset cache target_col/target_cols.",
+    )
+    parser.add_argument(
+        "--target-cols",
+        nargs="+",
+        default=None,
+        help="Optional target feature columns for multi-target DLinear/PatchTST runs.",
+    )
+    parser.add_argument(
         "--input-policy",
         choices=("target_only", "all_features"),
         default="target_only",
@@ -38,6 +49,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         help="Fraction of observed target-horizon entries to hide for CSDI imputation comparisons.",
     )
     parser.add_argument("--allow-cache-copy", action="store_true")
+    parser.add_argument("--verbose", action="store_true", help="Print per-epoch baseline training progress.")
 
 
 def _parse_horizons(values: list[str] | None) -> tuple[int, ...] | str | None:
@@ -54,6 +66,9 @@ def _parse_horizons(values: list[str] | None) -> tuple[int, ...] | str | None:
 
 
 def _train_config(args: argparse.Namespace) -> TrainConfig:
+    if getattr(args, "target_col", None) and getattr(args, "target_cols", None):
+        raise SystemExit("Use either --target-col or --target-cols, not both.")
+    target_cols = tuple(args.target_cols) if getattr(args, "target_cols", None) else None
     return TrainConfig(
         source_root=args.source_root,
         output_dir=args.output_dir,
@@ -68,6 +83,9 @@ def _train_config(args: argparse.Namespace) -> TrainConfig:
         lr=args.lr,
         horizons=_parse_horizons(getattr(args, "horizons", None)) or "all",
         input_policy=args.input_policy,
+        target_col=args.target_col,
+        target_cols=target_cols,
+        verbose=bool(getattr(args, "verbose", False)),
     )
 
 
@@ -123,6 +141,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if getattr(args, "target_col", None) and getattr(args, "target_cols", None):
+        raise SystemExit("Use either --target-col or --target-cols, not both.")
     args.func(args)
 
 

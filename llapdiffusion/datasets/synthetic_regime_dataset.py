@@ -241,6 +241,8 @@ def run_experiment(
     pin_memory: Optional[bool] = None,
     split_policy: str = "global_purged_horizon",
     exact_timestamp_batches: bool = True,
+    target_col: Optional[str] = None,
+    target_cols: Optional[Sequence[str]] = None,
 ):
     paths = CachePaths.from_dir(data_dir)
     meta = _validate_cache(paths)
@@ -269,6 +271,8 @@ def run_experiment(
             horizon=H,
             update_meta=True,
             backup_old=False,
+            target_col=target_col,
+            target_cols=target_cols,
         )
 
     train_dl, val_dl, test_dl, lengths = _load_fin_ratio_split(
@@ -290,6 +294,8 @@ def run_experiment(
         horizon=H,
         split_policy=split_policy,
         exact_timestamp_batches=exact_timestamp_batches,
+        target_col=target_col,
+        target_cols=target_cols,
     )
     return train_dl, val_dl, test_dl, lengths
 

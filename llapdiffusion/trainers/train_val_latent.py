@@ -19,8 +19,16 @@ from torch.utils.data import DataLoader
 
 from llapdiffusion.configs import config
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
+from llapdiffusion.logging_utils import is_debug, is_verbose
 from llapdiffusion.latent_space.latent_vae import LatentVAE
 from llapdiffusion.latent_space.latent_vae_utils import normalize_and_check
+from llapdiffusion.models.llapdiff_utils import (
+    infer_target_dim_from_loader,
+    target_obs_mask_to_bhnc,
+    target_time_observed,
+    targets_to_bhnc,
+    vae_io_dims_for_target_dim,
+)
 
 
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
@@ -63,6 +71,8 @@ def _ensure_loaders(
             ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
             split_policy=getattr(config, "split_policy", "global_purged_horizon"),
             exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
+            target_col=None if getattr(config, "TARGET_COLS", None) else getattr(config, "TARGET_COL", None),
+            target_cols=getattr(config, "TARGET_COLS", None),
         )
     elif sizes is None:
         try:
@@ -108,16 +118,16 @@ def _prepare_latent_batch(
     """Build mask-aware tokens for set-VAE training.
 
     Args:
-      y:           [B, N, T] target trajectories (may include NaNs).
+      y:           [B, N, T] or [B, N, T, C] target trajectories (may include NaNs).
       entity_mask: [B, N] bool, True for real entities, False for padded.
-      y_obs_mask:  optional [B, N, T] bool target observation mask from the dataset.
+      y_obs_mask:  optional target observation mask from the dataset.
       p_drop:      additional random masking rate on observed entries.
       noise_std:   gaussian noise std added to observed values.
 
     Returns:
-      x_tok:      [B, T, N, 2] token = [value*keep_mask, keep_mask]
-      y_clean:    [B, N, T] clean values (NaNs replaced with 0)
-      obs:        [B, N, T] bool, original observation mask (finite & entity_mask)
+      x_tok:      [B, T, N, 2*C] token = [values*keep_mask, keep_mask]
+      y_clean:    [B, N, T, C] clean values (NaNs replaced with 0)
+      obs:        [B, N, T, C] bool, original observation mask (finite & entity_mask)
       entity_pad: [B, N] bool, True for padded/non-existent entities
     """
 
@@ -125,28 +135,16 @@ def _prepare_latent_batch(
         entity_mask = entity_mask.to(dtype=torch.bool)
     entity_mask = entity_mask.to(device=y.device)
 
-    if y_obs_mask is None:
-        obs = torch.isfinite(y)
-    else:
-        obs = torch.as_tensor(y_obs_mask, device=y.device, dtype=torch.bool)
-        if obs.dim() == 4 and obs.size(-1) == 1:
-            obs = obs.squeeze(-1)
-        if obs.shape != y.shape:
-            if obs.dim() == 3 and obs.size(0) == y.size(0) and obs.size(1) == y.size(2) and obs.size(2) == y.size(1):
-                obs = obs.permute(0, 2, 1).contiguous()
-            elif obs.dim() == 2 and obs.size(0) == y.size(0) and obs.size(1) == y.size(2):
-                obs = obs[:, None, :].expand_as(y)
-            else:
-                raise ValueError(f"y_obs_mask shape {tuple(obs.shape)} is incompatible with target shape {tuple(y.shape)}")
-        bad_observed = obs & ~torch.isfinite(y)
-        if bad_observed.any():
-            raise ValueError("y_obs_mask marks non-finite target values as observed")
-        obs = obs & torch.isfinite(y)
-    obs = obs & entity_mask[..., None]  # [B,N,T]
+    y_bhnc = targets_to_bhnc(y, entity_mask, device=y.device)
+    if y_bhnc is None:
+        raise ValueError(f"target shape {tuple(y.shape)} is incompatible with entity mask {tuple(entity_mask.shape)}")
+    obs_bhnc = target_obs_mask_to_bhnc(y_obs_mask, y_bhnc, entity_mask, device=y.device)
+    y_bntc = y_bhnc.permute(0, 2, 1, 3).contiguous()
+    obs = obs_bhnc.permute(0, 2, 1, 3).contiguous()
     if obs.sum().item() == 0:
         return None
 
-    y_clean = _nan_to_num(y)
+    y_clean = _nan_to_num(y_bntc)
 
     if p_drop > 0:
         keep = (torch.rand_like(y_clean) > p_drop) & obs
@@ -158,8 +156,8 @@ def _prepare_latent_batch(
     else:
         y_noisy = y_clean
 
-    x_tok = torch.stack([y_noisy * keep.float(), keep.float()], dim=-1)  # [B,N,T,2]
-    x_tok = x_tok.permute(0, 2, 1, 3).contiguous()  # -> [B,T,N,2]
+    x_tok = torch.cat([y_noisy * keep.float(), keep.float()], dim=-1)  # [B,N,T,2*C]
+    x_tok = x_tok.permute(0, 2, 1, 3).contiguous()  # -> [B,T,N,2*C]
 
     entity_pad = ~entity_mask
     return x_tok, y_clean, obs, entity_pad
@@ -206,6 +204,19 @@ def _masked_mse(
     balance_mode: str = "none",
 ) -> Tuple[torch.Tensor, int]:
     """Compute mean squared error over observed entries only."""
+    if y_hat.dim() + 1 == y_true.dim():
+        y_hat = y_hat.unsqueeze(-1)
+    if y_true.dim() + 1 == y_hat.dim():
+        y_true = y_true.unsqueeze(-1)
+    if obs.dim() + 1 == y_true.dim():
+        obs = obs.unsqueeze(-1)
+    if obs.shape != y_true.shape:
+        try:
+            obs = obs.expand_as(y_true)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"observation mask shape {tuple(obs.shape)} does not match target shape {tuple(y_true.shape)}"
+            ) from exc
     obs_f = obs.float()
     denom = int(obs_f.sum().item())
     if denom <= 0:
@@ -213,11 +224,18 @@ def _masked_mse(
 
     mode = str(balance_mode or "none").strip().lower()
     if mode in {"coverage", "coverage_balanced"}:
-        coverage = obs_f.mean(dim=-1).clamp_min(1.0 / max(1, obs_f.size(-1)))
-        valid_series = obs.any(dim=-1)
+        reduce_dims = tuple(range(2, obs_f.dim()))
+        total_slots = 1
+        for dim in reduce_dims:
+            total_slots *= max(1, obs_f.size(dim))
+        coverage = obs_f.mean(dim=reduce_dims).clamp_min(1.0 / total_slots)
+        valid_series = obs.any(dim=reduce_dims)
         inv_cov = torch.where(valid_series, 1.0 / coverage, torch.zeros_like(coverage))
         mean_weight = inv_cov[valid_series].mean().clamp_min(1e-6) if valid_series.any() else inv_cov.new_tensor(1.0)
-        obs_f = (inv_cov / mean_weight).clamp(max=10.0).unsqueeze(-1) * obs_f
+        weight = (inv_cov / mean_weight).clamp(max=10.0)
+        while weight.dim() < obs_f.dim():
+            weight = weight.unsqueeze(-1)
+        obs_f = weight * obs_f
 
     sq = (y_hat - y_true).pow(2) * obs_f
     return sq.sum() / obs_f.sum().clamp(min=1.0), denom
@@ -272,8 +290,8 @@ def _epoch_pass(
 
         with grad_ctx_factory():
             with autocast(enabled=amp_enabled):
-                y_hat_bt, mu, logvar = model(x_tok, entity_pad=entity_pad)  # [B,T,N,1]
-                y_hat = y_hat_bt.squeeze(-1).permute(0, 2, 1).contiguous()  # -> [B,N,T]
+                y_hat_bt, mu, logvar = model(x_tok, entity_pad=entity_pad)  # [B,T,N,C]
+                y_hat = y_hat_bt.permute(0, 2, 1, 3).contiguous()  # -> [B,N,T,C]
 
                 recon_loss, recon_count = _masked_mse(
                     y_hat,
@@ -284,7 +302,7 @@ def _epoch_pass(
 
                 kl_elem = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # [B,T,C]
                 kl_bt = kl_elem.sum(dim=-1)  # [B,T]
-                obs_any_bt = obs.any(dim=1)  # [B,T]
+                obs_any_bt = target_time_observed(obs.permute(0, 2, 1, 3).contiguous())  # [B,T]
                 kl_loss = kl_bt[obs_any_bt].mean() if obs_any_bt.any() else kl_bt.new_tensor(0.0)
 
                 cons_loss = y_hat.new_tensor(0.0)
@@ -387,6 +405,17 @@ def _ensure_vae_num_entities(loader: Iterable, config=config) -> None:
         setattr(config, "VAE_NUM_ENTITIES", _infer_num_entities(loader))
 
 
+def _ensure_vae_target_dims(loader: Iterable, config=config) -> int:
+    target_dim = int(getattr(config, "TARGET_DIM", 0) or 0)
+    if target_dim <= 0:
+        target_dim = infer_target_dim_from_loader(loader)
+        setattr(config, "TARGET_DIM", target_dim)
+    input_dim, output_dim = vae_io_dims_for_target_dim(config, target_dim)
+    setattr(config, "VAE_INPUT_DIM", input_dim)
+    setattr(config, "VAE_OUTPUT_DIM", output_dim)
+    return target_dim
+
+
 def _build_model(device: torch.device, config=config) -> LatentVAE:
     return LatentVAE(
         seq_len=config.PRED,
@@ -399,6 +428,7 @@ def _build_model(device: torch.device, config=config) -> LatentVAE:
         dec_heads=config.VAE_HEADS,
         dec_ff=config.VAE_FF,
         input_dim=int(getattr(config, "VAE_INPUT_DIM", 2)),
+        output_dim=int(getattr(config, "VAE_OUTPUT_DIM", 1)),
         dropout=float(getattr(config, "VAE_DROPOUT", 0.1)),
         num_entities=getattr(config, "VAE_NUM_ENTITIES", None),
         entity_conditioned=bool(getattr(config, "VAE_ENTITY_CONDITION", False)),
@@ -475,7 +505,7 @@ def collect_latent_means(
             _, mu, _ = model(x_tok, entity_pad=entity_pad)
             if not torch.isfinite(mu).all():
                 raise FloatingPointError("VAE encoder produced non-finite latent means")
-            obs_any = obs.any(dim=1)
+            obs_any = target_time_observed(obs.permute(0, 2, 1, 3).contiguous())
             if obs_any.any():
                 all_mu.append(mu[obs_any].detach().cpu())
             if max_batches is not None and (batch_idx + 1) >= max_batches:
@@ -568,6 +598,7 @@ def audit_checkpoint(
 
     (train_dl, val_dl, test_dl), sizes = _ensure_loaders(train_dl, val_dl, test_dl, sizes, config)
     _ensure_vae_num_entities(train_dl, config=config)
+    _ensure_vae_target_dims(train_dl, config=config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = _vae_amp_enabled(device, config=config)
     beta = float(getattr(config, "VAE_BETA", 0.0))
@@ -681,11 +712,17 @@ def run(
 ) -> Dict[str, object]:
     (train_dl, val_dl, test_dl), sizes = _ensure_loaders(train_dl, val_dl, test_dl, sizes, config)
     _ensure_vae_num_entities(train_dl, config=config)
-    _log_dataset_summary(train_dl, sizes)
+    target_dim = _ensure_vae_target_dims(train_dl, config=config)
+    verbose = is_verbose(config)
+    debug = is_debug(config)
+    if verbose:
+        _log_dataset_summary(train_dl, sizes)
+        print(f"VAE target_dim: {target_dim}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = _vae_amp_enabled(device, config=config)
-    print(f"Using device: {device}")
+    if verbose:
+        print(f"Using device: {device}")
     grad_clip = getattr(config, "GRAD_CLIP", 1.0)
 
     # Denoising / robustness knobs (defaults are safe if not present in config.py)
@@ -718,7 +755,8 @@ def run(
     max_patience = int(getattr(config, "VAE_MAX_PATIENCE", 0))
 
     if not plot_only:
-        print("Starting training.")
+        if verbose:
+            print("Starting VAE training.")
         for epoch in range(1, config.EPOCHS + 1):
             beta = _beta_for_epoch(
                 vae_beta,
@@ -760,11 +798,12 @@ def run(
             val_elbo_beta = val_recon + beta * val_kl
 
             cons_str = f", Cons {train_cons:.6f}" if cons_lambda > 0 else ""
-            print(
-                f"Epoch {epoch:03d}/{config.EPOCHS:03d} - β={beta:.6g} | "
-                f"Train β·ELBO {train_elbo_beta:.6f} [Recon {train_recon:.6f}, KL/sample {train_kl:.6f}{cons_str}] | "
-                f"Val β·ELBO {val_elbo_beta:.6f} [Recon {val_recon:.6f}, KL/sample {val_kl:.6f}]"
-            )
+            if verbose:
+                print(
+                    f"Epoch {epoch:03d}/{config.EPOCHS:03d} - β={beta:.6g} | "
+                    f"Train β·ELBO {train_elbo_beta:.6f} [Recon {train_recon:.6f}, KL/sample {train_kl:.6f}{cons_str}] | "
+                    f"Val β·ELBO {val_elbo_beta:.6f} [Recon {val_recon:.6f}, KL/sample {val_kl:.6f}]"
+                )
 
             improved_elbo = val_elbo_beta < 0.99 * best_val_elbo
             improved_recon = val_recon < 0.99 * best_val_recon
@@ -774,13 +813,15 @@ def run(
                 best_val_elbo = val_elbo_beta
                 best_elbo_path = _vae_checkpoint_path("elbo", config=config)
                 torch.save(model.state_dict(), best_elbo_path)
-                print("  -> Saved best β·ELBO checkpoint")
+                if debug:
+                    print("  -> Saved best beta-ELBO checkpoint")
 
             if checkpoint_ready and improved_recon:
                 best_val_recon = val_recon
                 best_recon_path = _vae_checkpoint_path("recon", config=config)
                 torch.save(model.state_dict(), best_recon_path)
-                print("  -> Saved best reconstruction checkpoint")
+                if debug:
+                    print("  -> Saved best reconstruction checkpoint")
 
             patience_counter = 0 if improved_elbo else (patience_counter + 1)
             if epoch >= min_epochs and patience_counter >= max_patience:
@@ -804,10 +845,12 @@ def run(
             break
 
     if checkpoint_to_load is not None:
-        print(f"Loading checkpoint: {checkpoint_to_load}")
+        if verbose:
+            print(f"Loading checkpoint: {checkpoint_to_load}")
         vae = _load_checkpoint_model(checkpoint_to_load, device, config=config)
     else:
-        print("No improved checkpoints saved; using the final training state.")
+        if verbose:
+            print("No improved checkpoints saved; using the final training state.")
         vae = model
 
     vae.eval()
@@ -838,7 +881,7 @@ def run(
     if all_mu:
         latents = torch.cat(all_mu, dim=0)
         plot_latents = bool(getattr(config, "VAE_PLOT_LATENTS", False))
-        normalize_and_check(latents, plot=plot_latents)
+        normalize_and_check(latents, plot=plot_latents, verbose=verbose)
     else:
         raise RuntimeError("No latent means collected from the training dataloader")
 
@@ -868,6 +911,9 @@ def run(
             "vae_consist_lambda": cons_lambda,
             "vae_entity_condition": bool(getattr(config, "VAE_ENTITY_CONDITION", False)),
             "vae_num_entities": getattr(config, "VAE_NUM_ENTITIES", None),
+            "vae_target_dim": int(getattr(config, "TARGET_DIM", 1)),
+            "vae_input_dim": int(getattr(config, "VAE_INPUT_DIM", 2)),
+            "vae_output_dim": int(getattr(config, "VAE_OUTPUT_DIM", 1)),
         },
         "model": vae,
     }

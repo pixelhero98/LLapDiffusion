@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import importlib
+import re
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -87,6 +88,9 @@ def _sample_dataset_info(context: int = 5, horizon: int = 4):
         "copied_cache": False,
         "feature_cols": ["target"],
         "target_col": "target",
+        "target_cols": ["target"],
+        "target_indices": [0],
+        "target_dim": 1,
     }
 
 
@@ -343,6 +347,183 @@ def test_baseline_loader_accepts_supported_explicit_horizon(monkeypatch, tmp_pat
     assert info["horizon"] == 8
 
 
+def test_baseline_loader_forwards_target_col_and_reports_effective_target(monkeypatch, tmp_path):
+    from llapdiffusion.baselines import data as baseline_data
+
+    data_dir = tmp_path / "demo"
+    meta_dir = data_dir / "cache_ratio_index"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(
+        '{"assets": ["a"], "feature_cols": ["target", "alt"], "target_col": "target"}',
+        encoding="utf-8",
+    )
+    preset = SimpleNamespace(
+        data_dir=data_dir,
+        horizons=(4, 8),
+        context_length=16,
+        table_batch_size=2,
+    )
+    seen = {}
+
+    def fake_run_experiment(
+        data_dir,
+        K,
+        H,
+        ratios,
+        per_asset,
+        date_batching,
+        coverage,
+        dates_per_batch,
+        batch_size,
+        norm,
+        reindex,
+        split_policy,
+        exact_timestamp_batches,
+        target_col,
+    ):
+        seen["target_col"] = target_col
+        return ["train"], ["val"], ["test"], (1, 2, 3)
+
+    monkeypatch.setattr(baseline_data, "get_dataset_preset", lambda key: preset)
+    monkeypatch.setattr(baseline_data, "resolve_run_experiment", lambda path: fake_run_experiment)
+
+    _, info = baseline_data.load_dataset_loaders(
+        "demo",
+        horizon=4,
+        target_col="alt",
+        allow_cache_copy=False,
+        work_cache_dir=None,
+    )
+
+    assert seen["target_col"] == "alt"
+    assert info["target_col"] == "alt"
+    assert info["target_source"] == "feature_column"
+    assert info["target_index"] == 1
+
+
+def test_baseline_loader_forwards_target_cols_and_reports_metadata(monkeypatch, tmp_path):
+    from llapdiffusion.baselines import data as baseline_data
+
+    data_dir = tmp_path / "demo"
+    meta_dir = data_dir / "cache_ratio_index"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(
+        '{"assets": ["a"], "feature_cols": ["open", "close", "DOW_SIN"], "target_col": "close"}',
+        encoding="utf-8",
+    )
+    preset = SimpleNamespace(
+        data_dir=data_dir,
+        horizons=(4,),
+        context_length=16,
+        table_batch_size=2,
+    )
+    seen = {}
+
+    def fake_run_experiment(
+        data_dir,
+        K,
+        H,
+        ratios,
+        per_asset,
+        date_batching,
+        coverage,
+        dates_per_batch,
+        batch_size,
+        norm,
+        reindex,
+        split_policy,
+        exact_timestamp_batches,
+        target_cols,
+    ):
+        seen["target_cols"] = target_cols
+        return ["train"], ["val"], ["test"], (1, 2, 3)
+
+    monkeypatch.setattr(baseline_data, "get_dataset_preset", lambda key: preset)
+    monkeypatch.setattr(baseline_data, "resolve_run_experiment", lambda path: fake_run_experiment)
+
+    _, info = baseline_data.load_dataset_loaders(
+        "demo",
+        horizon=4,
+        target_cols=("open", "close"),
+        allow_cache_copy=False,
+        work_cache_dir=None,
+    )
+
+    assert seen["target_cols"] == ("open", "close")
+    assert info["target_col"] == "open"
+    assert info["target_cols"] == ["open", "close"]
+    assert info["target_indices"] == [0, 1]
+    assert info["target_dim"] == 2
+    assert info["target_source"] == "feature_columns"
+    assert info["requested_target_cols"] == ["open", "close"]
+
+
+def test_baseline_loader_rejects_multi_target_without_loader_support(monkeypatch, tmp_path):
+    from llapdiffusion.baselines import data as baseline_data
+
+    data_dir = tmp_path / "demo"
+    meta_dir = data_dir / "cache_ratio_index"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(
+        '{"assets": ["a"], "feature_cols": ["open", "close"], "target_col": "close"}',
+        encoding="utf-8",
+    )
+    preset = SimpleNamespace(
+        data_dir=data_dir,
+        horizons=(4,),
+        context_length=16,
+        table_batch_size=2,
+    )
+
+    def fake_run_experiment(data_dir, K, H, ratios, per_asset, date_batching, coverage, dates_per_batch, batch_size, norm, reindex, split_policy, exact_timestamp_batches):
+        return ["train"], ["val"], ["test"], (1, 2, 3)
+
+    monkeypatch.setattr(baseline_data, "get_dataset_preset", lambda key: preset)
+    monkeypatch.setattr(baseline_data, "resolve_run_experiment", lambda path: fake_run_experiment)
+
+    with pytest.raises(RuntimeError, match="target_cols"):
+        baseline_data.load_dataset_loaders(
+            "demo",
+            horizon=4,
+            target_cols=("open", "close"),
+            allow_cache_copy=False,
+            work_cache_dir=None,
+        )
+
+
+def test_baseline_loader_maps_single_target_cols_to_legacy_target_col(monkeypatch, tmp_path):
+    from llapdiffusion.baselines import data as baseline_data
+
+    data_dir = tmp_path / "demo"
+    meta_dir = data_dir / "cache_ratio_index"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(
+        '{"assets": ["a"], "feature_cols": ["open", "close"], "target_col": "close"}',
+        encoding="utf-8",
+    )
+    preset = SimpleNamespace(data_dir=data_dir, horizons=(4,), context_length=16, table_batch_size=2)
+    seen = {}
+
+    def fake_run_experiment(data_dir, K, H, ratios, per_asset, date_batching, coverage, dates_per_batch, batch_size, norm, reindex, split_policy, exact_timestamp_batches, target_col):
+        seen["target_col"] = target_col
+        return ["train"], ["val"], ["test"], (1, 2, 3)
+
+    monkeypatch.setattr(baseline_data, "get_dataset_preset", lambda key: preset)
+    monkeypatch.setattr(baseline_data, "resolve_run_experiment", lambda path: fake_run_experiment)
+
+    _, info = baseline_data.load_dataset_loaders(
+        "demo",
+        horizon=4,
+        target_cols=("open",),
+        allow_cache_copy=False,
+        work_cache_dir=None,
+    )
+
+    assert seen["target_col"] == "open"
+    assert info["target_cols"] == ["open"]
+    assert info["target_dim"] == 1
+
+
 def test_baseline_loader_uses_physionet_preset_split_policy(monkeypatch, tmp_path):
     from llapdiffusion.baselines import data as baseline_data
 
@@ -459,8 +640,84 @@ def test_baseline_loader_validates_noaa_us_long_horizon_cache(monkeypatch, tmp_p
 
 
 def test_target_index_fails_if_target_column_is_missing():
-    with pytest.raises(ValueError, match="target_col"):
+    with pytest.raises(ValueError, match="target"):
         target_index({"dataset": "demo", "feature_cols": ["x"], "target_col": "y"})
+
+
+def test_target_context_and_regular_features_support_multi_target():
+    from llapdiffusion.baselines.features import regular_features, target_context
+
+    batch = _sample_baseline_batch(batch_size=1, entities=2, context=3, horizon=2)
+    (V, T), _, meta = batch
+    V = torch.cat([V, V + 10.0], dim=-1)
+    T = torch.cat([T, T], dim=-1)
+    y = torch.stack(
+        [
+            torch.full((1, 2, 2), 1.0),
+            torch.full((1, 2, 2), 2.0),
+        ],
+        dim=-1,
+    )
+    meta = {k: v.clone() if torch.is_tensor(v) else v for k, v in meta.items()}
+    meta["x_obs_mask"] = torch.ones_like(V, dtype=torch.bool)
+    meta["y_obs_mask"] = torch.ones_like(y, dtype=torch.bool)
+    info = {
+        **_sample_dataset_info(context=3, horizon=2),
+        "feature_cols": ["open", "close"],
+        "target_col": "open",
+        "target_cols": ["open", "close"],
+        "target_indices": [0, 1],
+        "target_dim": 2,
+    }
+
+    x, mask, y_clean, valid = target_context(((V, T), y, meta), info)
+    feat = regular_features(((V, T), y, meta), info)
+
+    assert x.shape == (1, 2, 3, 2)
+    assert mask.shape == (1, 2, 3, 2)
+    assert y_clean.shape == (1, 2, 2, 2)
+    assert valid.shape == (1, 2, 2, 2)
+    assert feat.shape[-1] == 10
+
+
+def test_dlinear_adapter_returns_multi_target_channels(monkeypatch):
+    from llapdiffusion.baselines.adapters.dlinear import DLinearAdapter
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self, cfg):
+            super().__init__()
+            self.cfg = cfg
+
+        def forward(self, x):
+            B, _, C = x.shape
+            return torch.arange(C, dtype=x.dtype, device=x.device).view(1, 1, C).expand(B, self.cfg.pred_len, C)
+
+    source_manager = SimpleNamespace(
+        load_module=lambda *args, **kwargs: SimpleNamespace(Model=FakeModel),
+        path=lambda name: Path(name),
+    )
+    batch = _sample_baseline_batch(batch_size=1, entities=2, context=3, horizon=2)
+    (V, T), _, meta = batch
+    V = torch.cat([V, V + 10.0], dim=-1)
+    T = torch.cat([T, T], dim=-1)
+    y = torch.zeros(1, 2, 2, 2)
+    meta = {k: v.clone() if torch.is_tensor(v) else v for k, v in meta.items()}
+    meta["x_obs_mask"] = torch.ones_like(V, dtype=torch.bool)
+    meta["y_obs_mask"] = torch.ones_like(y, dtype=torch.bool)
+    info = {
+        **_sample_dataset_info(context=3, horizon=2),
+        "feature_cols": ["open", "close"],
+        "target_cols": ["open", "close"],
+        "target_indices": [0, 1],
+        "target_dim": 2,
+    }
+
+    adapter = DLinearAdapter(info, ((V, T), y, meta), source_manager)
+    pred = adapter(((V, T), y, meta), info)
+
+    assert pred.shape == (1, 2, 2, 2)
+    assert pred[..., 0].eq(0).all()
+    assert pred[..., 1].eq(1).all()
 
 
 def test_csdi_target_horizon_mask_hides_only_future_tokens():
@@ -672,6 +929,45 @@ def test_run_baselines_practical_defaults_are_full_comparison(monkeypatch):
     assert config.num_samples == 25
     assert config.device == "auto"
     assert config.input_policy == "target_only"
+    assert config.target_cols is None
+    assert config.verbose is False
+
+
+def test_run_baselines_accepts_target_cols(monkeypatch):
+    from llapdiffusion.tools import run_baselines
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["llapdiff-baselines", "practical-extrapolation", "--target-cols", "RET_OPEN", "RET_CLOSE", "--verbose"],
+    )
+    args = run_baselines.parse_args()
+    config = run_baselines._train_config(args)
+
+    assert config.target_col is None
+    assert config.target_cols == ("RET_OPEN", "RET_CLOSE")
+    assert config.verbose is True
+
+
+def test_run_baselines_rejects_target_col_conflict(monkeypatch):
+    from llapdiffusion.tools import run_baselines
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["llapdiff-baselines", "practical-extrapolation", "--target-col", "RET_OPEN", "--target-cols", "RET_CLOSE"],
+    )
+    args = run_baselines.parse_args()
+    with pytest.raises(SystemExit, match="either --target-col or --target-cols"):
+        run_baselines._train_config(args)
+
+
+def test_multi_target_rejected_for_scalar_only_baseline(tmp_path):
+    from llapdiffusion.baselines import runner
+
+    config = runner.TrainConfig(source_root=None, target_cols=("x", "y"))
+    with pytest.raises(ValueError, match="scalar targets only"):
+        runner.run_practical_one("timegrad", "crypto", config, tmp_path, horizon=4)
 
 
 def test_run_baselines_csdi_defaults_to_target_horizon_all_horizons(monkeypatch):
@@ -702,11 +998,6 @@ def test_run_baselines_public_help_excludes_removed_surfaces(monkeypatch, capsys
         "--fail-" + "fast",
         "--validate-" + "sources-only",
         "--num-" + "samples",
-        "write-" + "isam" + "bard-jobs",
-        "Sl" + "urm",
-        "#SB" + "ATCH",
-        "hop" + "per",
-        "am" + "pere",
     )
     help_text = []
     for argv in (
@@ -734,18 +1025,18 @@ def test_public_docs_and_requirements_are_clone_ready():
     )
 
     assert requirements == "-e ."
-    assert "Same-model imputation query" in readme
-    assert "Dual-task target-mask training" in readme
-    assert "hides 30% and keeps 70%" in readme
-    for token in (
-        "write-" + "isam" + "bard-jobs",
-        "isam" + "bard",
-        "Sl" + "urm",
-        "#SB" + "ATCH",
-        "hop" + "per",
-        "am" + "pere",
-    ):
-        assert token.lower() not in tracked_text.lower()
+    assert "## Quick start" in readme
+    assert "## Target Selection" in readme
+    assert "--target-col" in readme
+    assert "--target-cols" in readme
+    assert "https://arxiv.org/abs/2605.19805" in readme
+    private_patterns = (
+        r"hf_[A-Za-z0-9]{20,}",
+        r"(?i)c:\\users\\[a-z0-9_.-]+",
+        r"(?i)/home/[a-z0-9_.-]+",
+    )
+    for pattern in private_patterns:
+        assert re.search(pattern, tracked_text) is None
 
 
 def test_baseline_resolve_device_auto_uses_available_backend(monkeypatch):

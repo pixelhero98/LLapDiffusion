@@ -423,6 +423,8 @@ def load_bms_dataloaders_with_ratio_split(
     *,
     split_policy: str = "global_purged_horizon",
     exact_timestamp_batches: bool = True,
+    target_col: Optional[str] = None,
+    target_cols: Optional[Sequence[str]] = None,
     **loader_kwargs,
 ):
     """Wrapper around the financial ratio-split loader for BMS datasets."""
@@ -431,6 +433,8 @@ def load_bms_dataloaders_with_ratio_split(
         data_dir=data_dir,
         split_policy=split_policy,
         exact_timestamp_batches=exact_timestamp_batches,
+        target_col=target_col,
+        target_cols=target_cols,
         **loader_kwargs,
     )
 
@@ -521,6 +525,8 @@ def run_experiment(
     pin_memory: Optional[bool] = None,
     split_policy: str = "global_purged_horizon",
     exact_timestamp_batches: bool = True,
+    target_col: Optional[str] = None,
+    target_cols: Optional[Sequence[str]] = None,
 ):
     """Build train/val/test loaders for the prepared BMS cache.
 
@@ -557,6 +563,8 @@ def run_experiment(
             horizon=H,
             update_meta=False,
             backup_old=False,
+            target_col=target_col,
+            target_cols=target_cols,
         )
 
     if needs_update:
@@ -584,6 +592,8 @@ def run_experiment(
         horizon=H,
         split_policy=split_policy,
         exact_timestamp_batches=exact_timestamp_batches,
+        target_col=target_col,
+        target_cols=target_cols,
         shuffle_train=shuffle_train,
         num_workers=num_workers,
         pin_memory=pin_memory,

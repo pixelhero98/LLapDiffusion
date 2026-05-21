@@ -29,6 +29,10 @@ from torch.utils.data import DataLoader, Dataset, Sampler as _Sampler
 
 from llapdiffusion.datasets._types import PathLike
 from llapdiffusion.datasets._normalization import NormalizationStatsAccumulator
+from llapdiffusion.datasets.target_selection import (
+    finance_calendar_feature_cols_from_names,
+    resolve_target_selection,
+)
 
 # --------------------- Public cache configs ---------------------
 
@@ -59,6 +63,7 @@ class FeatureConfig:
     include_gap: bool = False
     include_hl_range: bool = False
     target_field: str = "Close"     # used for Y
+    target_col: Optional[str] = None
     if_calendar: bool = True
     calendar: Optional[CalendarConfig] = None
     include_entity_id_feature: bool = False
@@ -396,7 +401,7 @@ def prepare_features_and_index_cache(
     paths = CachePaths.from_dir(data_dir)
     paths.data_dir.mkdir(parents=True, exist_ok=True)
     paths.ensure()
-    target_col = f"RET_{feature_cfg.target_field.upper()}"
+    target_col = feature_cfg.target_col or f"RET_{feature_cfg.target_field.upper()}"
 
     # ---- download / load features per ticker (reuses your feature logic) ----
     need_price_cols = set(feature_cfg.price_fields) | {feature_cfg.target_field}
@@ -538,9 +543,12 @@ def prepare_features_and_index_cache(
 
     col_sets = [set(df.columns) for df in per_ticker.values()]
     feature_cols = sorted(list(set.intersection(*col_sets)))
-    target_col = f"RET_{feature_cfg.target_field.upper()}"
+    target_col = feature_cfg.target_col or f"RET_{feature_cfg.target_field.upper()}"
     if target_col not in feature_cols:
-        raise ValueError(f"Target column '{target_col}' not in common features. Add '{feature_cfg.target_field}' to cfg.price_fields.")
+        raise ValueError(f"Target column '{target_col}' not in common features.")
+    calendar_feature_cols = finance_calendar_feature_cols_from_names(feature_cols)
+    if target_col in set(calendar_feature_cols):
+        raise ValueError(f"Target column '{target_col}' is a calendar feature and cannot be used as a financial target.")
 
     # ---- Save compact arrays ----
     # Per-ticker matrices: X[t] shape [T,F] float16, Y[t] shape [T] float16, times[t] datetime64
@@ -618,7 +626,11 @@ def prepare_features_and_index_cache(
         'asset2id': {a:i for i,a in enumerate(assets)},
         'start': start, 'end': end,
         'window': int(window), 'horizon': int(horizon),
-        'feature_cols': feature_cols, 'target_col': target_col,
+        'feature_cols': feature_cols,
+        'target_col': target_col,
+        'target_cols': [target_col],
+        'target_source': 'cache_target',
+        'calendar_feature_cols': list(calendar_feature_cols),
         'feature_cfg': {
             'price_fields': feature_cfg.price_fields,
             'returns_mode': feature_cfg.returns_mode,
@@ -631,6 +643,7 @@ def prepare_features_and_index_cache(
             'include_gap': feature_cfg.include_gap,
             'include_hl_range': feature_cfg.include_hl_range,
             'target_field': feature_cfg.target_field,
+            'target_col': feature_cfg.target_col,
         },
         'normalize_per_ticker': bool(normalize_per_ticker),
         'clamp_sigma': float(clamp_sigma),
@@ -664,6 +677,8 @@ def rebuild_window_index_only(
     max_windows_per_ticker: Optional[int] = None,
     update_meta: bool = True,
     backup_old: bool = True,
+    target_col: Optional[str] = None,
+    target_cols: Optional[Sequence[str]] = None,
 ) -> int:
     """
     Rebuilds windows/global_pairs.npy and windows/end_times.npy for a NEW (K,H)
@@ -680,6 +695,9 @@ def rebuild_window_index_only(
     with meta_path.open("r") as f:
         meta = json.load(f)
     assets = meta["assets"]
+    target_selection = resolve_target_selection(meta, target_col, requested_target_cols=target_cols)
+    target_indices = list(target_selection.target_indices)
+    feature_target_source = target_selection.target_source != "cache_target"
 
     pairs_list, ends_list = [], []
     for aid in range(len(assets)):
@@ -687,7 +705,18 @@ def rebuild_window_index_only(
         if not tp.exists():
             continue
         times = np.load(tp)  # datetime64[ns]
-        targets = np.load(paths.targets / f"{aid}.npy").astype(np.float32)
+        if feature_target_source:
+            features = np.load(paths.features / f"{aid}.npy", allow_pickle=False)
+            obs_path = paths.obs_masks / f"{aid}.npy"
+            if obs_path.exists():
+                obs = np.load(obs_path, allow_pickle=False)[:, target_indices].astype(bool, copy=False)
+            else:
+                obs = np.isfinite(features[:, target_indices])
+        else:
+            targets = np.load(paths.targets / f"{aid}.npy", allow_pickle=False).astype(np.float32, copy=False)
+            if targets.ndim == 1:
+                targets = targets[:, None]
+            obs = np.isfinite(targets)
         T = int(times.shape[0])
         min_required = window + horizon
         if T < min_required:
@@ -696,7 +725,9 @@ def rebuild_window_index_only(
         if max_windows_per_ticker is not None and starts.size > max_windows_per_ticker:
             starts = starts[:max_windows_per_ticker]
         if horizon > 0:
-            obs = np.isfinite(targets)
+            if obs.ndim == 1:
+                obs = obs[:, None]
+            obs = obs.any(axis=1)
             future_obs = sliding_window_view(obs, window_shape=horizon)
             valid = future_obs[window : window + starts.size].any(axis=1)
             starts = starts[valid]
@@ -726,6 +757,18 @@ def rebuild_window_index_only(
     if update_meta:
         meta["window"] = int(window)
         meta["horizon"] = int(horizon)
+        if "target_cols" not in meta and meta.get("target_col"):
+            meta["target_cols"] = [str(meta["target_col"])]
+        meta["selected_target_cols"] = list(target_selection.target_cols)
+        meta["selected_target_indices"] = list(target_selection.target_indices)
+        meta["selected_target_dim"] = int(target_selection.target_dim)
+        meta["selected_target_source"] = target_selection.target_source
+        meta["requested_target_cols"] = (
+            list(target_selection.requested_target_cols)
+            if target_selection.requested_target_cols is not None
+            else None
+        )
+        meta["calendar_feature_cols"] = list(target_selection.calendar_feature_cols)
         with meta_path.open("w") as f:
             json.dump(meta, f, indent=2)
 
@@ -750,7 +793,7 @@ def make_collate_level_and_firstdiff(
     Replacement collate_fn that keeps metadata used by LLapDiff training/eval:
       - entity_mask: [B,N] bool
       - x_obs_mask:  [B,N,K] or [B,N,K,F] (if present)
-      - y_obs_mask:  [B,N,H] bool (if present)
+      - y_obs_mask:  [B,N,H] or [B,N,H,C] bool (if present)
       - delta_t:     [B,N,K] float
       - delta_t_y:   [B,N,H] float
 
@@ -824,7 +867,7 @@ def make_collate_level_and_firstdiff(
             if V is None or T is None or y is None:
                 raise KeyError("Sample must contain V/T/y (or aliases).")
 
-            # expected shapes per entity sample: [K,F], [K,F], [H]
+            # expected shapes per entity sample: [K,F], [K,F], [H] or [H,C]
             if y.ndim == 2 and y.shape[-1] == 1:
                 y = y[..., 0]
 
@@ -853,6 +896,7 @@ def make_collate_level_and_firstdiff(
         # Infer dimensions
         K, F = V_list[0].shape
         H = y_list[0].shape[0]
+        y_tail_shape = tuple(y_list[0].shape[1:])
 
         def _infer_batch_key(ctx_times, y_times):
             for raw_times in (ctx_times, y_times):
@@ -885,13 +929,14 @@ def make_collate_level_and_firstdiff(
 
         V = np.stack(V_list, axis=0)   # [M,K,F]
         T = np.stack(T_list, axis=0)   # [M,K,F]
-        y = np.stack(y_list, axis=0)   # [M,H]
+        y = np.stack(y_list, axis=0)   # [M,H] or [M,H,C]
 
         # entity mask: mark seen asset_ids
         entity_mask = np.zeros((B, int(n_entities)), dtype=bool)
         V_full = np.zeros((B, int(n_entities), K, F), dtype=np.float32)
         T_full = np.zeros((B, int(n_entities), K, F), dtype=np.float32)
-        y_full = np.zeros((B, int(n_entities), H), dtype=np.float32)
+        y_full_shape = (B, int(n_entities), H, *y_tail_shape)
+        y_full = np.zeros(y_full_shape, dtype=np.float32)
 
         x_obs_full = None
         y_obs_full = None
@@ -903,7 +948,7 @@ def make_collate_level_and_firstdiff(
             else:
                 x_obs_full = np.zeros((B, int(n_entities), *np.asarray(xm).shape), dtype=bool)
         if any(m is not None for m in y_obs_list):
-            y_obs_full = np.zeros((B, int(n_entities), H), dtype=bool)
+            y_obs_full = np.zeros(y_full_shape, dtype=bool)
 
         delta_t = np.zeros((B, int(n_entities), K), dtype=np.float32)
         delta_t_y = np.zeros((B, int(n_entities), H), dtype=np.float32)
@@ -1013,6 +1058,10 @@ class _IndexBackedDataset(Dataset):
                  clamp_sigma: float,
                  native_time_scale_seconds: float = 1.0,
                  native_time_scale_name: str = "1s",
+                 target_index: int = 0,
+                 target_indices: Optional[Sequence[int]] = None,
+                 target_dim: int = 1,
+                 target_source: str = "cache_target",
                  ): 
         self.pairs = pairs
         self.assets = assets
@@ -1028,6 +1077,14 @@ class _IndexBackedDataset(Dataset):
             nts = 1.0
         self.native_time_scale_seconds = nts
         self.native_time_scale_name = str(native_time_scale_name)
+        if target_indices is None:
+            target_indices = (int(target_index),)
+        self.target_indices = tuple(int(idx) for idx in target_indices)
+        if not self.target_indices:
+            raise ValueError("target_indices must be non-empty.")
+        self.target_index = int(self.target_indices[0])
+        self.target_dim = len(self.target_indices)
+        self.target_source = str(target_source)
 
         # Cache per-asset arrays lazily. We avoid mmap here because keeping
         # train/val/test datasets alive at once can exhaust the default open-file
@@ -1074,23 +1131,59 @@ class _IndexBackedDataset(Dataset):
         if obs_slice is None:
             obs_slice = np.isfinite(x)
         fill_slice = Fill[s:e] if Fill is not None else obs_slice
+        target_source = getattr(self, "target_source", "cache_target")
+        target_indices = tuple(int(idx) for idx in getattr(self, "target_indices", (getattr(self, "target_index", 0),)))
+        target_dim = int(getattr(self, "target_dim", len(target_indices) or 1))
         
-        y_vec = Yf[e:e+self.horizon].astype(np.float32)  # [H]
-        y_obs_mask = np.isfinite(y_vec)
-        raw_last_for_label = float(y_vec[-1]) if y_vec.size else 0.0
+        if target_source in {"feature_column", "feature_columns"}:
+            y_raw = Xf[e:e+self.horizon, list(target_indices)].astype(np.float32)
+            if Obs is not None and Obs.ndim == 2 and max(target_indices, default=-1) < Obs.shape[1]:
+                y_obs_mask = Obs[e:e+self.horizon, list(target_indices)].astype(bool)
+            else:
+                y_obs_mask = np.isfinite(y_raw)
+            y_vec = y_raw
+        else:
+            y_vec = Yf[e:e+self.horizon].astype(np.float32)  # [H]
+            y_obs_mask = np.isfinite(y_vec)
+        if target_dim == 1 and np.ndim(y_vec) == 2:
+            y_vec = y_vec[:, 0]
+            y_obs_mask = y_obs_mask[:, 0]
+        y_for_label = np.asarray(y_vec)
+        raw_last_for_label = (
+            float(y_for_label.reshape(y_for_label.shape[0], -1)[-1, 0]) if y_for_label.size else 0.0
+        )
 
 
         # Normalize + clamp (train-style). Use per-ticker or global stats
         if self.per_ticker:
             mx = np.array(self.mean_x[aid], dtype=np.float32)   # [1,1,F]
             sx = np.array(self.std_x[aid],  dtype=np.float32)
-            my = float(self.mean_y[aid]) if isinstance(self.mean_y, list) else float(self.mean_y)
-            sy = float(self.std_y[aid])  if isinstance(self.std_y, list)  else float(self.std_y)
+            if target_source in {"feature_column", "feature_columns"}:
+                my = mx.reshape(-1)[list(target_indices)].astype(np.float32)
+                sy = sx.reshape(-1)[list(target_indices)].astype(np.float32)
+            else:
+                my = float(self.mean_y[aid]) if isinstance(self.mean_y, list) else float(self.mean_y)
+                sy = float(self.std_y[aid])  if isinstance(self.std_y, list)  else float(self.std_y)
         else:
             mx = np.array(self.mean_x, dtype=np.float32)        # [1,1,F]
             sx = np.array(self.std_x,  dtype=np.float32)
-            my = float(self.mean_y)
-            sy = float(self.std_y)
+            if target_source in {"feature_column", "feature_columns"}:
+                my = mx.reshape(-1)[list(target_indices)].astype(np.float32)
+                sy = sx.reshape(-1)[list(target_indices)].astype(np.float32)
+            else:
+                my = float(self.mean_y)
+                sy = float(self.std_y)
+        my = np.asarray(my, dtype=np.float32)
+        sy = np.asarray(sy, dtype=np.float32)
+        sy = np.where(np.isfinite(sy) & (sy != 0.0), sy, 1.0).astype(np.float32)
+        if target_dim == 1:
+            my = float(my.reshape(-1)[0])
+            sy = float(sy.reshape(-1)[0])
+        elif y_vec.ndim == 1:
+            y_vec = y_vec[:, None]
+            y_obs_mask = y_obs_mask[:, None]
+        if np.isscalar(sy) and (not np.isfinite(sy) or sy == 0.0):
+            sy = 1.0
         lo, hi = mx - self.clamp_sigma * sx, mx + self.clamp_sigma * sx
         x = np.clip(x, lo[0,0], hi[0,0], out=x)
         x = (x - mx[0,0]) / sx[0,0]
@@ -1500,6 +1593,8 @@ def load_dataloaders_with_ratio_split(
     horizon: Optional[int] = None,
     split_policy: str = "global_purged_horizon",
     exact_timestamp_batches: bool = True,
+    target_col: Optional[str] = None,
+    target_cols: Optional[Sequence[str]] = None,
 ):
     paths = CachePaths.from_dir(data_dir)
 
@@ -1507,6 +1602,7 @@ def load_dataloaders_with_ratio_split(
     with paths.meta.open('r') as f:
         meta = json.load(f)
     assets = meta['assets']
+    target_selection = resolve_target_selection(meta, target_col, requested_target_cols=target_cols)
     base_window = int(meta['window'])
     base_horizon = int(meta['horizon'])
     window = int(window if window is not None else base_window)
@@ -1606,15 +1702,27 @@ def load_dataloaders_with_ratio_split(
     ds_tr = _IndexBackedDataset(tr_pairs, assets, data_dir, window, horizon, regression,
                                 keep_time_meta, norm_stats, clamp_sigma=float(meta.get('clamp_sigma', 5.0)),
                                 native_time_scale_seconds=float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
-                                native_time_scale_name=str(meta.get('native_time_scale', native_time_scale_name)))
+                                native_time_scale_name=str(meta.get('native_time_scale', native_time_scale_name)),
+                                target_index=target_selection.target_index,
+                                target_indices=target_selection.target_indices,
+                                target_dim=target_selection.target_dim,
+                                target_source=target_selection.target_source)
     ds_va = _IndexBackedDataset(va_pairs, assets, data_dir, window, horizon, regression,
                                 keep_time_meta, norm_stats, clamp_sigma=float(meta.get('clamp_sigma', 5.0)),
                                 native_time_scale_seconds=float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
-                                native_time_scale_name=str(meta.get('native_time_scale', native_time_scale_name)))
+                                native_time_scale_name=str(meta.get('native_time_scale', native_time_scale_name)),
+                                target_index=target_selection.target_index,
+                                target_indices=target_selection.target_indices,
+                                target_dim=target_selection.target_dim,
+                                target_source=target_selection.target_source)
     ds_te = _IndexBackedDataset(te_pairs, assets, data_dir, window, horizon, regression,
                                 keep_time_meta, norm_stats, clamp_sigma=float(meta.get('clamp_sigma', 5.0)),
                                 native_time_scale_seconds=float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
-                                native_time_scale_name=str(meta.get('native_time_scale', native_time_scale_name)))
+                                native_time_scale_name=str(meta.get('native_time_scale', native_time_scale_name)),
+                                target_index=target_selection.target_index,
+                                target_indices=target_selection.target_indices,
+                                target_dim=target_selection.target_dim,
+                                target_source=target_selection.target_source)
 
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
@@ -1702,6 +1810,8 @@ def run_experiment(
     reindex=True,         # set False if NOT using date batching and you don’t need to rebuild end_times
     split_policy: str = "global_purged_horizon",
     exact_timestamp_batches: bool = True,
+    target_col: Optional[str] = None,
+    target_cols: Optional[Sequence[str]] = None,
 ):
     """
     Builds loaders for a given (K, H) using the already-downloaded cache.
@@ -1709,7 +1819,15 @@ def run_experiment(
     - Coverage threshold is applied per day; panel width is auto-detected from the cache.
     """
     if reindex:
-        rebuild_window_index_only(data_dir, window=K, horizon=H, update_meta=True, backup_old=False)
+        rebuild_window_index_only(
+            data_dir,
+            window=K,
+            horizon=H,
+            update_meta=True,
+            backup_old=False,
+            target_col=target_col,
+            target_cols=target_cols,
+        )
 
     train_dl, val_dl, test_dl, lengths = load_dataloaders_with_ratio_split(
         data_dir=data_dir,
@@ -1727,6 +1845,8 @@ def run_experiment(
         horizon=H,
         split_policy=split_policy,
         exact_timestamp_batches=exact_timestamp_batches,
+        target_col=target_col,
+        target_cols=target_cols,
     )
 
     return train_dl, val_dl, test_dl, lengths

@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Sequence
 
 import torch
 
@@ -16,20 +16,37 @@ from llapdiffusion.configs.dataset_archives import configure_dataset_archive
 from llapdiffusion.configs.config_utils import clone_config, make_jsonable
 from llapdiffusion.configs.dataset_defaults import apply_dataset_preset, dataset_keys, default_horizons
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
+from llapdiffusion.datasets.target_selection import resolve_target_selection
+from llapdiffusion.logging_utils import apply_verbosity, is_verbose
 
 from llapdiffusion.latent_space.latent_vae import LatentVAE
 from llapdiffusion.models.summarizer import LaplaceAE
 from llapdiffusion.models.llapdiff_utils import (
     decode_latents_with_vae,
     encode_mu_norm,
+    infer_target_dim_from_loader,
     pack_targets_tokens,
     set_torch,
+    target_time_observed,
+    targets_to_bhnc,
+    vae_io_dims_for_target_dim,
 )
 
 
-def build_eval_config(dataset_key: str, pred: int) -> SimpleNamespace:
+def build_eval_config(
+    dataset_key: str,
+    pred: int,
+    *,
+    target_col: str | None = None,
+    target_cols: Sequence[str] | None = None,
+) -> SimpleNamespace:
     cfg = clone_config()
-    return apply_dataset_preset(cfg, dataset_key, pred=pred)
+    apply_dataset_preset(cfg, dataset_key, pred=pred)
+    if target_col and target_cols:
+        raise ValueError("Use either target_col or target_cols, not both.")
+    cfg.TARGET_COL = target_col
+    cfg.TARGET_COLS = list(target_cols) if target_cols else None
+    return cfg
 
 
 def _enforce_valid_keep_mask(obs_any: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
@@ -148,8 +165,55 @@ def _with_imputation_metric_target(metrics: Dict[str, float]) -> Dict[str, objec
     return tagged
 
 
-def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, train_dl):
-    _, num_entities, window_size, feat_dim = tv._summarize_dataset(train_dl, None)
+def _target_policy(cfg: SimpleNamespace) -> Dict[str, object]:
+    requested = getattr(cfg, "TARGET_COL", None)
+    requested_cols = getattr(cfg, "TARGET_COLS", None)
+    meta_path = Path(str(getattr(cfg, "DATA_DIR", ""))) / "cache_ratio_index" / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        selected = resolve_target_selection(
+            meta,
+            None if requested_cols else requested,
+            requested_target_cols=requested_cols,
+        )
+        return {
+            "target_col": selected.target_col,
+            "target_cols": list(selected.target_cols),
+            "target_indices": list(selected.target_indices),
+            "target_dim": selected.target_dim,
+            "target_source": selected.target_source,
+            "requested_target_col": selected.requested_target_col,
+            "requested_target_cols": list(selected.requested_target_cols or []),
+            "calendar_feature_cols": list(selected.calendar_feature_cols),
+        }
+    except Exception as exc:
+        if requested not in (None, "") or requested_cols not in (None, "", []):
+            raise ValueError("Could not resolve requested target columns.") from exc
+        return {
+            "target_col": requested,
+            "target_cols": (
+                list(requested_cols)
+                if requested_cols
+                else ([requested] if requested else [])
+            ),
+            "target_indices": [],
+            "target_dim": 1,
+            "target_source": "unresolved",
+            "requested_target_col": requested,
+            "requested_target_cols": list(requested_cols) if requested_cols else [],
+            "calendar_feature_cols": [],
+        }
+
+
+def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, train_dl, *, verbose: bool = False):
+    _, num_entities, window_size, feat_dim = tv._summarize_dataset(train_dl, None, verbose=verbose)
+    target_dim = int(getattr(cfg, "TARGET_DIM", 0) or 0)
+    if target_dim <= 0:
+        target_dim = infer_target_dim_from_loader(train_dl)
+        setattr(cfg, "TARGET_DIM", target_dim)
+    vae_input_dim, vae_output_dim = vae_io_dims_for_target_dim(cfg, target_dim)
+    setattr(cfg, "VAE_INPUT_DIM", vae_input_dim)
+    setattr(cfg, "VAE_OUTPUT_DIM", vae_output_dim)
 
     vae = LatentVAE(
         seq_len=cfg.PRED,
@@ -161,7 +225,8 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
         dec_layers=cfg.VAE_LAYERS,
         dec_heads=cfg.VAE_HEADS,
         dec_ff=cfg.VAE_FF,
-        input_dim=int(getattr(cfg, "VAE_INPUT_DIM", 2)),
+        input_dim=vae_input_dim,
+        output_dim=vae_output_dim,
         num_entities=num_entities,
         entity_conditioned=bool(getattr(cfg, "VAE_ENTITY_CONDITION", False)),
     ).to(device)
@@ -273,7 +338,7 @@ def _evaluate_impute_case(
         if x_tok is None or not obs.any():
             continue
 
-        obs_any = obs.any(dim=2)
+        obs_any = target_time_observed(obs)
         keep_mask = keep_fn(obs_any)
         valid_seq = keep_mask.any(dim=1) & (obs_any & (~keep_mask)).any(dim=1)
         if not valid_seq.any():
@@ -341,15 +406,15 @@ def _evaluate_impute_case(
 
         all_samples = torch.stack(all_samples, dim=0)
         point_forecast = all_samples.mean(dim=0)
-        y_true = (
-            torch.nan_to_num(yb, nan=0.0, posinf=0.0, neginf=0.0)
-            .permute(0, 2, 1)
-            .contiguous()
-            .unsqueeze(-1)
+        y_true = torch.nan_to_num(
+            targets_to_bhnc(yb, mask_bn, device=device),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
 
-        hidden_valid = (obs & (~keep_mask.unsqueeze(-1))).unsqueeze(-1).to(dtype=y_true.dtype)
-        observed_valid = (obs & keep_mask.unsqueeze(-1)).unsqueeze(-1).to(dtype=y_true.dtype)
+        hidden_valid = (obs & (~keep_mask[:, :, None, None])).to(dtype=y_true.dtype)
+        observed_valid = (obs & keep_mask[:, :, None, None]).to(dtype=y_true.dtype)
 
         res_hidden = (point_forecast - y_true) * hidden_valid
         abs_sum += res_hidden.abs().sum().item()
@@ -407,8 +472,10 @@ def evaluate_checkpoint(
     forecast_num_samples: Optional[int] = None,
     imputation_num_samples: Optional[int] = None,
     max_eval_batches: Optional[int] = None,
+    verbose: Optional[bool] = None,
 ) -> Dict[str, object]:
     ckpt_path = Path(ckpt_path)
+    verbose = is_verbose(cfg) if verbose is None else bool(verbose)
     if random_mask_ratio is None:
         random_mask_ratio = float(getattr(cfg, "IMPUTATION_RANDOM_MASK_RATIO", 0.30))
     random_mask_ratio = _validate_random_mask_ratio(random_mask_ratio)
@@ -432,10 +499,12 @@ def evaluate_checkpoint(
         ratios=(cfg.train_ratio, cfg.val_ratio, cfg.test_ratio),
         split_policy=getattr(cfg, "split_policy", "global_purged_horizon"),
         exact_timestamp_batches=bool(getattr(cfg, "exact_timestamp_batches", True)),
+        target_col=None if getattr(cfg, "TARGET_COLS", None) else getattr(cfg, "TARGET_COL", None),
+        target_cols=getattr(cfg, "TARGET_COLS", None),
     )
-    if sizes is not None:
+    if verbose and sizes is not None:
         print("eval sizes:", tuple(sizes))
-    diff_model, vae, summarizer, mu_mean, mu_std = _load_stack(cfg, ckpt_path, device, train_dl)
+    diff_model, vae, summarizer, mu_mean, mu_std = _load_stack(cfg, ckpt_path, device, train_dl, verbose=verbose)
     test_sampling = tv._sampling_kwargs(cfg, prefix="TEST")
     forecast_cfg = _config_with_num_eval_samples(cfg, forecast_samples)
 
@@ -451,6 +520,7 @@ def evaluate_checkpoint(
         ema=None,
         self_cond=bool(getattr(cfg, "SELF_COND", False)),
         generator_seed=generator_seed,
+        verbose=verbose,
         **test_sampling,
     )
     regular = _with_imputation_metric_target(_evaluate_impute_case(
@@ -471,7 +541,7 @@ def evaluate_checkpoint(
         dynamic_thresh_max=float(test_sampling["dynamic_thresh_max"]),
         rho=float(test_sampling["rho"]),
         generator_seed=generator_seed,
-        progress_label="regular_keep25",
+        progress_label="regular_keep25" if verbose else None,
     ))
     random_keep_generator = torch.Generator(device=device)
     random_keep_generator.manual_seed(1234)
@@ -493,7 +563,7 @@ def evaluate_checkpoint(
         dynamic_thresh_max=float(test_sampling["dynamic_thresh_max"]),
         rho=float(test_sampling["rho"]),
         generator_seed=None if generator_seed is None else int(generator_seed) + 100003,
-        progress_label="random_mask",
+        progress_label="random_mask" if verbose else None,
     ))
 
     result = {
@@ -501,6 +571,10 @@ def evaluate_checkpoint(
         "checkpoint": str(ckpt_path),
         "benchmark_protocol": llapdiff_protocol_metadata(),
         "data_policy": {
+            **_target_policy(cfg),
+            "target_dim": int(getattr(cfg, "TARGET_DIM", 1)),
+            "vae_input_dim": int(getattr(cfg, "VAE_INPUT_DIM", 2)),
+            "vae_output_dim": int(getattr(cfg, "VAE_OUTPUT_DIM", 1)),
             "split_policy": getattr(cfg, "split_policy", "global_purged_horizon"),
             "split_scope": getattr(cfg, "split_scope", "global_target_time"),
             "batching_policy": (
@@ -529,7 +603,8 @@ def evaluate_checkpoint(
     if out_path is not None:
         out_file = Path(out_path)
         out_file.write_text(json.dumps(make_jsonable(result), indent=2))
-        print(out_file)
+        if verbose:
+            print(out_file)
     return result
 
 
@@ -559,6 +634,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint path to evaluate.")
     parser.add_argument("--label", type=str, default=None, help="Optional label for the evaluation payload.")
     parser.add_argument("--out-json", type=str, default=None, help="Optional JSON output path.")
+    parser.add_argument(
+        "--target-col",
+        type=str,
+        default=None,
+        help="Optional scalar target feature column. Defaults to the dataset cache target_col.",
+    )
+    parser.add_argument(
+        "--target-cols",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional target feature columns for multi-target evaluation.",
+    )
+    parser.add_argument("--print-json", action="store_true", help="Print the full evaluation JSON to stdout.")
+    parser.add_argument("--verbose", action="store_true", help="Print extra evaluation progress details.")
+    parser.add_argument("--debug", action="store_true", help="Print verbose diagnostics.")
     parser.add_argument(
         "--num-samples",
         type=int,
@@ -608,7 +699,10 @@ def main() -> None:
     args = _parse_args()
     configure_dataset_archive(args.dataset_zip, args.dataset_extract_dir)
     pred = int(args.pred) if args.pred is not None else int(default_horizons(args.dataset_key)[-1])
-    cfg = build_eval_config(args.dataset_key, pred)
+    if args.target_col and args.target_cols:
+        raise ValueError("Use either --target-col or --target-cols, not both.")
+    cfg = build_eval_config(args.dataset_key, pred, target_col=args.target_col, target_cols=args.target_cols)
+    apply_verbosity(cfg, verbose=args.verbose, debug=args.debug)
     label = args.label or f"{args.dataset_key}_pred{pred}"
     result = evaluate_checkpoint(
         cfg,
@@ -620,8 +714,19 @@ def main() -> None:
         forecast_num_samples=args.forecast_num_samples,
         imputation_num_samples=args.imputation_num_samples,
         max_eval_batches=args.max_eval_batches,
+        verbose=args.verbose or args.debug,
     )
-    print(json.dumps(make_jsonable(result), indent=2))
+    if args.print_json:
+        print(json.dumps(make_jsonable(result), indent=2))
+    else:
+        forecast = result.get("forecast_test", {})
+        balanced = result.get("balanced_summary", {})
+        crps = forecast.get("crps") if isinstance(forecast, dict) else None
+        hidden = balanced.get("avg_hidden_crps") if isinstance(balanced, dict) else None
+        output = f"{label}: forecast_crps={crps} avg_hidden_crps={hidden}"
+        if args.out_json:
+            output += f" json={args.out_json}"
+        print(output)
 
 
 if __name__ == "__main__":

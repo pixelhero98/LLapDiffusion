@@ -44,6 +44,9 @@ class TrainConfig:
     lr: float = 1e-3
     horizons: tuple[int, ...] | str | None = "all"
     input_policy: str = "target_only"
+    target_col: str | None = None
+    target_cols: tuple[str, ...] | None = None
+    verbose: bool = False
 
 
 def set_seed(seed: int) -> None:
@@ -224,6 +227,20 @@ def _config_payload(config: TrainConfig) -> dict[str, object]:
     return payload
 
 
+def _target_dim(dataset_info: dict[str, object]) -> int:
+    return int(dataset_info.get("target_dim") or max(1, len(dataset_info.get("target_cols") or [])))
+
+
+def _ensure_baseline_supports_targets(baseline: str, dataset_info: dict[str, object]) -> None:
+    if _target_dim(dataset_info) <= 1:
+        return
+    if baseline not in {"dlinear", "patchtst"}:
+        raise ValueError(
+            f"{baseline} currently supports scalar targets only. "
+            "Use dlinear or patchtst for multi-target baseline runs."
+        )
+
+
 def _parameter_count(model: torch.nn.Module) -> int:
     return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
 
@@ -258,6 +275,14 @@ def write_rows(rows: Sequence[dict[str, object]], output: Path | str, *, prefix:
         "horizon",
         "entity_selection_mode",
         "input_policy",
+        "target_col",
+        "target_cols",
+        "target_indices",
+        "target_dim",
+        "target_source",
+        "requested_target_col",
+        "requested_target_cols",
+        "calendar_feature_cols",
         "input_policy_effective",
         "input_scope",
         "missingness_scope",
@@ -380,6 +405,11 @@ def run_practical_one(
 ) -> dict[str, object]:
     set_seed(config.seed)
     device = resolve_device(config.device)
+    if config.target_cols and len(config.target_cols) > 1 and baseline not in {"dlinear", "patchtst"}:
+        raise ValueError(
+            f"{baseline} currently supports scalar targets only. "
+            "Use dlinear or patchtst for multi-target baseline runs."
+        )
     source_manager = SourceManager(config.source_root)
     spec = BASELINES[baseline]
     source = source_manager.validate(spec)
@@ -388,9 +418,12 @@ def run_practical_one(
         horizon=horizon,
         allow_cache_copy=config.allow_cache_copy,
         work_cache_dir=Path(config.work_cache_dir).expanduser().resolve() if config.work_cache_dir else None,
+        target_col=config.target_col,
+        target_cols=config.target_cols,
     )
     train_dl, val_dl, test_dl = loaders
     dataset_info["input_policy"] = str(config.input_policy)
+    _ensure_baseline_supports_targets(baseline, dataset_info)
     sample_batch, _ = find_batch(
         train_dl,
         dataset_info,
@@ -438,18 +471,25 @@ def run_practical_one(
         val = _evaluate_loader(model, baseline, val_dl, dataset_info, device)
         epoch_row = {"epoch": epoch, "train_loss": train_loss / train_batches, "train_batches": train_batches, "val": val}
         history.append(epoch_row)
-        print(
-            f"{baseline}/{dataset}/h{dataset_info['horizon']} "
-            f"epoch={epoch} train_loss={epoch_row['train_loss']:.6f} val_mse={val['mse']:.6f}",
-            flush=True,
-        )
         if val["mse"] < best_val:
             best_val = val["mse"]
             best_epoch = epoch
             stale = 0
             torch.save(model.state_dict(), best_path)
+            if config.verbose:
+                print(
+                    f"{baseline}/{dataset}/h{dataset_info['horizon']} "
+                    f"epoch={epoch} train_loss={epoch_row['train_loss']:.6f} val_mse={val['mse']:.6f} best=1",
+                    flush=True,
+                )
         else:
             stale += 1
+            if config.verbose:
+                print(
+                    f"{baseline}/{dataset}/h{dataset_info['horizon']} "
+                    f"epoch={epoch} train_loss={epoch_row['train_loss']:.6f} val_mse={val['mse']:.6f}",
+                    flush=True,
+                )
         if stale >= config.patience:
             break
 
@@ -476,6 +516,14 @@ def run_practical_one(
         "loader_batches": loader_batches,
         "train_config": _config_payload(config),
         "input_policy": str(config.input_policy),
+        "target_col": dataset_info.get("target_col"),
+        "target_cols": dataset_info.get("target_cols"),
+        "target_indices": dataset_info.get("target_indices"),
+        "target_dim": dataset_info.get("target_dim"),
+        "target_source": dataset_info.get("target_source"),
+        "requested_target_col": dataset_info.get("requested_target_col"),
+        "requested_target_cols": dataset_info.get("requested_target_cols"),
+        "calendar_feature_cols": dataset_info.get("calendar_feature_cols"),
         "split_policy": dataset_info.get("split_policy", "global_purged_horizon"),
         "split_scope": dataset_info.get("split_scope", "global_target_time"),
         "split_note": dataset_info.get("split_note", ""),
