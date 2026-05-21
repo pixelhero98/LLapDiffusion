@@ -6,6 +6,10 @@ Official implementation of **Latent Laplace Diffusion for Irregular Multivariate
 
 LLapDiffusion trains a timestamp-aware latent diffusion model for irregular multivariate forecasting and target-horizon imputation. The model conditions on observed values, timestamps, gaps, and masks, then denoises compact latent trajectories parameterized by stable Laplace-domain modes.
 
+![LLapDiff continuous-time latent generation overview](imgs/llapdiff_complex_pole_trajectory.png)
+
+*Continuous-time latent generation with context samples, query path, latent coordinates, and stable complex poles.*
+
 ## Installation
 
 Create a Python 3.11 environment and install the package:
