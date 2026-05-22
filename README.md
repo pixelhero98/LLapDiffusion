@@ -12,7 +12,7 @@ LLapDiffusion trains a timestamp-aware latent diffusion model for irregular mult
 > 
 > Realizations of the latent space and the history summarizer are just preliminary, which leaves room for improvement for follow-up works.
 >
-> Parameterized dynamics are locally linearized with the residual MLP as tiny nonlinear corrections. A natural follow-up is to derive global and nonlinear parameterized dynamics.
+> Parameterized dynamics are locally linearized with the residual MLP as small nonlinear corrections. A natural follow-up is to derive global, nonlinear dynamics.
 
 ## Installation
 
