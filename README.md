@@ -34,6 +34,7 @@ python -m pip install -e ".[baselines]"
 ```
 
 ## Quick start
+`Preset default checkpoints and raw datasets are available over HF`: Model: https://huggingface.co/pixelhero98/llapdiff-checkpoints, Dataset: https://huggingface.co/datasets/pixelhero98/llapdiff-raw
 
 Run one public preset:
 
