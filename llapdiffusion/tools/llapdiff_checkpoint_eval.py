@@ -366,6 +366,7 @@ def _evaluate_impute_case(
         cond_summary = cond_summary[valid_seq]
         cond_summary_raw = cond_summary_raw[valid_seq]
         yb = yb[valid_seq]
+        mask_bn = mask_bn[valid_seq]
         x_tok = x_tok[valid_seq]
         entity_pad = entity_pad[valid_seq]
         obs = obs[valid_seq]

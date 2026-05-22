@@ -95,6 +95,123 @@ def _write_tiny_cache(
     return root, global_pairs, global_end_times
 
 
+def _write_query_grid_cache(
+    root: Path,
+    *,
+    future_grids: list[tuple[float, ...]],
+    window: int = 2,
+) -> Path:
+    """Write one window per asset with a shared context end and configurable query grids."""
+    paths = CachePaths.from_dir(root)
+    paths.ensure()
+    horizon = len(future_grids[0])
+    assets = [f"a{idx}" for idx in range(len(future_grids))]
+    feature_cols = ["noise", "target"]
+    base = np.datetime64("2020-01-01T00:00:00", "ns")
+    context_hours = np.arange(window, dtype=np.int64)
+    context_end = base + np.timedelta64(int(context_hours[-1]), "h")
+    pairs = []
+    end_times = []
+
+    for aid, grid in enumerate(future_grids):
+        assert len(grid) == horizon
+        future_times = np.array(
+            [context_end + np.timedelta64(int(offset * 3600), "s") for offset in grid],
+            dtype="datetime64[ns]",
+        )
+        times = np.concatenate(
+            [
+                base + context_hours.astype("timedelta64[h]"),
+                future_times,
+            ]
+        ).astype("datetime64[ns]")
+        values = np.arange(times.shape[0], dtype=np.float32) + 10 * aid
+        features = np.stack([values, values], axis=1)
+        obs = np.ones_like(features, dtype=bool)
+
+        np.save(paths.features / f"{aid}.npy", features.astype(np.float16))
+        np.save(paths.targets / f"{aid}.npy", values.astype(np.float16))
+        np.save(paths.times / f"{aid}.npy", times)
+        np.save(paths.obs_masks / f"{aid}.npy", obs)
+        np.save(paths.fill_masks / f"{aid}.npy", obs)
+        pairs.append([aid, 0])
+        end_times.append(times[window - 1])
+
+    np.save(paths.windows / "global_pairs.npy", np.asarray(pairs, dtype=np.int32))
+    np.save(paths.windows / "end_times.npy", np.asarray(end_times, dtype="datetime64[ns]"))
+    paths.meta.write_text(
+        json.dumps(
+            {
+                "dataset": "query_grid_tiny",
+                "assets": assets,
+                "asset2id": {asset: idx for idx, asset in enumerate(assets)},
+                "feature_cols": feature_cols,
+                "target_col": "target",
+                "window": window,
+                "horizon": horizon,
+                "max_window": window,
+                "max_horizon": horizon,
+                "keep_time_meta": "end",
+                "clamp_sigma": 5.0,
+                "freq": "irregular",
+                "normalize_per_ticker": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    paths.norm_stats.write_text(
+        json.dumps(
+            {
+                "per_ticker": False,
+                "mean_x": [[[0.0, 0.0]]],
+                "std_x": [[[1.0, 1.0]]],
+                "mean_y": 0.0,
+                "std_y": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
+def _query_grid_train_loader(
+    data_dir: Path,
+    *,
+    coverage_per_window: float = 0.0,
+    target_cols: tuple[str, ...] | None = None,
+):
+    train_dl, _, _, _ = load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        batch_size=8,
+        n_entities=len(
+            json.loads((CachePaths.from_dir(data_dir).meta).read_text(encoding="utf-8"))["assets"]
+        ),
+        norm_scope="cache",
+        shuffle_train=False,
+        date_batching=True,
+        dates_per_batch=1,
+        window=2,
+        horizon=3,
+        split_policy="contiguous",
+        coverage_per_window=coverage_per_window,
+        exact_timestamp_batches=True,
+        target_cols=target_cols,
+    )
+    return train_dl
+
+
+def _valid_query_grids(meta: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+    grids = []
+    for row_idx in range(meta["entity_mask"].shape[0]):
+        valid = meta["entity_mask"][row_idx]
+        if valid.any():
+            grids.append(meta["delta_t_y"][row_idx, valid])
+    return grids
+
+
 def _target_time_indices(pairs: np.ndarray, assign: np.ndarray, split: int, *, window: int, horizon: int) -> set[int]:
     out: set[int] = set()
     for aid, start in pairs[assign == split]:
@@ -313,6 +430,104 @@ def test_panel_coverage_preserves_dense_date_filter(tmp_path):
     )
 
     assert sum(low[3]) > sum(high[3])
+
+
+def test_query_grid_incompatible_assets_do_not_share_joint_row(tmp_path):
+    data_dir = _write_query_grid_cache(
+        tmp_path,
+        future_grids=[(1.0, 2.0, 3.0), (1.0, 4.0, 5.0)],
+    )
+    train_dl = _query_grid_train_loader(data_dir)
+
+    rows = []
+    for _, _, meta in train_dl:
+        rows.extend(_valid_query_grids(meta))
+
+    assert len(rows) == 2
+    assert all(row.shape[0] == 1 for row in rows)
+    assert {tuple(row[0].tolist()) for row in rows} == {
+        (1.0, 2.0, 3.0),
+        (1.0, 4.0, 5.0),
+    }
+
+
+def test_query_grid_aligned_assets_still_co_batch(tmp_path):
+    data_dir = _write_query_grid_cache(
+        tmp_path,
+        future_grids=[(1.0, 4.0, 5.0), (1.0, 4.0, 5.0)],
+    )
+    train_dl = _query_grid_train_loader(data_dir)
+
+    rows = []
+    for _, _, meta in train_dl:
+        rows.extend(_valid_query_grids(meta))
+
+    assert len(rows) == 1
+    assert rows[0].shape == (2, 3)
+    assert torch.allclose(rows[0], torch.tensor([[1.0, 4.0, 5.0], [1.0, 4.0, 5.0]]))
+
+
+def test_query_grid_batching_preserves_multi_target_channels(tmp_path):
+    data_dir = _write_query_grid_cache(
+        tmp_path,
+        future_grids=[(1.0, 2.0, 3.0), (1.0, 4.0, 5.0)],
+    )
+    train_dl = _query_grid_train_loader(data_dir, target_cols=("noise", "target"))
+
+    rows = []
+    targets = []
+    masks = []
+    entity_masks = []
+    for _, y, meta in train_dl:
+        rows.extend(_valid_query_grids(meta))
+        targets.append(y)
+        masks.append(meta["y_obs_mask"])
+        entity_masks.append(meta["entity_mask"])
+
+    y_all = torch.cat(targets, dim=0)
+    mask_all = torch.cat(masks, dim=0)
+    entity_all = torch.cat(entity_masks, dim=0)
+    assert len(rows) == 2
+    assert all(row.shape[0] == 1 for row in rows)
+    assert y_all.shape == (2, 2, 3, 2)
+    assert mask_all.shape == y_all.shape
+    assert torch.equal(mask_all, entity_all[:, :, None, None].expand_as(mask_all))
+    for row in y_all:
+        valid = row.abs().sum(dim=(1, 2)) > 0
+        active = row[valid]
+        assert active.shape == (1, 3, 2)
+        assert torch.allclose(active[..., 0], active[..., 1])
+
+
+def test_coverage_per_window_is_applied_to_query_grid_compatible_groups(tmp_path):
+    data_dir = _write_query_grid_cache(
+        tmp_path,
+        future_grids=[(1.0, 4.0, 5.0), (1.0, 4.0, 5.0), (1.0, 2.0, 3.0)],
+    )
+    train_dl = _query_grid_train_loader(data_dir, coverage_per_window=2 / 3)
+
+    rows = []
+    for _, _, meta in train_dl:
+        rows.extend(_valid_query_grids(meta))
+
+    assert len(rows) == 1
+    assert rows[0].shape == (2, 3)
+    assert torch.allclose(rows[0], torch.tensor([[1.0, 4.0, 5.0], [1.0, 4.0, 5.0]]))
+
+
+def test_manual_incompatible_query_grid_metadata_raises_clear_guard():
+    from llapdiffusion.trainers import train_val_llapdiff as tv
+
+    meta = {
+        "delta_t_y": torch.tensor(
+            [[[1.0, 2.0, 3.0], [1.0, 4.0, 5.0]]],
+            dtype=torch.float32,
+        )
+    }
+    entity_mask = torch.tensor([[True, True]])
+
+    with pytest.raises(ValueError, match="delta_t_y.*same query grid"):
+        tv._flatten_dt(meta, entity_mask, torch.device("cpu"), key="delta_t_y")
 
 
 def test_target_override_selects_non_default_feature_and_keeps_scalar_shape(tmp_path):

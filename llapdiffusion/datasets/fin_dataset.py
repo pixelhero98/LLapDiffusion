@@ -948,7 +948,8 @@ def make_collate_level_and_firstdiff(
         H = y_list[0].shape[0]
         y_tail_shape = tuple(y_list[0].shape[1:])
 
-        def _infer_batch_key(ctx_times, y_times):
+        def _infer_batch_key(ctx_times, y_times, delta_t_y):
+            time_key = None
             for raw_times in (ctx_times, y_times):
                 if raw_times is None:
                     continue
@@ -956,12 +957,23 @@ def make_collate_level_and_firstdiff(
                 if arr.size == 0:
                     continue
                 try:
-                    return int(np.asarray(arr.reshape(-1)[-1]).astype("datetime64[ns]").astype(np.int64))
+                    time_key = int(np.asarray(arr.reshape(-1)[-1]).astype("datetime64[ns]").astype(np.int64))
+                    break
                 except Exception:
                     continue
-            return None
+            sig = None
+            if delta_t_y is not None:
+                dt_y_arr = np.asarray(delta_t_y, dtype=np.float32).reshape(-1)
+                if dt_y_arr.size:
+                    sig = _query_grid_signature(dt_y_arr)
+            if time_key is None and sig is None:
+                return None
+            return (time_key, sig)
 
-        batch_keys = [_infer_batch_key(ctx_times_list[j], y_times_list[j]) for j in range(len(items))]
+        batch_keys = [
+            _infer_batch_key(ctx_times_list[j], y_times_list[j], delta_t_y_list[j])
+            for j in range(len(items))
+        ]
         batch_rows = []
         batch_time_keys = []
         if batch_keys and all(batch_key is not None for batch_key in batch_keys):
@@ -969,7 +981,7 @@ def make_collate_level_and_firstdiff(
             for batch_key in batch_keys:
                 if batch_key not in row_by_time:
                     row_by_time[batch_key] = len(batch_time_keys)
-                    batch_time_keys.append(int(batch_key))
+                    batch_time_keys.append(batch_key[0])
                 batch_rows.append(row_by_time[batch_key])
             B = len(batch_time_keys)
         else:
@@ -1064,6 +1076,17 @@ def make_collate_level_and_firstdiff(
                         raise ValueError("Cannot infer delta_t_y from y_times without ctx_times or explicit delta_t_y")
                     delta_t_y[row, aid] = _compute_time_offsets_from_anchor(yt, anchor, native_scale_seconds=1.0)
 
+        for row in range(B):
+            valid = entity_mask[row]
+            if int(valid.sum()) <= 1:
+                continue
+            grids = delta_t_y[row, valid]
+            if not np.allclose(grids, grids[:1], rtol=1e-5, atol=1e-6):
+                raise ValueError(
+                    "collate produced incompatible delta_t_y query grids for one joint row; "
+                    "date batching must group entities by context end and future query grid"
+                )
+
         xb = (
             torch.from_numpy(V_full),  # [B,N,K,F]
             torch.from_numpy(T_full),  # [B,N,K,F]
@@ -1075,7 +1098,7 @@ def make_collate_level_and_firstdiff(
             "delta_t": torch.from_numpy(delta_t),
             "delta_t_y": torch.from_numpy(delta_t_y),
         }
-        if batch_time_keys is not None:
+        if batch_time_keys is not None and all(key is not None for key in batch_time_keys):
             time_keys = np.asarray(batch_time_keys, dtype=np.int64)
             meta["context_end_time_keys"] = torch.from_numpy(time_keys)
             meta["date_keys"] = torch.from_numpy(time_keys // np.int64(24 * 60 * 60 * 1_000_000_000))
@@ -1300,17 +1323,134 @@ def _normalize_to_day(ts: np.ndarray) -> np.ndarray:
     return ts.astype('datetime64[D]').astype(np.int64)
 
 
+def _query_grid_signature(delta_t_y: np.ndarray) -> bytes:
+    """Return a stable signature for a target query grid."""
+    grid = np.asarray(delta_t_y, dtype=np.float64).reshape(-1)
+    if grid.size and not np.isfinite(grid).all():
+        raise ValueError("delta_t_y contains non-finite offsets")
+    rounded = np.round(grid, decimals=6).astype(np.float32, copy=False)
+    return hashlib.blake2b(rounded.tobytes(), digest_size=16).digest()
+
+
+def _future_query_grid_signature(
+    times: np.ndarray,
+    start: int,
+    window: int,
+    horizon: int,
+    native_time_scale_seconds: float,
+) -> bytes:
+    """Compute the query-grid signature used by _IndexBackedDataset for one row."""
+    if int(horizon) <= 0:
+        return _query_grid_signature(np.empty((0,), dtype=np.float32))
+    s = int(start)
+    e = s + int(window)
+    future = np.asarray(times[e:e + int(horizon)])
+    if future.shape[0] != int(horizon):
+        raise ValueError(
+            f"Cannot build future query grid for start={s}: "
+            f"expected horizon={int(horizon)}, got {future.shape[0]}"
+        )
+    arr = np.asarray(times)
+    if np.issubdtype(arr.dtype, np.datetime64):
+        future_ns = future.astype("datetime64[ns]").astype(np.int64)
+        anchor_ns = np.asarray(times[e - 1]).astype("datetime64[ns]").astype(np.int64)
+        deltas = (future_ns - anchor_ns).astype(np.int64, copy=False)
+        return hashlib.blake2b(deltas.tobytes(), digest_size=16).digest()
+    if np.issubdtype(arr.dtype, np.number):
+        values = future.astype(np.float64, copy=False)
+        anchor = float(np.asarray(times[e - 1], dtype=np.float64).reshape(-1)[0])
+        return _query_grid_signature(values - anchor)
+    offsets = _compute_time_offsets_from_anchor(
+        future,
+        np.asarray(times[e - 1]),
+        native_time_scale_seconds,
+    )
+    return _query_grid_signature(offsets)
+
+
+def _future_query_grid_signatures_for_pairs(
+    data_dir: str,
+    pairs: np.ndarray,
+    window: int,
+    horizon: int,
+    native_time_scale_seconds: float,
+) -> np.ndarray:
+    """Compute per-row future query-grid signatures for joint date batching."""
+    paths = CachePaths.from_dir(data_dir)
+    out: List[bytes] = []
+    times_cache: Dict[int, np.ndarray] = {}
+    for aid_raw, start_raw in np.asarray(pairs, dtype=np.int64):
+        aid = int(aid_raw)
+        if aid not in times_cache:
+            times_cache[aid] = np.load(paths.times / f"{aid}.npy", allow_pickle=False)
+        out.append(
+            _future_query_grid_signature(
+                times_cache[aid],
+                int(start_raw),
+                int(window),
+                int(horizon),
+                float(native_time_scale_seconds),
+            )
+        )
+    return np.asarray(out, dtype=object)
+
+
 def _build_date_batches_from_pairs(order_pairs: np.ndarray,
                                    end_times: np.ndarray,
                                    dates_per_batch: int,
                                    min_real_entities: int,
-                                   exact_timestamp: bool = False) -> List[np.ndarray]:
+                                   exact_timestamp: bool = False,
+                                   query_grid_signatures: Optional[Sequence[object]] = None) -> List[np.ndarray]:
     # order_pairs: [M,2] (aid, start) sorted by end_times.
     keys = (
         end_times.astype("datetime64[ns]").astype(np.int64)
         if exact_timestamp
         else _normalize_to_day(end_times)
     )
+    if exact_timestamp and query_grid_signatures is not None:
+        sigs = np.asarray(query_grid_signatures, dtype=object)
+        if sigs.shape[0] != end_times.shape[0]:
+            raise ValueError(
+                "query_grid_signatures length must match end_times length: "
+                f"{sigs.shape[0]} != {end_times.shape[0]}"
+            )
+        context_keys = end_times.astype("datetime64[ns]").astype(np.int64)
+        sort_order = sorted(
+            range(len(keys)),
+            key=lambda idx: (int(keys[idx]), int(context_keys[idx]), sigs[idx]),
+        )
+        groups_with_base: List[Tuple[int, np.ndarray]] = []
+        start_pos = 0
+        while start_pos < len(sort_order):
+            first_idx = sort_order[start_pos]
+            group_key = (int(context_keys[first_idx]), sigs[first_idx])
+            base_key = int(keys[first_idx])
+            end_pos = start_pos + 1
+            while end_pos < len(sort_order):
+                idx = sort_order[end_pos]
+                if (int(context_keys[idx]), sigs[idx]) != group_key:
+                    break
+                end_pos += 1
+            group = np.asarray(sort_order[start_pos:end_pos], dtype=np.int64)
+            if group.size >= int(min_real_entities):
+                groups_with_base.append((base_key, group))
+            start_pos = end_pos
+
+        batches: List[np.ndarray] = []
+        base_order: List[int] = []
+        by_base: Dict[int, List[np.ndarray]] = {}
+        for base_key, group in groups_with_base:
+            if base_key not in by_base:
+                by_base[base_key] = []
+                base_order.append(base_key)
+            by_base[base_key].append(group)
+        for k in range(0, len(base_order), dates_per_batch):
+            chunk_keys = base_order[k:k + dates_per_batch]
+            chunk = [group for base_key in chunk_keys for group in by_base[base_key]]
+            if chunk:
+                batches.append(np.concatenate(chunk, axis=0))
+        return batches
+
     order = np.argsort(keys, kind='mergesort')
     keys_sorted = keys[order]
     _, starts = np.unique(keys_sorted, return_index=True)
@@ -1810,18 +1950,50 @@ def load_dataloaders_with_ratio_split(
         date_batching = (coverage_per_window > 0.0)
     if date_batching:
         min_real = max(1, int(_ceil(coverage_per_window * len(assets)))) if coverage_per_window > 0 else 1
+        query_grid_signatures = (
+            _future_query_grid_signatures_for_pairs(
+                data_dir,
+                pairs,
+                window,
+                horizon,
+                float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
+            )
+            if exact_timestamp_batches
+            else None
+        )
         # recover split-specific end_times by masking
         tr_mask = (assign == 0)
         va_mask = (assign == 1)
         te_mask = (assign == 2)
         batches_tr = _build_date_batches_from_pairs(
-            tr_pairs, end_times[tr_mask], dates_per_batch, min_real, exact_timestamp=exact_timestamp_batches
+            tr_pairs,
+            end_times[tr_mask],
+            dates_per_batch,
+            min_real,
+            exact_timestamp=exact_timestamp_batches,
+            query_grid_signatures=(
+                query_grid_signatures[tr_mask] if query_grid_signatures is not None else None
+            ),
         )
         batches_va = _build_date_batches_from_pairs(
-            va_pairs, end_times[va_mask], dates_per_batch, min_real, exact_timestamp=exact_timestamp_batches
+            va_pairs,
+            end_times[va_mask],
+            dates_per_batch,
+            min_real,
+            exact_timestamp=exact_timestamp_batches,
+            query_grid_signatures=(
+                query_grid_signatures[va_mask] if query_grid_signatures is not None else None
+            ),
         )
         batches_te = _build_date_batches_from_pairs(
-            te_pairs, end_times[te_mask], dates_per_batch, min_real, exact_timestamp=exact_timestamp_batches
+            te_pairs,
+            end_times[te_mask],
+            dates_per_batch,
+            min_real,
+            exact_timestamp=exact_timestamp_batches,
+            query_grid_signatures=(
+                query_grid_signatures[te_mask] if query_grid_signatures is not None else None
+            ),
         )
         train_dl = DataLoader(ds_tr, batch_sampler=_ListBatchSampler(batches_tr), pin_memory=pin_memory,
                               num_workers=num_workers, persistent_workers=False, generator=gen,

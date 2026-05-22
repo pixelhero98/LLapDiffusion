@@ -1,4 +1,5 @@
 import io
+import json
 import sys
 import zipfile
 from types import SimpleNamespace
@@ -1077,6 +1078,64 @@ def test_imputation_generation_only_uses_intentionally_observed_target_tokens(mo
     assert torch.all(call["y_obs"][:, 2:] == 0)
 
 
+def test_imputation_eval_filters_entity_mask_with_multi_target_valid_sequences(monkeypatch):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+
+    class FakeDiffModel:
+        def generate(self, **kwargs):
+            return torch.zeros(kwargs["shape"])
+
+    monkeypatch.setattr(ce.tv, "_sanitize_batch", lambda xb, yb, meta, device: (xb, yb.to(device), meta["entity_mask"].to(device)))
+    monkeypatch.setattr(
+        ce.tv,
+        "_build_cond_summary_pair",
+        lambda *args, **kwargs: (torch.zeros(2, 2, 4), torch.zeros(2, 2, 4)),
+    )
+    monkeypatch.setattr(
+        ce.tv,
+        "_flatten_dt",
+        lambda *args, **kwargs: torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]]),
+    )
+    monkeypatch.setattr(ce, "encode_mu_norm", lambda *args, **kwargs: torch.zeros(1, 4, 3))
+
+    def fake_decode(vae, x0_norm, *, entity_pad, mu_mean, mu_std):
+        return torch.zeros(x0_norm.shape[0], x0_norm.shape[1], entity_pad.shape[1], 2)
+
+    monkeypatch.setattr(ce, "decode_latents_with_vae", fake_decode)
+
+    xb = (torch.ones(2, 1, 3, 1), torch.zeros(2, 1, 3, 1))
+    yb = torch.tensor(
+        [
+            [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]],
+            [[[2.0, 3.0], [4.0, 5.0], [6.0, 7.0], [8.0, 9.0]]],
+        ]
+    )
+    meta = {
+        "entity_mask": torch.tensor([[True], [True]]),
+        "delta_t": torch.zeros(2, 1, 3),
+        "delta_t_y": torch.tensor([[[1.0, 2.0, 3.0, 4.0]], [[1.0, 2.0, 3.0, 4.0]]]),
+        "x_obs_mask": torch.ones(2, 1, 3, 1, dtype=torch.bool),
+        "y_obs_mask": torch.ones(2, 1, 4, 2, dtype=torch.bool),
+    }
+
+    metrics = ce._evaluate_impute_case(
+        [(xb, yb, meta)],
+        diff_model=FakeDiffModel(),
+        vae=object(),
+        summarizer=object(),
+        device=torch.device("cpu"),
+        mu_mean=torch.zeros(3),
+        mu_std=torch.ones(3),
+        keep_fn=lambda obs_any: torch.tensor([[True, True, True, True], [True, True, False, False]]),
+        num_samples=1,
+        steps=2,
+    )
+
+    assert metrics["hidden_token_frac"] == pytest.approx(0.5)
+    assert metrics["observed_token_frac"] == pytest.approx(0.5)
+    assert metrics["hidden_mse"] > 0.0
+
+
 def test_random_imputation_keep_mask_generator_advances_between_batches():
     from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
 
@@ -1353,6 +1412,44 @@ def test_checkpoint_eval_routes_max_eval_batches(monkeypatch, tmp_path):
     ce.evaluate_checkpoint(cfg, tmp_path / "model.pt", label="uncapped", max_eval_batches=0)
     assert captured["forecast"] == [test_batches]
     assert captured["impute"] == [test_batches, test_batches]
+
+
+def test_checkpoint_eval_forwards_target_cols_to_loader(monkeypatch, tmp_path):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+
+    captured = {}
+
+    _patch_checkpoint_eval_dependencies(monkeypatch, ce)
+
+    def fake_run_experiment(**kwargs):
+        captured.update(kwargs)
+        return ["train"], ["val"], ["test"], (1, 1, 1)
+
+    monkeypatch.setattr(ce, "resolve_run_experiment", lambda data_dir: fake_run_experiment)
+
+    cfg = _checkpoint_eval_cfg()
+    data_dir = tmp_path / "data"
+    meta_dir = data_dir / "cache_ratio_index"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "dataset": "demo",
+                "feature_cols": ["RET_OPEN", "RET_CLOSE", "DOW_SIN"],
+                "target_col": "RET_OPEN",
+                "calendar_feature_cols": ["DOW_SIN"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg.DATA_DIR = str(data_dir)
+    cfg.TARGET_COL = None
+    cfg.TARGET_COLS = ["RET_OPEN", "RET_CLOSE"]
+
+    ce.evaluate_checkpoint(cfg, tmp_path / "model.pt", label="multi-target")
+
+    assert captured["target_col"] is None
+    assert captured["target_cols"] == ["RET_OPEN", "RET_CLOSE"]
 
 
 def test_checkpoint_eval_random_mask30_uses_seventy_percent_keep(monkeypatch, tmp_path):
