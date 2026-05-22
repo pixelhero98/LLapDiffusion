@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.logging_utils import is_debug, is_verbose
 from llapdiffusion.models.summarizer import LaplaceAE
+from llapdiffusion.target_artifacts import loader_target_request_from_config
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
 
 
@@ -69,6 +70,7 @@ def _ensure_loaders(
 ) -> Tuple[LoaderTuple, Optional[Tuple[int, int, int]]]:
     if any(loader is None for loader in (train_loader, val_loader, test_loader)):
         run_experiment = resolve_run_experiment(config.DATA_DIR)
+        target_col, target_cols = loader_target_request_from_config(config)
         train_loader, val_loader, test_loader, sizes = run_experiment(
             data_dir=config.DATA_DIR,
             date_batching=config.date_batching,
@@ -79,8 +81,8 @@ def _ensure_loaders(
             ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
             split_policy=getattr(config, "split_policy", "global_purged_horizon"),
             exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
-            target_col=None if getattr(config, "TARGET_COLS", None) else getattr(config, "TARGET_COL", None),
-            target_cols=getattr(config, "TARGET_COLS", None),
+            target_col=target_col,
+            target_cols=target_cols,
         )
     elif sizes is None:
         try:

@@ -799,6 +799,7 @@ def run_experiment(
         )
 
     needs_reindex = (int(K), int(H)) != (base_window, base_horizon)
+    needs_target_reindex = target_col is not None or target_cols is not None
 
     if needs_reindex and not reindex:
         raise ValueError(
@@ -806,12 +807,12 @@ def run_experiment(
             "Enable reindex to rebuild the window index."
         )
 
-    if reindex and needs_reindex:
+    if reindex and (needs_reindex or needs_target_reindex):
         _rebuild_window_index_only(
             data_dir,
             window=K,
             horizon=H,
-            update_meta=True,
+            update_meta=needs_reindex,
             backup_old=False,
             target_col=target_col,
             target_cols=target_cols,

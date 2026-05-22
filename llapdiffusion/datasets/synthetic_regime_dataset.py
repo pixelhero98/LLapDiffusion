@@ -267,12 +267,15 @@ def run_experiment(
             "Re-run prepare_synthetic_regime_cache with larger values first."
         )
 
-    if reindex and (K != cached_window or H != cached_horizon):
+    needs_reindex = K != cached_window or H != cached_horizon
+    needs_target_reindex = target_col is not None or target_cols is not None
+
+    if reindex and (needs_reindex or needs_target_reindex):
         rebuild_window_index_only(
             data_dir,
             window=K,
             horizon=H,
-            update_meta=True,
+            update_meta=needs_reindex,
             backup_old=False,
             target_col=target_col,
             target_cols=target_cols,

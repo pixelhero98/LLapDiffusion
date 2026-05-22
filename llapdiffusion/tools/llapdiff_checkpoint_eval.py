@@ -31,6 +31,11 @@ from llapdiffusion.models.llapdiff_utils import (
     targets_to_bhnc,
     vae_io_dims_for_target_dim,
 )
+from llapdiffusion.target_artifacts import (
+    apply_target_metadata_to_config,
+    unwrap_checkpoint_model,
+    validate_checkpoint_target_metadata,
+)
 
 
 COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
@@ -242,7 +247,9 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
         num_entities=num_entities,
         entity_conditioned=bool(getattr(cfg, "VAE_ENTITY_CONDITION", False)),
     ).to(device)
-    tv._load_module_state(vae, torch.load(cfg.VAE_CKPT, map_location=device), strict=True)
+    vae_payload = torch.load(cfg.VAE_CKPT, map_location=device)
+    validate_checkpoint_target_metadata(vae_payload, cfg, context="VAE")
+    tv._load_module_state(vae, unwrap_checkpoint_model(vae_payload), strict=True)
     vae.eval()
 
     summarizer = LaplaceAE(
@@ -275,6 +282,7 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
 
     diff_model = tv.build_llapdiff_model(cfg, device)
     payload = torch.load(ckpt_path, map_location=device)
+    validate_checkpoint_target_metadata(payload, cfg, context="LLapDiff")
     tv._load_module_state(diff_model, payload["model"], strict=True)
     diff_model.eval()
     mu_mean = payload["mu_mean"].to(device)
@@ -517,6 +525,7 @@ def evaluate_checkpoint(
     )
     if verbose and sizes is not None:
         print("eval sizes:", tuple(sizes))
+    apply_target_metadata_to_config(cfg, _target_policy(cfg))
     diff_model, vae, summarizer, mu_mean, mu_std = _load_stack(cfg, ckpt_path, device, train_dl, verbose=verbose)
     test_sampling = tv._sampling_kwargs(cfg, prefix="TEST")
     forecast_cfg = _config_with_num_eval_samples(cfg, forecast_samples)
@@ -615,6 +624,7 @@ def evaluate_checkpoint(
         result["random_mask30"] = dict(random_mask)
     if out_path is not None:
         out_file = Path(out_path)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text(json.dumps(make_jsonable(result), indent=2))
         if verbose:
             print(out_file)

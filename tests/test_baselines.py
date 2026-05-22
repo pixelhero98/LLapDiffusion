@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import importlib
+import json
 import re
 import sys
 from pathlib import Path
@@ -487,6 +488,7 @@ def test_baseline_loader_forwards_target_cols_and_reports_metadata(monkeypatch, 
         target_cols,
     ):
         seen["target_cols"] = target_cols
+        seen["reindex"] = reindex
         return ["train"], ["val"], ["test"], (1, 2, 3)
 
     monkeypatch.setattr(baseline_data, "get_dataset_preset", lambda key: preset)
@@ -501,12 +503,94 @@ def test_baseline_loader_forwards_target_cols_and_reports_metadata(monkeypatch, 
     )
 
     assert seen["target_cols"] == ("open", "close")
+    assert seen["reindex"] is True
     assert info["target_col"] == "open"
     assert info["target_cols"] == ["open", "close"]
     assert info["target_indices"] == [0, 1]
     assert info["target_dim"] == 2
     assert info["target_source"] == "feature_columns"
     assert info["requested_target_cols"] == ["open", "close"]
+
+
+@pytest.mark.parametrize(
+    ("module_name", "dataset_name", "rebuild_attr", "loader_attr"),
+    [
+        (
+            "llapdiffusion.datasets.noaa_isd_dataset",
+            "noaa_isd",
+            "_rebuild_window_index_only",
+            "load_isd_dataloaders_with_ratio_split",
+        ),
+        (
+            "llapdiffusion.datasets.physionet_cinc_dataset",
+            "physionet_cinc",
+            "_rebuild_window_index_only",
+            "load_physionet_dataloaders_with_ratio_split",
+        ),
+        (
+            "llapdiffusion.datasets.synthetic_regime_dataset",
+            "synthetic_regime",
+            "rebuild_window_index_only",
+            "_load_fin_ratio_split",
+        ),
+    ],
+)
+def test_dataset_wrappers_reindex_requested_target_cols_when_horizon_matches(
+    monkeypatch,
+    tmp_path,
+    module_name,
+    dataset_name,
+    rebuild_attr,
+    loader_attr,
+):
+    module = importlib.import_module(module_name)
+    data_dir = tmp_path / dataset_name
+    meta_dir = data_dir / "cache_ratio_index"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "dataset": dataset_name,
+                "assets": ["a"],
+                "feature_cols": ["open", "close"],
+                "target_col": "close",
+                "target_cols": ["close"],
+                "window": 12,
+                "horizon": 4,
+                "max_window": 12,
+                "max_horizon": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rebuild_calls = []
+
+    def fake_rebuild(data_dir, **kwargs):
+        rebuild_calls.append(kwargs)
+        return 1
+
+    monkeypatch.setattr(module, rebuild_attr, fake_rebuild)
+    monkeypatch.setattr(
+        module,
+        loader_attr,
+        lambda **kwargs: (["train"], ["val"], ["test"], (1, 2, 3)),
+    )
+
+    loaders = module.run_experiment(
+        data_dir,
+        K=12,
+        H=4,
+        target_cols=("open", "close"),
+        reindex=True,
+    )
+
+    assert loaders == (["train"], ["val"], ["test"], (1, 2, 3))
+    assert len(rebuild_calls) == 1
+    assert rebuild_calls[0]["window"] == 12
+    assert rebuild_calls[0]["horizon"] == 4
+    assert rebuild_calls[0]["update_meta"] is False
+    assert rebuild_calls[0]["target_cols"] == ("open", "close")
 
 
 def test_baseline_loader_rejects_multi_target_without_loader_support(monkeypatch, tmp_path):

@@ -374,6 +374,49 @@ def test_loader_coverage_hides_context_only_and_is_deterministic(tmp_path):
     assert meta1["y_obs_mask"][0, present].all()
 
 
+def test_loader_coverage_preserves_sparse_missingness_and_target_metadata(tmp_path):
+    data_dir, _, _ = _write_tiny_cache(tmp_path, num_assets=1, length=12, window=4, horizon=3)
+    paths = CachePaths.from_dir(data_dir)
+    obs = np.load(paths.obs_masks / "0.npy")
+    obs[0, 0] = False
+    obs[2, 1] = False
+    np.save(paths.obs_masks / "0.npy", obs)
+    np.save(paths.fill_masks / "0.npy", obs)
+
+    def first_batch(coverage: float):
+        train_dl, _, _, _ = load_dataloaders_with_ratio_split(
+            data_dir=str(data_dir),
+            train_ratio=1.0,
+            val_ratio=0.0,
+            test_ratio=0.0,
+            batch_size=1,
+            n_entities=1,
+            norm_scope="cache",
+            shuffle_train=False,
+            date_batching=False,
+            window=4,
+            horizon=3,
+            split_policy="contiguous",
+            exact_timestamp_batches=True,
+            coverage=coverage,
+            seed=99,
+        )
+        return next(iter(train_dl))
+
+    (V0, _), y0, meta0 = first_batch(0.0)
+    (Vh, _), yh, metah = first_batch(0.5)
+
+    assert torch.equal(meta0["x_obs_mask"][0, 0], torch.tensor([[False, True], [True, True], [True, False], [True, True]]))
+    assert torch.equal(metah["x_obs_mask"] & ~meta0["x_obs_mask"], torch.zeros_like(metah["x_obs_mask"]))
+    assert torch.count_nonzero(meta0["x_obs_mask"] & ~metah["x_obs_mask"]).item() > 0
+    hidden = meta0["x_obs_mask"] & ~metah["x_obs_mask"]
+    assert torch.all(Vh[hidden] == 0.0)
+    assert torch.equal(y0, yh)
+    assert torch.equal(meta0["y_obs_mask"], metah["y_obs_mask"])
+    assert torch.equal(meta0["delta_t"], metah["delta_t"])
+    assert torch.equal(meta0["delta_t_y"], metah["delta_t_y"])
+
+
 @pytest.mark.parametrize("coverage", [-0.1, 1.0])
 def test_loader_coverage_rejects_invalid_rates(tmp_path, coverage):
     data_dir, _, _ = _write_tiny_cache(tmp_path, length=40, window=2, horizon=3)
@@ -387,6 +430,66 @@ def test_loader_coverage_rejects_invalid_rates(tmp_path, coverage):
             split_policy="contiguous",
             coverage=coverage,
         )
+
+
+def test_keep_time_meta_none_preserves_distinct_date_rows(tmp_path):
+    data_dir, _, _ = _write_tiny_cache(tmp_path, num_assets=1, length=10, window=2, horizon=2)
+    paths = CachePaths.from_dir(data_dir)
+    meta = json.loads(paths.meta.read_text(encoding="utf-8"))
+    meta["keep_time_meta"] = "none"
+    paths.meta.write_text(json.dumps(meta), encoding="utf-8")
+
+    train_dl, _, _, _ = load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        batch_size=8,
+        n_entities=1,
+        norm_scope="cache",
+        shuffle_train=False,
+        date_batching=True,
+        dates_per_batch=2,
+        window=2,
+        horizon=2,
+        split_policy="contiguous",
+        exact_timestamp_batches=True,
+    )
+
+    _, y, meta_batch = next(iter(train_dl))
+
+    assert y.shape == (2, 1, 2)
+    assert meta_batch["entity_mask"].tolist() == [[True], [True]]
+    assert meta_batch["context_end_time_keys"].shape == (2,)
+    assert torch.unique(meta_batch["context_end_time_keys"]).numel() == 2
+
+
+def test_loader_construction_does_not_mutate_meta_json(tmp_path):
+    data_dir, _, _ = _write_tiny_cache(tmp_path, num_assets=1, length=10, window=2, horizon=2)
+    paths = CachePaths.from_dir(data_dir)
+    meta = json.loads(paths.meta.read_text(encoding="utf-8"))
+    meta.pop("native_time_scale", None)
+    meta.pop("native_time_scale_seconds", None)
+    paths.meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    before = paths.meta.read_bytes()
+
+    load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        batch_size=1,
+        n_entities=1,
+        norm_scope="cache",
+        shuffle_train=False,
+        date_batching=False,
+        window=2,
+        horizon=2,
+        split_policy="contiguous",
+        exact_timestamp_batches=True,
+    )
+
+    assert paths.meta.read_bytes() == before
 
 
 def test_panel_coverage_preserves_dense_date_filter(tmp_path):

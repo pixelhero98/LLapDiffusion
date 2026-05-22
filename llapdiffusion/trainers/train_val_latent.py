@@ -29,6 +29,12 @@ from llapdiffusion.models.llapdiff_utils import (
     targets_to_bhnc,
     vae_io_dims_for_target_dim,
 )
+from llapdiffusion.target_artifacts import (
+    loader_target_request_from_config,
+    target_metadata_from_config,
+    unwrap_checkpoint_model,
+    validate_checkpoint_target_metadata,
+)
 
 
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
@@ -61,6 +67,7 @@ def _ensure_loaders(
 
     if any(loader is None for loader in (train_dl, val_dl, test_dl)):
         run_experiment = resolve_run_experiment(config.DATA_DIR)
+        target_col, target_cols = loader_target_request_from_config(config)
         train_dl, val_dl, test_dl, sizes = run_experiment(
             data_dir=config.DATA_DIR,
             date_batching=config.date_batching,
@@ -71,8 +78,8 @@ def _ensure_loaders(
             ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
             split_policy=getattr(config, "split_policy", "global_purged_horizon"),
             exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
-            target_col=None if getattr(config, "TARGET_COLS", None) else getattr(config, "TARGET_COL", None),
-            target_cols=getattr(config, "TARGET_COLS", None),
+            target_col=target_col,
+            target_cols=target_cols,
         )
     elif sizes is None:
         try:
@@ -387,7 +394,23 @@ def _vae_entity_suffix(config=config) -> str:
 
 
 def _vae_checkpoint_path(kind: str, config=config) -> Path:
-    return Path(config.VAE_DIR) / f"pred-{config.PRED}_ch-{config.VAE_LATENT_CHANNELS}{_vae_entity_suffix(config)}_{kind}.pt"
+    target_suffix = str(getattr(config, "TARGET_ARTIFACT_SUFFIX", "") or "")
+    return Path(config.VAE_DIR) / f"pred-{config.PRED}_ch-{config.VAE_LATENT_CHANNELS}{_vae_entity_suffix(config)}{target_suffix}_{kind}.pt"
+
+
+def _vae_checkpoint_payload(model: LatentVAE, config=config, **extra) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "model": model.state_dict(),
+        "target_metadata": target_metadata_from_config(config),
+        "target_dim": int(getattr(config, "TARGET_DIM", 1)),
+        "target_cols": list(getattr(config, "TARGET_COLS", []) or []),
+        "target_indices": list(getattr(config, "TARGET_INDICES", []) or []),
+        "target_source": str(getattr(config, "TARGET_SOURCE", "")),
+        "vae_input_dim": int(getattr(config, "VAE_INPUT_DIM", 2)),
+        "vae_output_dim": int(getattr(config, "VAE_OUTPUT_DIM", 1)),
+    }
+    payload.update(extra)
+    return payload
 
 
 def _infer_num_entities(loader: Iterable) -> int:
@@ -441,8 +464,9 @@ def _load_checkpoint_model(
     config=config,
 ) -> LatentVAE:
     model = _build_model(device, config=config)
-    state = torch.load(Path(checkpoint_path), map_location=device)
-    model.load_state_dict(state)
+    payload = torch.load(Path(checkpoint_path), map_location=device)
+    validate_checkpoint_target_metadata(payload, config, context="VAE")
+    model.load_state_dict(unwrap_checkpoint_model(payload))
     model.eval()
     return model
 
@@ -812,23 +836,44 @@ def run(
             if checkpoint_ready and improved_elbo:
                 best_val_elbo = val_elbo_beta
                 best_elbo_path = _vae_checkpoint_path("elbo", config=config)
-                torch.save(model.state_dict(), best_elbo_path)
+                torch.save(
+                    _vae_checkpoint_payload(
+                        model,
+                        config=config,
+                        epoch=epoch,
+                        checkpoint_kind="elbo",
+                        val_elbo_beta=float(val_elbo_beta),
+                        val_recon=float(val_recon),
+                    ),
+                    best_elbo_path,
+                )
                 if debug:
                     print("  -> Saved best beta-ELBO checkpoint")
 
             if checkpoint_ready and improved_recon:
                 best_val_recon = val_recon
                 best_recon_path = _vae_checkpoint_path("recon", config=config)
-                torch.save(model.state_dict(), best_recon_path)
+                torch.save(
+                    _vae_checkpoint_payload(
+                        model,
+                        config=config,
+                        epoch=epoch,
+                        checkpoint_kind="recon",
+                        val_elbo_beta=float(val_elbo_beta),
+                        val_recon=float(val_recon),
+                    ),
+                    best_recon_path,
+                )
                 if debug:
                     print("  -> Saved best reconstruction checkpoint")
 
             patience_counter = 0 if improved_elbo else (patience_counter + 1)
             if epoch >= min_epochs and patience_counter >= max_patience:
-                print(
-                    f"\nEarly stopping at epoch {epoch}: β·ELBO hasn't improved in {max_patience} epochs "
-                    f"after the minimum {min_epochs} epochs."
-                )
+                if verbose:
+                    print(
+                        f"\nEarly stopping at epoch {epoch}: β·ELBO hasn't improved in {max_patience} epochs "
+                        f"after the minimum {min_epochs} epochs."
+                    )
                 break
     else:
         best_elbo_path = _vae_checkpoint_path("elbo", config=config)

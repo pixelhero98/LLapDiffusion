@@ -16,7 +16,7 @@ from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.datasets.target_selection import resolve_target_selection
 
 
-_COPIED_CACHES: dict[tuple[str, str, str, int], Path] = {}
+_COPIED_CACHES: dict[tuple[str, str, str, int, tuple[str, ...]], Path] = {}
 
 
 def load_dataset_loaders(
@@ -44,6 +44,9 @@ def load_dataset_loaders(
     coverage = float(coverage)
     if not 0.0 <= coverage < 1.0:
         raise ValueError("coverage must be in the half-open interval [0, 1)")
+    requested_target_cols = tuple(str(col).strip() for col in (target_cols or ()) if str(col).strip())
+    if target_col and requested_target_cols:
+        raise ValueError("Use either target_col or target_cols, not both.")
 
     if dataset_key == "noaa_us":
         meta_path = data_dir / "cache_ratio_index" / "meta.json"
@@ -55,7 +58,7 @@ def load_dataset_loaders(
                 raise RuntimeError("noaa_us copied cache reindex requires --work-cache-dir")
             root = Path(work_cache_dir).expanduser().resolve()
             root.mkdir(parents=True, exist_ok=True)
-            cache_key = (dataset_key, str(data_dir.resolve()), str(root), horizon)
+            cache_key = (dataset_key, str(data_dir.resolve()), str(root), horizon, requested_target_cols)
             copy_dir = _COPIED_CACHES.get(cache_key)
             if copy_dir is None:
                 copy_dir = root / f"noaa_us_h{horizon}_{os.getpid()}_{time.time_ns()}"
@@ -70,10 +73,6 @@ def load_dataset_loaders(
     else:
         run_experiment = resolve_run_experiment(data_dir)
 
-    requested_target_cols = tuple(str(col).strip() for col in (target_cols or ()) if str(col).strip())
-    if target_col and requested_target_cols:
-        raise ValueError("Use either target_col or target_cols, not both.")
-
     sig = inspect.signature(run_experiment)
     if requested_target_cols and len(requested_target_cols) > 1 and "target_cols" not in sig.parameters:
         raise RuntimeError(
@@ -82,6 +81,20 @@ def load_dataset_loaders(
     loader_target_col = target_col
     if requested_target_cols and len(requested_target_cols) == 1 and "target_cols" not in sig.parameters:
         loader_target_col = requested_target_cols[0]
+    if requested_target_cols and "target_cols" in sig.parameters:
+        reindex = True
+        if not copied_cache and allow_cache_copy and work_cache_dir is not None:
+            root = Path(work_cache_dir).expanduser().resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            cache_key = (dataset_key, str(data_dir.resolve()), str(root), horizon, requested_target_cols)
+            copy_dir = _COPIED_CACHES.get(cache_key)
+            if copy_dir is None:
+                tag = "_".join(col.lower().replace("/", "_") for col in requested_target_cols[:3])
+                copy_dir = root / f"{dataset_key}_h{horizon}_{tag}_{os.getpid()}_{time.time_ns()}"
+                shutil.copytree(data_dir, copy_dir)
+                _COPIED_CACHES[cache_key] = copy_dir
+            data_dir = copy_dir
+            copied_cache = True
 
     kwargs = {
         "data_dir": str(data_dir),

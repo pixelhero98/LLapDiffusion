@@ -929,7 +929,16 @@ def make_collate_level_and_firstdiff(
 
             ctx_times = _pick(s, "ctx_times", "times_x", "x_times")
             y_times = _pick(s, "y_times", "times_y", "target_times")
-            ctx_times_list.append(_as_np(ctx_times) if ctx_times is not None else None)
+            ctx_times_arr = _as_np(ctx_times) if ctx_times is not None else None
+            context_end_key = _pick(s, "context_end_time_key", "context_end_key")
+            if ctx_times_arr is None and context_end_key is not None:
+                key_arr = np.asarray(context_end_key).reshape(-1)
+                if key_arr.size:
+                    try:
+                        ctx_times_arr = np.asarray([int(key_arr[0])], dtype="datetime64[ns]")
+                    except Exception:
+                        ctx_times_arr = key_arr[:1]
+            ctx_times_list.append(ctx_times_arr)
             y_times_list.append(_as_np(y_times) if y_times is not None else None)
 
             # Preserve explicit relative deltas when provided by the dataset.
@@ -1300,6 +1309,10 @@ class _IndexBackedDataset(Dataset):
             Tf[e-1],
             self.native_time_scale_seconds,
         )
+        try:
+            meta['context_end_time_key'] = int(np.asarray(Tf[e-1]).astype("datetime64[ns]").astype(np.int64))
+        except Exception:
+            meta['context_end_time_key'] = Tf[e-1]
         if self.keep_time_meta != 'none':
             if self.keep_time_meta == 'full':
                 meta['ctx_times'] = Tf[s:e]
@@ -1827,11 +1840,6 @@ def load_dataloaders_with_ratio_split(
         norm_stats = json.load(f)
 
     native_time_scale_name, native_time_scale_seconds = _infer_native_time_scale(paths, assets, meta)
-    if meta.get('native_time_scale') != native_time_scale_name or float(meta.get('native_time_scale_seconds', 0.0)) != float(native_time_scale_seconds):
-        meta['native_time_scale'] = native_time_scale_name
-        meta['native_time_scale_seconds'] = float(native_time_scale_seconds)
-        with paths.meta.open('w') as f:
-            json.dump(meta, f, indent=2)
 
     # Collate (levels + first-diff), grouped-by-end if requested later
     if collate_fn is None:
@@ -1911,8 +1919,8 @@ def load_dataloaders_with_ratio_split(
     
     ds_tr = _IndexBackedDataset(tr_pairs, assets, data_dir, window, horizon, regression,
                                 keep_time_meta, norm_stats, clamp_sigma=float(meta.get('clamp_sigma', 5.0)),
-                                native_time_scale_seconds=float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
-                                native_time_scale_name=str(meta.get('native_time_scale', native_time_scale_name)),
+                                native_time_scale_seconds=float(native_time_scale_seconds),
+                                native_time_scale_name=str(native_time_scale_name),
                                 target_index=target_selection.target_index,
                                 target_indices=target_selection.target_indices,
                                 target_dim=target_selection.target_dim,
@@ -1921,8 +1929,8 @@ def load_dataloaders_with_ratio_split(
                                 seed=seed)
     ds_va = _IndexBackedDataset(va_pairs, assets, data_dir, window, horizon, regression,
                                 keep_time_meta, norm_stats, clamp_sigma=float(meta.get('clamp_sigma', 5.0)),
-                                native_time_scale_seconds=float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
-                                native_time_scale_name=str(meta.get('native_time_scale', native_time_scale_name)),
+                                native_time_scale_seconds=float(native_time_scale_seconds),
+                                native_time_scale_name=str(native_time_scale_name),
                                 target_index=target_selection.target_index,
                                 target_indices=target_selection.target_indices,
                                 target_dim=target_selection.target_dim,
@@ -1931,8 +1939,8 @@ def load_dataloaders_with_ratio_split(
                                 seed=seed)
     ds_te = _IndexBackedDataset(te_pairs, assets, data_dir, window, horizon, regression,
                                 keep_time_meta, norm_stats, clamp_sigma=float(meta.get('clamp_sigma', 5.0)),
-                                native_time_scale_seconds=float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
-                                native_time_scale_name=str(meta.get('native_time_scale', native_time_scale_name)),
+                                native_time_scale_seconds=float(native_time_scale_seconds),
+                                native_time_scale_name=str(native_time_scale_name),
                                 target_index=target_selection.target_index,
                                 target_indices=target_selection.target_indices,
                                 target_dim=target_selection.target_dim,
@@ -1956,7 +1964,7 @@ def load_dataloaders_with_ratio_split(
                 pairs,
                 window,
                 horizon,
-                float(meta.get('native_time_scale_seconds', native_time_scale_seconds)),
+                float(native_time_scale_seconds),
             )
             if exact_timestamp_batches
             else None

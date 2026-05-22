@@ -126,12 +126,19 @@ def _load_target_cols_map(value: str | None) -> dict[str, tuple[str, ...]]:
     parsed = json.loads(text)
     if not isinstance(parsed, Mapping):
         raise ValueError("--target-cols-map must be a JSON object.")
+    known_dataset_keys = set(dataset_keys())
     out: dict[str, tuple[str, ...]] = {}
     for dataset_key, cols in parsed.items():
+        dataset_key = str(dataset_key)
+        if dataset_key not in known_dataset_keys:
+            raise ValueError(
+                f"--target-cols-map contains unknown dataset key {dataset_key!r}; "
+                f"supported keys are {tuple(sorted(known_dataset_keys))}."
+            )
         coerced = _coerce_target_cols(cols)
         if not coerced:
             raise ValueError(f"--target-cols-map entry for {dataset_key!r} is empty.")
-        out[str(dataset_key)] = coerced
+        out[dataset_key] = coerced
     return out
 
 

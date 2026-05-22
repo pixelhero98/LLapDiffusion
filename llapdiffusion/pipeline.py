@@ -14,6 +14,7 @@ from llapdiffusion.configs.dataset_defaults import apply_dataset_preset, dataset
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.datasets.target_selection import resolve_target_selection
 from llapdiffusion.logging_utils import apply_verbosity
+from llapdiffusion.target_artifacts import apply_target_metadata_to_config, loader_target_request_from_config
 from llapdiffusion.trainers import train_val_latent, train_val_summarizer, train_val_llapdiff
 
 
@@ -31,6 +32,7 @@ def prepare_dataloaders(
     """Build train/val/test loaders using the shared configuration."""
 
     run_experiment = resolve_run_experiment(config.DATA_DIR)
+    target_col, target_cols = loader_target_request_from_config(config)
     return run_experiment(
         data_dir=config.DATA_DIR,
         date_batching=config.date_batching,
@@ -41,8 +43,8 @@ def prepare_dataloaders(
         ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
         split_policy=getattr(config, "split_policy", "global_purged_horizon"),
         exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
-        target_col=None if getattr(config, "TARGET_COLS", None) else getattr(config, "TARGET_COL", None),
-        target_cols=getattr(config, "TARGET_COLS", None),
+        target_col=target_col,
+        target_cols=target_cols,
     )
 
 
@@ -139,11 +141,27 @@ def _target_policy(config=config) -> Dict[str, object]:
 def _sync_target_shape_config(config=config) -> Dict[str, object]:
     policy = _target_policy(config=config)
     target_dim = int(policy.get("target_dim") or 1)
-    config.TARGET_DIM = target_dim
-    config.TARGET_COL = policy.get("target_col")
-    config.TARGET_COLS = list(policy.get("target_cols") or [])
+    target_metadata = apply_target_metadata_to_config(config, policy)
     config.VAE_OUTPUT_DIM = target_dim
     config.VAE_INPUT_DIM = 2 * target_dim
+    suffix = str(getattr(config, "TARGET_ARTIFACT_SUFFIX", "") or "")
+    if suffix:
+        entity_suffix = "_entity" if bool(getattr(config, "VAE_ENTITY_CONDITION", False)) else ""
+        config.VAE_CKPT = str(
+            Path(config.VAE_DIR)
+            / f"pred-{config.PRED}_ch-{config.VAE_LATENT_CHANNELS}{entity_suffix}{suffix}_elbo.pt"
+        )
+        if hasattr(config, "OUT_DIR"):
+            out_dir = Path(str(config.OUT_DIR))
+            if not out_dir.name.endswith(suffix):
+                config.OUT_DIR = str(out_dir.with_name(out_dir.name + suffix))
+        if hasattr(config, "CKPT_DIR"):
+            ckpt_dir = Path(str(config.CKPT_DIR))
+            if not ckpt_dir.name.endswith(suffix):
+                config.CKPT_DIR = str(ckpt_dir.with_name(ckpt_dir.name + suffix))
+        if hasattr(config, "POLE_PLOT_DIR") and hasattr(config, "OUT_DIR"):
+            config.POLE_PLOT_DIR = str(Path(str(config.OUT_DIR)) / "pole_plots")
+    config.TARGET_METADATA = target_metadata
     return policy
 
 
@@ -151,14 +169,24 @@ def _update_config_for_pred(pred: int, config=config) -> None:
     split_policy = getattr(config, "split_policy", "global_purged_horizon")
     split_scope = getattr(config, "split_scope", "global_target_time")
     exact_timestamp_batches = bool(getattr(config, "exact_timestamp_batches", True))
-    target_col = getattr(config, "TARGET_COL", None)
-    target_cols = getattr(config, "TARGET_COLS", None)
+    requested_target_col = getattr(
+        config,
+        "REQUESTED_TARGET_COL_ARG",
+        getattr(config, "TARGET_COL", None),
+    )
+    requested_target_cols = getattr(
+        config,
+        "REQUESTED_TARGET_COLS_ARG",
+        getattr(config, "TARGET_COLS", None),
+    )
     apply_dataset_preset(config, _resolve_dataset_key(config=config), pred=int(pred))
     config.split_policy = split_policy
     config.split_scope = split_scope
     config.exact_timestamp_batches = exact_timestamp_batches
-    config.TARGET_COL = target_col
-    config.TARGET_COLS = target_cols
+    config.REQUESTED_TARGET_COL_ARG = requested_target_col
+    config.REQUESTED_TARGET_COLS_ARG = requested_target_cols
+    config.TARGET_COL = requested_target_col
+    config.TARGET_COLS = requested_target_cols
     config.SUM_CONTEXT_LEN = _resolve_sum_context_len(pred, config=config)
     config.SUM_CKPT = str(
         Path(config.SUM_DIR) / f"{pred}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
@@ -686,11 +714,13 @@ def _print_summary_table(results: Dict[int, Dict[str, object]]) -> None:
 def main() -> Dict[int, Dict[str, object]]:
     args = _parse_args()
     configure_dataset_archive(args.dataset_zip, args.dataset_extract_dir)
-    initial_pred = int(args.preds[0]) if args.preds else None
+    initial_pred = int(args.preds[0]) if args.preds else int(default_horizons(args.dataset_key)[0])
     apply_dataset_preset(config, args.dataset_key, pred=initial_pred)
     apply_verbosity(config, verbose=args.verbose, debug=args.debug)
     if args.target_col and args.target_cols:
         raise ValueError("Use either --target-col or --target-cols, not both.")
+    config.REQUESTED_TARGET_COL_ARG = args.target_col
+    config.REQUESTED_TARGET_COLS_ARG = list(args.target_cols) if args.target_cols else None
     config.TARGET_COL = args.target_col
     config.TARGET_COLS = args.target_cols
     if args.split_policy is not None:

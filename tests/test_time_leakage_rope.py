@@ -289,6 +289,183 @@ def test_vae_checkpoint_path_preserves_entity_suffix(tmp_path):
     assert tvl._vae_checkpoint_path("elbo", config=cfg).name == "pred-20_ch-12_entity_elbo.pt"
 
 
+def test_nondefault_target_selection_gets_target_specific_artifact_paths(tmp_path):
+    from llapdiffusion import pipeline
+    from llapdiffusion.trainers import train_val_latent as tvl
+
+    cfg = SimpleNamespace(
+        VAE_DIR=str(tmp_path / "vae"),
+        PRED=20,
+        VAE_LATENT_CHANNELS=12,
+        VAE_ENTITY_CONDITION=True,
+        VAE_CKPT=str(tmp_path / "vae" / "pred-20_ch-12_entity_elbo.pt"),
+        OUT_DIR=str(tmp_path / "out" / "pred-20"),
+        CKPT_DIR=str(tmp_path / "ckpt" / "pred-20"),
+        POLE_PLOT_DIR=str(tmp_path / "out" / "pred-20" / "pole_plots"),
+    )
+
+    default_policy = {
+        "target_col": "RET_CLOSE",
+        "target_cols": ["RET_CLOSE"],
+        "target_indices": [0],
+        "target_dim": 1,
+        "target_source": "cache_target",
+        "requested_target_col": None,
+        "requested_target_cols": [],
+    }
+    multi_policy = {
+        "target_col": "RET_CLOSE",
+        "target_cols": ["RET_CLOSE", "RVOL20_CLOSE"],
+        "target_indices": [0, 1],
+        "target_dim": 2,
+        "target_source": "feature_columns",
+        "requested_target_col": "RET_CLOSE",
+        "requested_target_cols": ["RET_CLOSE", "RVOL20_CLOSE"],
+    }
+    old_target_policy = pipeline._target_policy
+    try:
+        pipeline._target_policy = lambda config: default_policy
+        pipeline._sync_target_shape_config(config=cfg)
+        assert cfg.TARGET_ARTIFACT_SUFFIX == ""
+        assert tvl._vae_checkpoint_path("elbo", config=cfg).name == "pred-20_ch-12_entity_elbo.pt"
+
+        pipeline._target_policy = lambda config: multi_policy
+        pipeline._sync_target_shape_config(config=cfg)
+    finally:
+        pipeline._target_policy = old_target_policy
+
+    assert cfg.TARGET_ARTIFACT_SUFFIX.startswith("_tdim-2_targets-ret-close-rvol20-close-")
+    assert cfg.TARGET_ARTIFACT_SUFFIX in cfg.VAE_CKPT
+    assert cfg.TARGET_ARTIFACT_SUFFIX in cfg.OUT_DIR
+    assert cfg.TARGET_ARTIFACT_SUFFIX in tvl._vae_checkpoint_path("recon", config=cfg).name
+
+
+def test_checkpoint_target_metadata_mismatch_fails_clearly():
+    from llapdiffusion.target_artifacts import validate_checkpoint_target_metadata
+
+    cfg = SimpleNamespace(
+        TARGET_COL="RET_CLOSE",
+        TARGET_COLS=["RET_CLOSE", "RVOL20_CLOSE"],
+        TARGET_INDICES=[0, 1],
+        TARGET_DIM=2,
+        TARGET_SOURCE="feature_columns",
+        REQUESTED_TARGET_COL="RET_CLOSE",
+        REQUESTED_TARGET_COLS=["RET_CLOSE", "RVOL20_CLOSE"],
+    )
+    payload = {
+        "model": {},
+        "target_metadata": {
+            "target_col": "RET_CLOSE",
+            "target_cols": ["RET_CLOSE"],
+            "target_indices": [0],
+            "target_dim": 1,
+            "target_source": "cache_target",
+        },
+    }
+
+    with pytest.raises(ValueError, match="target metadata mismatch"):
+        validate_checkpoint_target_metadata(payload, cfg, context="VAE")
+
+
+def test_checkpoint_scalar_target_metadata_mismatch_fails_clearly():
+    from llapdiffusion.target_artifacts import validate_checkpoint_target_metadata
+
+    cfg = SimpleNamespace(
+        TARGET_COL="B",
+        TARGET_COLS=["B"],
+        TARGET_INDICES=[1],
+        TARGET_DIM=1,
+        TARGET_SOURCE="cache_target",
+        REQUESTED_TARGET_COL=None,
+        REQUESTED_TARGET_COLS=[],
+    )
+    payload = {
+        "model": {},
+        "target_metadata": {
+            "target_col": "A",
+            "target_cols": ["A"],
+            "target_indices": [0],
+            "target_dim": 1,
+            "target_source": "cache_target",
+            "requested_target_col": None,
+            "requested_target_cols": [],
+        },
+    }
+
+    with pytest.raises(ValueError, match="target metadata mismatch"):
+        validate_checkpoint_target_metadata(payload, cfg, context="VAE")
+
+
+def test_loader_target_request_ignores_resolved_default_metadata():
+    from llapdiffusion.target_artifacts import loader_target_request_from_config, target_artifact_suffix
+
+    resolved_default = SimpleNamespace(
+        TARGET_COL="RET_CLOSE",
+        TARGET_COLS=["RET_CLOSE"],
+        TARGET_METADATA={"target_cols": ["RET_CLOSE"], "target_dim": 1},
+        REQUESTED_TARGET_COL=None,
+        REQUESTED_TARGET_COLS=[],
+    )
+    raw_programmatic = SimpleNamespace(TARGET_COL=None, TARGET_COLS=["RET_OPEN", "RET_CLOSE"])
+
+    assert loader_target_request_from_config(resolved_default) == (None, None)
+    assert loader_target_request_from_config(raw_programmatic) == (
+        None,
+        ["RET_OPEN", "RET_CLOSE"],
+    )
+    assert (
+        target_artifact_suffix(
+            {
+                "target_col": "RET_CLOSE",
+                "target_cols": ["RET_CLOSE"],
+                "target_dim": 1,
+                "target_source": "cache_target",
+                "requested_target_col": "RET_CLOSE",
+                "requested_target_cols": ["RET_CLOSE"],
+            }
+        )
+        == ""
+    )
+
+
+def test_update_config_for_pred_preserves_raw_target_request(monkeypatch, tmp_path):
+    from llapdiffusion import pipeline
+
+    calls = []
+
+    def fake_apply(config, dataset_key, pred):
+        calls.append((dataset_key, pred))
+        config.DATASET_KEY = dataset_key
+        config.PRED = pred
+        config.SUM_DIR = str(tmp_path / "sum")
+        config.VAE_LATENT_CHANNELS = 12
+        config.TARGET_COL = None
+        config.TARGET_COLS = None
+
+    cfg = SimpleNamespace(
+        DATASET_KEY="crypto",
+        split_policy="global_purged_horizon",
+        split_scope="global_target_time",
+        exact_timestamp_batches=True,
+        TARGET_COL="RET_CLOSE",
+        TARGET_COLS=["RET_CLOSE"],
+        REQUESTED_TARGET_COL_ARG=None,
+        REQUESTED_TARGET_COLS_ARG=None,
+    )
+
+    monkeypatch.setattr(pipeline, "apply_dataset_preset", fake_apply)
+    monkeypatch.setattr(pipeline, "_resolve_sum_context_len", lambda pred, config: pred)
+
+    pipeline._update_config_for_pred(20, config=cfg)
+
+    assert calls == [("crypto", 20)]
+    assert cfg.TARGET_COL is None
+    assert cfg.TARGET_COLS is None
+    assert cfg.REQUESTED_TARGET_COL_ARG is None
+    assert cfg.REQUESTED_TARGET_COLS_ARG is None
+    assert cfg.SUM_CKPT.endswith("20-12-summarizer.pt")
+
+
 def test_vae_amp_flag_controls_cuda_autocast():
     from llapdiffusion.trainers import train_val_latent as tvl
 
@@ -494,6 +671,13 @@ def test_primary_loader_coverage_help_uses_context_missingness_wording(monkeypat
     assert "fraction of observed context entries to hide; 0 disables induced missingness" in compact_help
 
 
+def test_artifact_prep_target_cols_map_rejects_unknown_dataset_key():
+    from llapdiffusion.tools import run_multidataset_artifact_prep as prep
+
+    with pytest.raises(ValueError, match="unknown dataset key 'not_a_dataset'"):
+        prep._load_target_cols_map('{"crypto": ["RET"], "not_a_dataset": ["x"]}')
+
+
 def test_llapdiff_train_main_applies_dataset_preset_with_requested_pred(monkeypatch):
     from llapdiffusion import pipeline
 
@@ -530,6 +714,45 @@ def test_llapdiff_train_main_applies_dataset_preset_with_requested_pred(monkeypa
     assert calls["preset"] == [("crypto", 100)]
     assert calls["preds"] == [100]
     assert result == {100: {"eval_stats": {}}}
+
+
+def test_llapdiff_train_main_defaults_to_all_dataset_horizons(monkeypatch):
+    from llapdiffusion import pipeline
+
+    calls = {"preset": [], "preds": []}
+    default_preds = (5, 20, 60, 100)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llapdiff-train",
+            "--dataset-key",
+            "crypto",
+        ],
+    )
+    monkeypatch.setattr(pipeline, "configure_dataset_archive", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "default_horizons", lambda dataset_key: default_preds)
+
+    def fake_apply(config, dataset_key, pred=None):
+        calls["preset"].append((dataset_key, pred))
+        config.PIPELINE_PREDS = default_preds
+        config.OUT_DIR = "out"
+        config.CKPT_DIR = "ckpt"
+
+    def fake_run_single_pred(pred, **kwargs):
+        calls["preds"].append(pred)
+        return {"eval_stats": {}}
+
+    monkeypatch.setattr(pipeline, "apply_dataset_preset", fake_apply)
+    monkeypatch.setattr(pipeline, "run_single_pred", fake_run_single_pred)
+    monkeypatch.setattr(pipeline, "_print_summary_table", lambda results: None)
+
+    result = pipeline.main()
+
+    assert calls["preset"] == [("crypto", 5)]
+    assert calls["preds"] == [5, 20, 60, 100]
+    assert result == {pred: {"eval_stats": {}} for pred in default_preds}
 
 
 def test_missing_dataset_archive_fails_early(tmp_path, monkeypatch):
@@ -1378,6 +1601,20 @@ def test_checkpoint_eval_routes_sample_counts(monkeypatch, tmp_path):
         imputation_num_samples=9,
     )
     assert captured == {"forecast": [7], "impute": [9, 9]}
+
+
+def test_checkpoint_eval_creates_out_json_parent_dirs(monkeypatch, tmp_path):
+    from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
+
+    _patch_checkpoint_eval_dependencies(monkeypatch, ce)
+    cfg = _checkpoint_eval_cfg()
+    out_path = tmp_path / "nested" / "eval" / "result.json"
+
+    ce.evaluate_checkpoint(cfg, tmp_path / "model.pt", label="saved", out_path=out_path)
+
+    assert out_path.exists()
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "saved"
 
 
 def test_checkpoint_eval_routes_max_eval_batches(monkeypatch, tmp_path):

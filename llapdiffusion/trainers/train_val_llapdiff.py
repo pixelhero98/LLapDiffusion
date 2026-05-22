@@ -36,6 +36,12 @@ from llapdiffusion.models.llapdiff_utils import (
     targets_to_bhnc,
     vae_io_dims_for_target_dim,
 )
+from llapdiffusion.target_artifacts import (
+    loader_target_request_from_config,
+    target_metadata_from_config,
+    unwrap_checkpoint_model,
+    validate_checkpoint_target_metadata,
+)
 from llapdiffusion.models.time_utils import relative_time_offsets
 
 
@@ -492,6 +498,7 @@ def _ensure_loaders(
 ) -> Tuple[LoaderTuple, Optional[Tuple[int, int, int]]]:
     if any(loader is None for loader in (train_dl, val_dl, test_dl)):
         run_experiment = resolve_run_experiment(config.DATA_DIR)
+        target_col, target_cols = loader_target_request_from_config(config)
         train_dl, val_dl, test_dl, sizes = run_experiment(
             data_dir=config.DATA_DIR,
             date_batching=config.date_batching,
@@ -502,8 +509,8 @@ def _ensure_loaders(
             ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
             split_policy=getattr(config, "split_policy", "global_purged_horizon"),
             exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
-            target_col=None if getattr(config, "TARGET_COLS", None) else getattr(config, "TARGET_COL", None),
-            target_cols=getattr(config, "TARGET_COLS", None),
+            target_col=target_col,
+            target_cols=target_cols,
         )
     elif sizes is None:
         try:
@@ -1318,6 +1325,7 @@ def _load_eval_checkpoint(
     diff_model: nn.Module,
     ema: Optional[EMA],
     device: torch.device,
+    config_obj: object,
     verbose: bool = False,
 ) -> Optional[str]:
     """Load a checkpoint for evaluation and return the loaded path.
@@ -1328,6 +1336,7 @@ def _load_eval_checkpoint(
         return None
 
     payload = torch.load(checkpoint_path, map_location=device)
+    validate_checkpoint_target_metadata(payload, config_obj, context="LLapDiff")
     state_dict = payload.get("model") if isinstance(payload, dict) else None
     if state_dict is None:
         print(f"[warn] checkpoint missing model weights: {checkpoint_path}")
@@ -1640,7 +1649,9 @@ def run(
     vae_ckpt = Path(config.VAE_CKPT)
     if not vae_ckpt.exists():
         raise FileNotFoundError(f"Missing VAE checkpoint: {vae_ckpt}")
-    _load_module_state(vae, torch.load(vae_ckpt, map_location=device), strict=True)
+    vae_payload = torch.load(vae_ckpt, map_location=device)
+    validate_checkpoint_target_metadata(vae_payload, config, context="VAE")
+    _load_module_state(vae, unwrap_checkpoint_model(vae_payload), strict=True)
     vae.eval()
 
     # ---------------- Summarizer (frozen) ----------------
@@ -2206,12 +2217,34 @@ def run(
     best_val_crps_by_source = {"raw": float("inf"), "ema": float("inf")}
     last_epoch = 0
     out_dir = Path(getattr(config, "OUT_DIR", "./outputs"))
-    pred_tag = f"pred-{int(getattr(config, 'PRED', 0))}"
+    target_suffix = str(getattr(config, "TARGET_ARTIFACT_SUFFIX", "") or "")
+    pred_tag = f"pred-{int(getattr(config, 'PRED', 0))}{target_suffix}"
     best_ckpt_path = out_dir / f"llapdiff_{pred_tag}_best.pt"
     best_ckpt_path_raw = out_dir / f"llapdiff_{pred_tag}_best_raw.pt"
     best_ckpt_path_ema = out_dir / f"llapdiff_{pred_tag}_best_ema.pt"
     last_ckpt_path = out_dir / f"llapdiff_{pred_tag}_last.pt"
     save_best = bool(getattr(config, "SAVE_BEST", True))
+
+    def _checkpoint_payload(**extra) -> Dict[str, object]:
+        metadata = target_metadata_from_config(config)
+        payload: Dict[str, object] = {
+            "model": diff_model.state_dict(),
+            "model_config": _llapdiff_model_config(config),
+            "ema": ema.state_dict() if ema is not None else None,
+            "optimizer": optimizer.state_dict(),
+            "target_metadata": metadata,
+            "target_dim": int(target_dim),
+            "target_cols": list(metadata.get("target_cols", [])),
+            "target_indices": list(metadata.get("target_indices", [])),
+            "target_source": str(metadata.get("target_source", "")),
+            "target_signature": str(metadata.get("target_signature", "")),
+            "vae_input_dim": int(vae_input_dim),
+            "vae_output_dim": int(vae_output_dim),
+            "mu_mean": mu_mean.detach().cpu(),
+            "mu_std": mu_std.detach().cpu(),
+        }
+        payload.update(extra)
+        return payload
 
     epochs = int(getattr(config, "EPOCHS", 1))
     eval_every = max(1, int(getattr(config, "EVAL_EVERY", 1)))
@@ -2445,17 +2478,8 @@ def run(
                 if save_best:
                     _save_checkpoint(
                         best_ckpt_path_raw,
-                        {
-                            "model": diff_model.state_dict(),
-                            "model_config": _llapdiff_model_config(config),
-                            "ema": ema.state_dict() if ema is not None else None,
-                            "optimizer": optimizer.state_dict(),
+                        _checkpoint_payload(**{
                             "epoch": epoch + 1,
-                            "target_dim": int(target_dim),
-                            "vae_input_dim": int(vae_input_dim),
-                            "vae_output_dim": int(vae_output_dim),
-                            "mu_mean": mu_mean.detach().cpu(),
-                            "mu_std": mu_std.detach().cpu(),
                             "val_metrics": raw_val_metrics,
                             "val_metric_source": "raw",
                             "best_val_crps": best_val_crps_by_source["raw"],
@@ -2463,7 +2487,7 @@ def run(
                                 "raw": _finite_or_none(best_val_crps_by_source["raw"]),
                                 "ema": _finite_or_none(best_val_crps_by_source["ema"]),
                             },
-                        },
+                        }),
                     )
 
             if ema_val_metrics is not None and float(ema_val_metrics["crps"]) < best_val_crps_by_source["ema"]:
@@ -2471,17 +2495,8 @@ def run(
                 if save_best:
                     _save_checkpoint(
                         best_ckpt_path_ema,
-                        {
-                            "model": diff_model.state_dict(),
-                            "model_config": _llapdiff_model_config(config),
-                            "ema": ema.state_dict() if ema is not None else None,
-                            "optimizer": optimizer.state_dict(),
+                        _checkpoint_payload(**{
                             "epoch": epoch + 1,
-                            "target_dim": int(target_dim),
-                            "vae_input_dim": int(vae_input_dim),
-                            "vae_output_dim": int(vae_output_dim),
-                            "mu_mean": mu_mean.detach().cpu(),
-                            "mu_std": mu_std.detach().cpu(),
                             "val_metrics": ema_val_metrics,
                             "val_metric_source": "ema",
                             "best_val_crps": best_val_crps_by_source["ema"],
@@ -2489,7 +2504,7 @@ def run(
                                 "raw": _finite_or_none(best_val_crps_by_source["raw"]),
                                 "ema": _finite_or_none(best_val_crps_by_source["ema"]),
                             },
-                        },
+                        }),
                     )
 
         primary_metrics = None
@@ -2520,17 +2535,8 @@ def run(
                 if save_best:
                     _save_checkpoint(
                         best_ckpt_path,
-                        {
-                            "model": diff_model.state_dict(),
-                            "model_config": _llapdiff_model_config(config),
-                            "ema": ema.state_dict() if ema is not None else None,
-                            "optimizer": optimizer.state_dict(),
+                        _checkpoint_payload(**{
                             "epoch": epoch + 1,
-                            "target_dim": int(target_dim),
-                            "vae_input_dim": int(vae_input_dim),
-                            "vae_output_dim": int(vae_output_dim),
-                            "mu_mean": mu_mean.detach().cpu(),
-                            "mu_std": mu_std.detach().cpu(),
                             "val_metrics": primary_metrics,
                             "val_metric_source": val_metric_source,
                             "best_val_crps": _finite_or_none(best_val_crps),
@@ -2540,32 +2546,24 @@ def run(
                             },
                             "best_primary_metric": best_primary_metric,
                             "best_primary_metric_name": primary_eval_metric,
-                        },
+                        }),
                     )
             elif (epoch + 1) >= early_stop_min_epochs:
                 patience_ctr += 1
 
             if early_stop_patience > 0 and (epoch + 1) >= early_stop_min_epochs and patience_ctr >= early_stop_patience:
-                print(
-                    f"[early stop] validation {primary_eval_metric} did not improve for {early_stop_patience} evals "
-                    f"after epoch {early_stop_min_epochs}"
-                )
+                if verbose:
+                    print(
+                        f"[early stop] validation {primary_eval_metric} did not improve for {early_stop_patience} evals "
+                        f"after epoch {early_stop_min_epochs}"
+                    )
                 break
 
     # Always save final checkpoint
     _save_checkpoint(
         last_ckpt_path,
-        {
-            "model": diff_model.state_dict(),
-            "model_config": _llapdiff_model_config(config),
-            "ema": ema.state_dict() if ema is not None else None,
-            "optimizer": optimizer.state_dict(),
+        _checkpoint_payload(**{
             "epoch": last_epoch,
-            "target_dim": int(target_dim),
-            "vae_input_dim": int(vae_input_dim),
-            "vae_output_dim": int(vae_output_dim),
-            "mu_mean": mu_mean.detach().cpu(),
-            "mu_std": mu_std.detach().cpu(),
             "train_losses": train_losses,
             "train_history": train_history,
             "val_history": val_history,
@@ -2582,7 +2580,7 @@ def run(
             "best_primary_metric_name": primary_eval_metric,
             "val_metric_source": val_metric_source,
             "test_metric_source": test_metric_source,
-        },
+        }),
     )
 
     best_checkpoint = str(best_ckpt_path) if best_ckpt_path.exists() else None
@@ -2604,6 +2602,7 @@ def run(
         diff_model=diff_model,
         ema=ema,
         device=device,
+        config_obj=config,
         verbose=verbose,
     )
 

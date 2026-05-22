@@ -588,13 +588,16 @@ def run_experiment(
             "Re-run prepare_physionet_cinc_cache with larger values first."
         )
 
-    if reindex and (K != base_window or H != base_horizon):
+    needs_reindex = K != base_window or H != base_horizon
+    needs_target_reindex = target_col is not None or target_cols is not None
+
+    if reindex and (needs_reindex or needs_target_reindex):
         _validate_window_and_horizon(K, H)
         _rebuild_window_index_only(
             data_dir,
             window=K,
             horizon=H,
-            update_meta=True,
+            update_meta=needs_reindex,
             backup_old=False,
             target_col=target_col,
             target_cols=target_cols,
