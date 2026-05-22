@@ -10,6 +10,14 @@ LLapDiffusion trains a timestamp-aware latent diffusion model for irregular mult
 
 *Continuous-time latent generation with context samples, query path, latent coordinates, and stable complex poles.*
 
+## Limitation
+
+> Less effective when sampling is regular and no temporal (gap) missingness.
+> 
+> Realizations of the latent space and the history summarizer are just preliminary, which leaves room for improvement for follow-up works.
+>
+> Parameterized dynamics are locally linearized with the residual MLP as tiny nonlinear corrections. A natural follow-up is to derive global and nonlinear parameterized dynamics.
+
 ## Installation
 
 Create a Python 3.11 environment and install the package:
