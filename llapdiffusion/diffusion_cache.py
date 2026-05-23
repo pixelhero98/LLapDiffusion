@@ -215,6 +215,8 @@ class DiffusionSplitCache:
             mu_norm = mu_norm * obs_any.unsqueeze(-1).to(dtype=mu_norm.dtype)
             if not torch.isfinite(mu_norm).all():
                 raise FloatingPointError("cached normalized VAE latent means are non-finite")
+            mu_norm = mu_norm.detach()
+            obs_any = obs_any.detach()
 
         if load_summary:
             if self._summary is None:
@@ -225,6 +227,7 @@ class DiffusionSplitCache:
             )
             if not torch.isfinite(summary_raw).all():
                 raise FloatingPointError("cached raw conditioning summary is non-finite")
+            summary_raw = summary_raw.detach()
 
         return PreparedDiffusionBatch(mu_norm=mu_norm, obs_any=obs_any, summary_raw=summary_raw)
 

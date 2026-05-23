@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -79,6 +80,12 @@ def _nan_to_num(x: torch.Tensor) -> torch.Tensor:
 
 def _is_finite_tensor(x: Optional[torch.Tensor]) -> bool:
     return x is None or bool(torch.isfinite(x).all().item())
+
+
+def _release_cuda_allocator(device: torch.device) -> None:
+    if device.type == "cuda":
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def _grads_are_finite_params(params) -> bool:
@@ -1916,6 +1923,8 @@ def run(
         summary_ft_mode=sum_ft_mode,
         verbose=verbose,
     )
+    if diffusion_input_cache is not None:
+        _release_cuda_allocator(device)
 
     # ---------------- Latent stats / calibration ----------------
     latent_norm_mode = str(getattr(config, "LATENT_NORM_MODE", "global"))
@@ -1938,6 +1947,8 @@ def run(
             vae=vae,
             latent_stats=(mu_mean, mu_std),
         )
+    if diffusion_input_cache is not None:
+        _release_cuda_allocator(device)
     if debug:
         print(
             f"Baseline target variance ({config.PREDICT_TYPE}): {baseline_target_variance:.6f}"
@@ -1967,6 +1978,8 @@ def run(
             f"{latent_probe['feat_std_min']:.4f}/"
             f"{latent_probe['feat_std_max']:.4f}"
         )
+    if diffusion_input_cache is not None:
+        _release_cuda_allocator(device)
 
     pole_probe_state = _init_pole_probe(diff_model, laplace_summarizer, train_dl, device) if bool(getattr(config, "POLE_PROBE", False)) else None
     pole_probe_every = max(1, int(getattr(config, "POLE_PROBE_EVERY", 1)))
@@ -1976,7 +1989,7 @@ def run(
     minsnr_normalize = str(getattr(config, "MINSNR_NORMALIZE", "auto"))
     cond_train_mode = str(getattr(config, "COND_TRAIN_MODE", "auto")).strip().lower()
     if cond_train_mode == "auto":
-        cond_train_mode = "dual" if bool(getattr(config, "date_batching", False)) else "stochastic"
+        cond_train_mode = "stochastic"
     if cond_train_mode not in {"stochastic", "dual"}:
         raise ValueError(
             f"Unknown COND_TRAIN_MODE '{cond_train_mode}'. Use 'auto', 'stochastic' or 'dual'."
