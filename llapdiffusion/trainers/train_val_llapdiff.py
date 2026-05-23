@@ -15,6 +15,10 @@ from torch.utils.data import DataLoader
 from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.logging_utils import is_debug, is_verbose
+from llapdiffusion.diffusion_cache import (
+    DiffusionSplitCache,
+    build_or_load_diffusion_input_cache,
+)
 from llapdiffusion.latent_space.latent_vae import LatentVAE
 from llapdiffusion.models.summarizer import LaplaceAE
 from llapdiffusion.models.llapdiff import LLapDiff
@@ -413,19 +417,25 @@ def _build_cond_summary(
     x_obs_mask: Optional[torch.Tensor] = None,
     norm: bool = True,
     requires_grad: bool = False,
+    summary_base_raw: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     adapter = getattr(diff_model, "cond_adapter", None) if diff_model is not None else None
-    cond_summary_raw = build_context(
-        summarizer,
-        V,
-        T,
-        mask_bn,
-        device,
-        dt=dt,
-        x_obs_mask=x_obs_mask,
-        norm=False,
-        requires_grad=requires_grad,
-    )
+    if summary_base_raw is None:
+        cond_summary_raw = build_context(
+            summarizer,
+            V,
+            T,
+            mask_bn,
+            device,
+            dt=dt,
+            x_obs_mask=x_obs_mask,
+            norm=False,
+            requires_grad=requires_grad,
+        )
+    else:
+        if requires_grad:
+            raise RuntimeError("cached summarizer outputs cannot be used while summarizer gradients are active")
+        cond_summary_raw = summary_base_raw.to(device=device, dtype=V.dtype)
     if adapter is not None:
         stats = _history_stat_tokens(V, T, mask_bn, device, dt=dt, x_obs_mask=x_obs_mask)
         cond_summary_raw = adapter(cond_summary_raw, stats)
@@ -445,19 +455,25 @@ def _build_cond_summary_pair(
     x_obs_mask: Optional[torch.Tensor] = None,
     norm: bool = True,
     requires_grad: bool = False,
+    summary_base_raw: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     adapter = getattr(diff_model, "cond_adapter", None) if diff_model is not None else None
-    cond_summary_raw = build_context(
-        summarizer,
-        V,
-        T,
-        mask_bn,
-        device,
-        dt=dt,
-        x_obs_mask=x_obs_mask,
-        norm=False,
-        requires_grad=requires_grad,
-    )
+    if summary_base_raw is None:
+        cond_summary_raw = build_context(
+            summarizer,
+            V,
+            T,
+            mask_bn,
+            device,
+            dt=dt,
+            x_obs_mask=x_obs_mask,
+            norm=False,
+            requires_grad=requires_grad,
+        )
+    else:
+        if requires_grad:
+            raise RuntimeError("cached summarizer outputs cannot be used while summarizer gradients are active")
+        cond_summary_raw = summary_base_raw.to(device=device, dtype=V.dtype)
     if adapter is not None:
         stats = _history_stat_tokens(V, T, mask_bn, device, dt=dt, x_obs_mask=x_obs_mask)
         cond_summary_raw = adapter(cond_summary_raw, stats)
@@ -634,6 +650,34 @@ def _collect_pole_probe(
     }
 
 
+def _latent_targets_for_batch(
+    vae: nn.Module,
+    yb: torch.Tensor,
+    mask_bn: torch.Tensor,
+    meta: Dict[str, torch.Tensor],
+    device: torch.device,
+    mu_mean: torch.Tensor,
+    mu_std: torch.Tensor,
+    *,
+    cached_batch=None,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if cached_batch is not None and cached_batch.mu_norm is not None and cached_batch.obs_any is not None:
+        return cached_batch.mu_norm, cached_batch.obs_any
+
+    x_tok, entity_pad, obs = pack_targets_tokens(
+        yb, mask_bn, device, y_obs_mask=meta.get("y_obs_mask")
+    )
+    if x_tok is None or obs is None or not obs.any():
+        return None, None
+
+    obs_any = target_time_observed(obs)
+    mu_norm = encode_mu_norm(
+        vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std
+    )
+    mu_norm = mu_norm * obs_any.unsqueeze(-1).to(dtype=mu_norm.dtype)
+    return mu_norm, obs_any
+
+
 @torch.no_grad()
 def _collect_latent_probe(
     vae: nn.Module,
@@ -643,23 +687,41 @@ def _collect_latent_probe(
     mu_std: torch.Tensor,
     *,
     max_batches: int = 4,
+    input_cache: Optional[DiffusionSplitCache] = None,
 ) -> Optional[Dict[str, float]]:
     """Estimate whether normalized latent targets are actually centered/scaled as expected."""
     vals = []
     batches = 0
+    if input_cache is not None:
+        input_cache.reset()
     for xb, yb, meta in train_dl:
         (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta, device)
         if not mask_bn.any():
             continue
-        x_tok, entity_pad, obs = pack_targets_tokens(
-            yb, mask_bn, device, y_obs_mask=meta.get("y_obs_mask")
+        cached_batch = (
+            input_cache.next_batch(
+                meta,
+                device=device,
+                mu_mean=mu_mean,
+                mu_std=mu_std,
+                load_latents=True,
+                load_summary=False,
+            )
+            if input_cache is not None
+            else None
         )
-        if x_tok is None or not obs.any():
+        mu_norm, obs_any = _latent_targets_for_batch(
+            vae,
+            yb,
+            mask_bn,
+            meta,
+            device,
+            mu_mean,
+            mu_std,
+            cached_batch=cached_batch,
+        )
+        if mu_norm is None or obs_any is None or not obs_any.any():
             continue
-        obs_any = target_time_observed(obs)
-        mu_norm = encode_mu_norm(
-            vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std
-        )
         mu_obs = mu_norm[obs_any]
         if mu_obs.numel() == 0:
             continue
@@ -795,6 +857,7 @@ def evaluate_val_diagnostics(
     num_snr_bins: int = 8,
     min_log_snr: float = -12.0,
     max_log_snr: float = 12.0,
+    input_cache: Optional[DiffusionSplitCache] = None,
 ) -> Dict[str, object]:
     """Return validation MSE diagnostics for the active prediction parameterization."""
     predict_type_name = str(getattr(config, "PREDICT_TYPE", "x0")).strip().lower() or "x0"
@@ -814,10 +877,24 @@ def evaluate_val_diagnostics(
         ema.store(diff_model)
         ema.copy_to(diff_model)
 
+    if input_cache is not None:
+        input_cache.reset()
     for xb, yb, meta in dataloader:
         (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta, device)
         if not mask_bn.any():
             continue
+        cached_batch = (
+            input_cache.next_batch(
+                meta,
+                device=device,
+                mu_mean=mu_mean,
+                mu_std=mu_std,
+                load_latents=True,
+                load_summary=True,
+            )
+            if input_cache is not None
+            else None
+        )
 
         cond_summary, cond_summary_raw = _build_cond_summary_pair(
             summarizer,
@@ -828,6 +905,7 @@ def evaluate_val_diagnostics(
             device,
             dt=meta.get("delta_t"),
             x_obs_mask=meta.get("x_obs_mask"),
+            summary_base_raw=(cached_batch.summary_raw if cached_batch is not None else None),
         )
         dt_b = _flatten_dt(
             meta,
@@ -836,17 +914,18 @@ def evaluate_val_diagnostics(
             key="delta_t_y",
         )
 
-        x_tok, entity_pad, obs = pack_targets_tokens(
-            yb, mask_bn, device, y_obs_mask=meta.get("y_obs_mask")
+        mu_norm, obs_any = _latent_targets_for_batch(
+            vae,
+            yb,
+            mask_bn,
+            meta,
+            device,
+            mu_mean,
+            mu_std,
+            cached_batch=cached_batch,
         )
-        if x_tok is None or not obs.any():
+        if mu_norm is None or obs_any is None or not obs_any.any():
             continue
-
-        obs_any = target_time_observed(obs)
-        mu_norm = encode_mu_norm(
-            vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std
-        )
-        mu_norm = mu_norm * obs_any.unsqueeze(-1).to(dtype=mu_norm.dtype)
         if not _is_finite_tensor(mu_norm):
             raise FloatingPointError("non-finite latent targets detected during validation")
 
@@ -1825,17 +1904,40 @@ def run(
             f"dropout={float(getattr(config, 'COND_ADAPTER_DROPOUT', 0.0)):.3f}"
         )
 
+    # ---------------- Precomputed frozen diffusion inputs ----------------
+    diffusion_input_cache = build_or_load_diffusion_input_cache(
+        train_dl=train_dl,
+        val_dl=val_dl,
+        test_dl=test_dl,
+        vae=vae,
+        summarizer=laplace_summarizer,
+        device=device,
+        config_obj=config,
+        summary_ft_mode=sum_ft_mode,
+        verbose=verbose,
+    )
+
     # ---------------- Latent stats / calibration ----------------
     latent_norm_mode = str(getattr(config, "LATENT_NORM_MODE", "global"))
-    mu_mean, mu_std = compute_latent_stats(vae, train_dl, device, mode=latent_norm_mode)
-    baseline_target_variance = calculate_target_variance(
-        predict_type=config.PREDICT_TYPE,
-        dataloader=train_dl,
-        device=device,
-        scheduler=scheduler,
-        vae=vae,
-        latent_stats=(mu_mean, mu_std),
-    )
+    if diffusion_input_cache is not None:
+        mu_mean, mu_std = diffusion_input_cache.mu_mean, diffusion_input_cache.mu_std
+        baseline_target_variance = diffusion_input_cache.train.calculate_target_variance(
+            predict_type=config.PREDICT_TYPE,
+            scheduler=scheduler,
+            device=device,
+            mu_mean=mu_mean,
+            mu_std=mu_std,
+        )
+    else:
+        mu_mean, mu_std = compute_latent_stats(vae, train_dl, device, mode=latent_norm_mode)
+        baseline_target_variance = calculate_target_variance(
+            predict_type=config.PREDICT_TYPE,
+            dataloader=train_dl,
+            device=device,
+            scheduler=scheduler,
+            vae=vae,
+            latent_stats=(mu_mean, mu_std),
+        )
     if debug:
         print(
             f"Baseline target variance ({config.PREDICT_TYPE}): {baseline_target_variance:.6f}"
@@ -1850,6 +1952,7 @@ def run(
             mu_mean,
             mu_std,
             max_batches=latent_probe_batches,
+            input_cache=(diffusion_input_cache.train if diffusion_input_cache is not None else None),
         )
         if debug and latent_probe_batches > 0
         else None
@@ -1937,10 +2040,25 @@ def run(
             else None
         )
 
+        train_input_cache = diffusion_input_cache.train if diffusion_input_cache is not None else None
+        if train_input_cache is not None:
+            train_input_cache.reset()
         for xb, yb, meta in train_dl:
             (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta, device)
             if not mask_bn.any():
                 continue
+            cached_batch = (
+                train_input_cache.next_batch(
+                    meta,
+                    device=device,
+                    mu_mean=mu_mean,
+                    mu_std=mu_std,
+                    load_latents=True,
+                    load_summary=True,
+                )
+                if train_input_cache is not None
+                else None
+            )
 
             cond_summary, cond_summary_raw = _build_cond_summary_pair(
                 laplace_summarizer,
@@ -1952,6 +2070,7 @@ def run(
                 dt=meta.get("delta_t"),
                 x_obs_mask=meta.get("x_obs_mask"),
                 requires_grad=summary_ft_active,
+                summary_base_raw=(cached_batch.summary_raw if cached_batch is not None else None),
             )
             if not _is_finite_tensor(cond_summary):
                 raise FloatingPointError("non-finite cond_summary detected")
@@ -1967,17 +2086,18 @@ def run(
             if not _is_finite_tensor(dt_flat):
                 raise FloatingPointError("non-finite delta_t_y detected")
 
-            x_tok, entity_pad, obs = pack_targets_tokens(
-                yb, mask_bn, device, y_obs_mask=meta.get("y_obs_mask")
+            mu_norm, obs_any = _latent_targets_for_batch(
+                vae,
+                yb,
+                mask_bn,
+                meta,
+                device,
+                mu_mean,
+                mu_std,
+                cached_batch=cached_batch,
             )
-            if x_tok is None or not obs.any():
+            if mu_norm is None or obs_any is None or not obs_any.any():
                 continue
-
-            obs_any = target_time_observed(obs)  # [B,H]
-            mu_norm = encode_mu_norm(
-                vae, x_tok, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std
-            )
-            mu_norm = mu_norm * obs_any.unsqueeze(-1).to(dtype=mu_norm.dtype)
             if not _is_finite_tensor(mu_norm):
                 raise FloatingPointError("non-finite latent targets detected")
 
@@ -2402,6 +2522,7 @@ def run(
                 num_snr_bins=int(getattr(config, "VAL_DIAG_SNR_BINS", 8)),
                 min_log_snr=float(getattr(config, "VAL_DIAG_LOGSNR_MIN", -12.0)),
                 max_log_snr=float(getattr(config, "VAL_DIAG_LOGSNR_MAX", 12.0)),
+                input_cache=(diffusion_input_cache.val if diffusion_input_cache is not None else None),
             )
             predict_type_name = str(getattr(config, "PREDICT_TYPE", "")).strip().lower()
             metric_label = "x0" if predict_type_name in {"", "x0"} else predict_type_name

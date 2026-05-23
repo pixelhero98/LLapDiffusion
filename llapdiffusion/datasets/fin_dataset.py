@@ -906,6 +906,7 @@ def make_collate_level_and_firstdiff(
         # ---------- Required tensors ----------
         V_list, T_list, y_list = [], [], []
         asset_ids = []
+        window_starts = []
         ctx_times_list, y_times_list = [], []
         delta_t_list, delta_t_y_list = [], []
         x_obs_list, y_obs_list = [], []
@@ -926,6 +927,7 @@ def make_collate_level_and_firstdiff(
             y_list.append(y.astype(np.float32, copy=False))
 
             asset_ids.append(int(_pick(s, "asset_id", "entity_id", default=-1)))
+            window_starts.append(int(_pick(s, "start_idx", "window_start", default=-1)))
 
             ctx_times = _pick(s, "ctx_times", "times_x", "x_times")
             y_times = _pick(s, "y_times", "times_y", "target_times")
@@ -1004,6 +1006,8 @@ def make_collate_level_and_firstdiff(
 
         # entity mask: mark seen asset_ids
         entity_mask = np.zeros((B, int(n_entities)), dtype=bool)
+        cache_asset_ids = np.full((B, int(n_entities)), -1, dtype=np.int64)
+        cache_window_starts = np.full((B, int(n_entities)), -1, dtype=np.int64)
         V_full = np.zeros((B, int(n_entities), K, F), dtype=np.float32)
         T_full = np.zeros((B, int(n_entities), K, F), dtype=np.float32)
         y_full_shape = (B, int(n_entities), H, *y_tail_shape)
@@ -1033,6 +1037,8 @@ def make_collate_level_and_firstdiff(
                 continue
 
             entity_mask[row, aid] = True
+            cache_asset_ids[row, aid] = int(asset_ids[j])
+            cache_window_starts[row, aid] = int(window_starts[j])
             V_full[row, aid] = V[j]
             T_full[row, aid] = T[j]
             y_full[row, aid] = y[j]
@@ -1106,6 +1112,8 @@ def make_collate_level_and_firstdiff(
             "entity_mask": torch.from_numpy(entity_mask),
             "delta_t": torch.from_numpy(delta_t),
             "delta_t_y": torch.from_numpy(delta_t_y),
+            "cache_asset_ids": torch.from_numpy(cache_asset_ids),
+            "cache_window_starts": torch.from_numpy(cache_window_starts),
         }
         if batch_time_keys is not None and all(key is not None for key in batch_time_keys):
             time_keys = np.asarray(batch_time_keys, dtype=np.int64)
@@ -1300,7 +1308,12 @@ class _IndexBackedDataset(Dataset):
         else:
             y_t = torch.tensor(int(raw_last_for_label > 0.0), dtype=torch.int64)
 
-        meta = {'asset_id': int(aid), 'asset': self.assets[int(aid)]}
+        meta = {
+            'asset_id': int(aid),
+            'asset': self.assets[int(aid)],
+            'start_idx': int(s),
+            'window_start': int(s),
+        }
         # Relative time deltas for context (K) and forecast horizon (H).
         # Always store these because diffusion/Laplace evaluation needs dt for irregular sampling.
         meta['delta_t'] = _compute_relative_time_deltas(Tf[s:e], self.native_time_scale_seconds)

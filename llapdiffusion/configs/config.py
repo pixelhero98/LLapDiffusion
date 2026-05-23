@@ -158,6 +158,13 @@ SELF_COND = False
 SELF_COND_P = 0.5
 SELF_COND_START_EPOCH = 450
 
+# Internal diffusion training acceleration. The public batch-size surface remains
+# BATCH_SIZE; these flags only control safe reuse of frozen upstream artifacts.
+DIFF_PRECOMPUTE_INPUTS = True
+DIFF_PRECOMPUTE_LATENT_DTYPE = "float32"
+DIFF_PRECOMPUTE_SUMMARY_DTYPE = "float16"
+DIFF_PRECOMPUTE_DIR = None
+
 
 # ============================ Evaluation & Sampling ============================
 
