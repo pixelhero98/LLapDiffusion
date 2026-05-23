@@ -338,15 +338,16 @@ def _validate_forecast_only_config(cfg: SimpleNamespace) -> None:
 
 
 def _build_loaders(cfg: SimpleNamespace):
+    batch_size = int(getattr(cfg, "BATCH_SIZE", getattr(cfg, "DATES_PER_BATCH", 1)))
     return synthetic_run_experiment(
         data_dir=cfg.DATA_DIR,
         date_batching=bool(getattr(cfg, "date_batching", True)),
-        dates_per_batch=int(cfg.DATES_PER_BATCH),
+        dates_per_batch=batch_size,
         K=int(cfg.WINDOW),
         H=int(cfg.PRED),
         coverage=float(cfg.COVERAGE),
         ratios=(cfg.train_ratio, cfg.val_ratio, cfg.test_ratio),
-        batch_size=int(cfg.BATCH_SIZE),
+        batch_size=batch_size,
         norm="train_only",
         per_asset=True,
         split_policy=getattr(cfg, "split_policy", "global_purged_horizon"),

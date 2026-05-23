@@ -71,13 +71,15 @@ def _ensure_loaders(
     if any(loader is None for loader in (train_loader, val_loader, test_loader)):
         run_experiment = resolve_run_experiment(config.DATA_DIR)
         target_col, target_cols = loader_target_request_from_config(config)
+        batch_size = int(getattr(config, "BATCH_SIZE", getattr(config, "DATES_PER_BATCH", 1)))
         train_loader, val_loader, test_loader, sizes = run_experiment(
             data_dir=config.DATA_DIR,
             date_batching=config.date_batching,
-            dates_per_batch=int(config.DATES_PER_BATCH),
+            dates_per_batch=batch_size,
             K=config.WINDOW,
             H=config.PRED,
             coverage=config.COVERAGE,
+            batch_size=batch_size,
             ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
             split_policy=getattr(config, "split_policy", "global_purged_horizon"),
             exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),

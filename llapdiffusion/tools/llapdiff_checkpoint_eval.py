@@ -510,13 +510,15 @@ def evaluate_checkpoint(
     batch_cap = _resolve_max_eval_batches(max_eval_batches)
     device = set_torch(seed=int(getattr(cfg, "SEED", 42)), deterministic=bool(getattr(cfg, "DETERMINISTIC", False)))
     run_experiment = resolve_run_experiment(cfg.DATA_DIR)
+    batch_size = int(getattr(cfg, "BATCH_SIZE", getattr(cfg, "DATES_PER_BATCH", 1)))
     train_dl, val_dl, test_dl, sizes = run_experiment(
         data_dir=cfg.DATA_DIR,
         date_batching=cfg.date_batching,
-        dates_per_batch=cfg.DATES_PER_BATCH,
+        dates_per_batch=batch_size,
         K=cfg.WINDOW,
         H=cfg.PRED,
         coverage=cfg.COVERAGE,
+        batch_size=batch_size,
         ratios=(cfg.train_ratio, cfg.val_ratio, cfg.test_ratio),
         split_policy=getattr(cfg, "split_policy", "global_purged_horizon"),
         exact_timestamp_batches=bool(getattr(cfg, "exact_timestamp_batches", True)),

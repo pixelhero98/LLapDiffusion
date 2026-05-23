@@ -21,14 +21,14 @@ PRED = 1
 WINDOW = 1
 COVERAGE = 0.0
 date_batching = True
-DATES_PER_BATCH = 1
 split_policy = "global_purged_horizon"
 split_scope = "global_target_time"
 exact_timestamp_batches = True
 
-# Table batch sizes are applied by the dataset preset registry. Runtime
-# date-panel batching still uses DATES_PER_BATCH=1.
+# Dataset presets set BATCH_SIZE from the paper/table defaults and mirror it
+# into DATES_PER_BATCH so the public batch-size knob controls both loader paths.
 BATCH_SIZE = 1
+DATES_PER_BATCH = 1
 train_ratio = 0.7
 val_ratio = 0.1
 test_ratio = 0.2

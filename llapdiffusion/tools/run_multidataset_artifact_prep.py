@@ -115,6 +115,14 @@ def _validate_coverage(value: object) -> float:
     return coverage
 
 
+def _effective_batch_size(cfg) -> int:
+    fallback = getattr(cfg, "DATES_PER_BATCH", 1)
+    batch_size = int(getattr(cfg, "BATCH_SIZE", fallback))
+    if batch_size < 1:
+        raise ValueError("BATCH_SIZE must be a positive integer.")
+    return batch_size
+
+
 def _load_target_cols_map(value: str | None) -> dict[str, tuple[str, ...]]:
     if not value:
         return {}
@@ -168,21 +176,21 @@ def _artifact_config(
     cfg.TARGET_COL = target_col
     cfg.TARGET_COLS = list(target_cols) if target_cols else None
     cfg.COVERAGE = _validate_coverage(coverage)
-    # Artifact prep prioritizes stable loader semantics over the table batch-size row.
-    cfg.BATCH_SIZE = 1
-    cfg.DATES_PER_BATCH = 1
+    cfg.DATES_PER_BATCH = _effective_batch_size(cfg)
     return cfg
 
 
 def _build_loaders(cfg):
     run_experiment = resolve_run_experiment(cfg.DATA_DIR)
+    batch_size = _effective_batch_size(cfg)
     return run_experiment(
         data_dir=cfg.DATA_DIR,
         date_batching=cfg.date_batching,
-        dates_per_batch=cfg.DATES_PER_BATCH,
+        dates_per_batch=batch_size,
         K=cfg.WINDOW,
         H=cfg.PRED,
         coverage=cfg.COVERAGE,
+        batch_size=batch_size,
         ratios=(cfg.train_ratio, cfg.val_ratio, cfg.test_ratio),
         split_policy=getattr(cfg, "split_policy", "global_purged_horizon"),
         exact_timestamp_batches=bool(getattr(cfg, "exact_timestamp_batches", True)),

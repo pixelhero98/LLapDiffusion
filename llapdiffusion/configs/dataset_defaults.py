@@ -226,7 +226,7 @@ def apply_dataset_preset(cfg: object, dataset_key: str, *, pred: int | None = No
     setattr(cfg, "split_scope", preset.split_scope)
     setattr(cfg, "exact_timestamp_batches", preset.exact_timestamp_batches)
     setattr(cfg, "BATCH_SIZE", preset.table_batch_size)
-    setattr(cfg, "DATES_PER_BATCH", 1)
+    setattr(cfg, "DATES_PER_BATCH", preset.table_batch_size)
 
     setattr(cfg, "VAE_LATENT_CHANNELS", preset.vae_latent_channels)
     vae_entity_condition = bool(getattr(cfg, "VAE_ENTITY_CONDITION", True))
@@ -314,7 +314,7 @@ def validate_dataset_presets(keys: Iterable[str] | None = None) -> dict[str, obj
                 "horizons": list(preset.horizons),
                 "context_length": preset.context_length,
                 "table_batch_size": preset.table_batch_size,
-                "runtime_dates_per_batch": 1,
+                "runtime_dates_per_batch": preset.table_batch_size,
                 "split_policy": preset.split_policy,
                 "split_scope": preset.split_scope,
                 "exact_timestamp_batches": preset.exact_timestamp_batches,

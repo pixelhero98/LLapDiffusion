@@ -33,13 +33,15 @@ def prepare_dataloaders(
 
     run_experiment = resolve_run_experiment(config.DATA_DIR)
     target_col, target_cols = loader_target_request_from_config(config)
+    batch_size = _effective_batch_size(config)
     return run_experiment(
         data_dir=config.DATA_DIR,
         date_batching=config.date_batching,
-        dates_per_batch=int(config.DATES_PER_BATCH),
+        dates_per_batch=batch_size,
         K=config.WINDOW,
         H=config.PRED,
         coverage=config.COVERAGE,
+        batch_size=batch_size,
         ratios=(config.train_ratio, config.val_ratio, config.test_ratio),
         split_policy=getattr(config, "split_policy", "global_purged_horizon"),
         exact_timestamp_batches=bool(getattr(config, "exact_timestamp_batches", True)),
@@ -61,6 +63,18 @@ def _validate_coverage(value: object) -> float:
     if not 0.0 <= coverage < 1.0:
         raise ValueError("--coverage must satisfy 0 <= coverage < 1.")
     return coverage
+
+
+def _validate_batch_size(value: object) -> int:
+    batch_size = int(value)
+    if batch_size < 1:
+        raise ValueError("--batch-size must be a positive integer.")
+    return batch_size
+
+
+def _effective_batch_size(config=config) -> int:
+    fallback = getattr(config, "DATES_PER_BATCH", 1)
+    return _validate_batch_size(getattr(config, "BATCH_SIZE", fallback))
 
 
 def _summarizer_ckpt_path(config=config) -> Path:
@@ -169,6 +183,7 @@ def _update_config_for_pred(pred: int, config=config) -> None:
     split_policy = getattr(config, "split_policy", "global_purged_horizon")
     split_scope = getattr(config, "split_scope", "global_target_time")
     exact_timestamp_batches = bool(getattr(config, "exact_timestamp_batches", True))
+    requested_batch_size = getattr(config, "REQUESTED_BATCH_SIZE_ARG", None)
     requested_target_col = getattr(
         config,
         "REQUESTED_TARGET_COL_ARG",
@@ -183,6 +198,11 @@ def _update_config_for_pred(pred: int, config=config) -> None:
     config.split_policy = split_policy
     config.split_scope = split_scope
     config.exact_timestamp_batches = exact_timestamp_batches
+    config.REQUESTED_BATCH_SIZE_ARG = requested_batch_size
+    if requested_batch_size is not None:
+        batch_size = _validate_batch_size(requested_batch_size)
+        config.BATCH_SIZE = batch_size
+        config.DATES_PER_BATCH = batch_size
     config.REQUESTED_TARGET_COL_ARG = requested_target_col
     config.REQUESTED_TARGET_COLS_ARG = requested_target_cols
     config.TARGET_COL = requested_target_col
@@ -428,6 +448,12 @@ def _parse_args() -> argparse.Namespace:
         help="Prediction horizons to run. Defaults to config.PIPELINE_PREDS or [config.PRED].",
     )
     parser.add_argument("--coverage", type=float, default=0.0, help=COVERAGE_HELP)
+    parser.add_argument(
+        "--batch-size",
+        type=_validate_batch_size,
+        default=None,
+        help="Effective loader batch size. Defaults to the dataset preset table value.",
+    )
     parser.add_argument(
         "--recompute-vae",
         action="store_true",
@@ -717,6 +743,11 @@ def main() -> Dict[int, Dict[str, object]]:
     initial_pred = int(args.preds[0]) if args.preds else int(default_horizons(args.dataset_key)[0])
     apply_dataset_preset(config, args.dataset_key, pred=initial_pred)
     apply_verbosity(config, verbose=args.verbose, debug=args.debug)
+    config.REQUESTED_BATCH_SIZE_ARG = args.batch_size
+    if args.batch_size is not None:
+        batch_size = _validate_batch_size(args.batch_size)
+        config.BATCH_SIZE = batch_size
+        config.DATES_PER_BATCH = batch_size
     if args.target_col and args.target_cols:
         raise ValueError("Use either --target-col or --target-cols, not both.")
     config.REQUESTED_TARGET_COL_ARG = args.target_col

@@ -841,6 +841,49 @@ def test_target_context_rejects_feature_width_mismatch():
         target_context(((V, T), y, meta), info)
 
 
+def test_public_dataset_presets_match_table_batch_sizes(monkeypatch):
+    from llapdiffusion.configs import dataset_defaults
+
+    expected = {
+        "bms_air": 10,
+        "uci_air": 10,
+        "physionet": 5,
+        "noaa_us": 15,
+        "noaa_uk": 15,
+        "us_equity": 5,
+        "crypto": 5,
+    }
+
+    monkeypatch.setattr(
+        dataset_defaults,
+        "resolve_dataset_dir",
+        lambda expected_dir, *, package_root: expected_dir,
+    )
+
+    assert {
+        key: preset.table_batch_size
+        for key, preset in dataset_defaults.DATASET_PRESETS.items()
+    } == expected
+
+    for key, batch_size in expected.items():
+        preset = dataset_defaults.get_dataset_preset(key)
+        cfg = SimpleNamespace(ARTIFACT_ROOT=".")
+        dataset_defaults.apply_dataset_preset(cfg, key, pred=preset.horizons[-1])
+        assert cfg.BATCH_SIZE == batch_size
+        assert cfg.DATES_PER_BATCH == batch_size
+
+
+def test_validate_dataset_presets_reports_runtime_table_batch_size(monkeypatch):
+    from llapdiffusion.configs import dataset_defaults
+
+    monkeypatch.setattr(dataset_defaults, "find_dataset_archive", lambda package_root: Path("datasets.zip"))
+    summary = dataset_defaults.validate_dataset_presets(dataset_defaults.dataset_keys())
+
+    for row in summary["rows"]:
+        preset = dataset_defaults.get_dataset_preset(row["dataset"])
+        assert row["runtime_dates_per_batch"] == preset.table_batch_size
+
+
 def test_public_dataset_wrappers_expose_split_and_batching_policy():
     modules = [
         "llapdiffusion.datasets.fin_dataset",
@@ -856,6 +899,7 @@ def test_public_dataset_wrappers_expose_split_and_batching_policy():
         assert "split_policy" in signature.parameters
         assert "exact_timestamp_batches" in signature.parameters
         assert "target_col" in signature.parameters
+        assert "batch_size" in signature.parameters
 
 
 def test_public_ratio_loader_helpers_expose_split_and_batching_policy():
@@ -891,6 +935,29 @@ def test_physionet_public_wrapper_defaults_to_legacy_split():
         .default
         == "contiguous"
     )
+
+
+def test_pipeline_batch_size_override_survives_pred_reset(monkeypatch):
+    from llapdiffusion import pipeline
+    from llapdiffusion.configs import dataset_defaults
+
+    monkeypatch.setattr(
+        dataset_defaults,
+        "resolve_dataset_dir",
+        lambda expected_dir, *, package_root: expected_dir,
+    )
+
+    cfg = SimpleNamespace(ARTIFACT_ROOT=".")
+    dataset_defaults.apply_dataset_preset(cfg, "bms_air", pred=24)
+    cfg.REQUESTED_BATCH_SIZE_ARG = 2
+    cfg.BATCH_SIZE = 2
+    cfg.DATES_PER_BATCH = 2
+
+    pipeline._update_config_for_pred(168, config=cfg)
+
+    assert cfg.BATCH_SIZE == 2
+    assert cfg.DATES_PER_BATCH == 2
+    assert cfg.PRED == 168
 
 
 def test_synthetic_public_path_defaults_to_exact_timestamp_batching():
@@ -975,7 +1042,8 @@ def test_pipeline_forwards_loader_policy(monkeypatch):
     cfg = SimpleNamespace(
         DATA_DIR="demo",
         date_batching=True,
-        DATES_PER_BATCH=4,
+        BATCH_SIZE=6,
+        DATES_PER_BATCH=99,
         WINDOW=2,
         PRED=3,
         COVERAGE=0.25,
@@ -990,6 +1058,8 @@ def test_pipeline_forwards_loader_policy(monkeypatch):
     assert pipeline.prepare_dataloaders(config=cfg)[3] == (1, 2, 3)
     assert seen["split_policy"] == "global_purged_horizon"
     assert seen["exact_timestamp_batches"] is True
+    assert seen["batch_size"] == 6
+    assert seen["dates_per_batch"] == 6
     assert seen["target_col"] == "ozone"
     assert seen["coverage"] == 0.25
 
@@ -1019,7 +1089,8 @@ def test_trainer_fallback_loaders_forward_target_col(monkeypatch, module_name):
     cfg = SimpleNamespace(
         DATA_DIR="demo-cache",
         date_batching=True,
-        DATES_PER_BATCH=2,
+        BATCH_SIZE=3,
+        DATES_PER_BATCH=99,
         WINDOW=4,
         PRED=2,
         COVERAGE=0.0,
@@ -1035,6 +1106,8 @@ def test_trainer_fallback_loaders_forward_target_col(monkeypatch, module_name):
 
     assert seen["data_dir"] == "demo-cache"
     assert seen["target_col"] == "alt"
+    assert seen["batch_size"] == 3
+    assert seen["dates_per_batch"] == 3
 
 
 def test_target_mask_excludes_missing_targets_even_when_entity_present():
