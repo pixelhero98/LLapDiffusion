@@ -40,7 +40,7 @@ class TrainConfig:
     imputation_random_mask_ratio: float = 0.30
     allow_cache_copy: bool = False
     epochs: int = 600
-    patience: int = 50
+    patience: int = 20
     lr: float = 1e-3
     horizons: tuple[int, ...] | str | None = "all"
     input_policy: str = "target_only"

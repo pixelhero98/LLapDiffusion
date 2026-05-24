@@ -1060,7 +1060,7 @@ def test_run_baselines_practical_defaults_are_full_comparison(monkeypatch):
 
     assert config.horizons == "all"
     assert config.epochs == 600
-    assert config.patience == 50
+    assert config.patience == 20
     assert config.num_samples == 25
     assert config.device == "auto"
     assert config.input_policy == "target_only"
@@ -1125,7 +1125,7 @@ def test_run_baselines_csdi_defaults_to_target_horizon_all_horizons(monkeypatch)
 
     assert config.horizons == "all"
     assert config.epochs == 600
-    assert config.patience == 50
+    assert config.patience == 20
     assert config.num_samples == 25
     assert config.device == "auto"
 
