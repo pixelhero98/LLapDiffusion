@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 
 from llapdiffusion.configs import config
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
-from llapdiffusion.logging_utils import is_debug, is_verbose
+from llapdiffusion.logging_utils import is_debug, is_verbose, progress_iter
 from llapdiffusion.latent_space.latent_vae import LatentVAE
 from llapdiffusion.latent_space.latent_vae_utils import normalize_and_check
 from llapdiffusion.models.llapdiff_utils import (
@@ -263,6 +263,8 @@ def _epoch_pass(
     noise_std: float = 0.0,
     cons_lambda: float = 0.0,
     recon_balance_mode: str = "none",
+    progress_enabled: bool = False,
+    progress_label: Optional[str] = None,
 ) -> Dict[str, float]:
     """Run one epoch step (train or eval) and accumulate statistics."""
 
@@ -278,7 +280,13 @@ def _epoch_pass(
 
     grad_ctx_factory = nullcontext if is_train else torch.no_grad
 
-    for (_, yb, meta) in loader:
+    batches = progress_iter(
+        loader,
+        desc=progress_label or "vae epoch",
+        enabled=progress_enabled,
+        unit="batch",
+    )
+    for (_, yb, meta) in batches:
         y = yb.to(device)
         entity_mask = meta["entity_mask"].to(device)
         y_obs_mask = _meta_y_obs_mask(meta, y)
@@ -804,6 +812,8 @@ def run(
                 noise_std=noise_std,
                 cons_lambda=cons_lambda,
                 recon_balance_mode=recon_balance_mode,
+                progress_enabled=verbose,
+                progress_label=f"vae train e{epoch:03d}/{config.EPOCHS:03d}",
             )
             val_totals = _epoch_pass(
                 val_dl,
@@ -815,6 +825,8 @@ def run(
                 noise_std=0.0,
                 cons_lambda=0.0,
                 recon_balance_mode=recon_balance_mode,
+                progress_enabled=verbose,
+                progress_label=f"vae val e{epoch:03d}/{config.EPOCHS:03d}",
             )
 
             train_recon, train_kl, train_cons = _aggregate_metrics(train_totals)

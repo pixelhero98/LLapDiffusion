@@ -14,7 +14,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
-from llapdiffusion.logging_utils import is_debug, is_verbose
+from llapdiffusion.logging_utils import is_debug, is_verbose, progress_iter
 from llapdiffusion.models.summarizer import LaplaceAE
 from llapdiffusion.target_artifacts import loader_target_request_from_config
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
@@ -240,6 +240,8 @@ def _run_epoch(
     amp: bool = False,
     max_nonfinite_grad_steps: int = 0,
     epoch_stats: Optional[MutableMapping[str, int]] = None,
+    progress_enabled: bool = False,
+    progress_label: Optional[str] = None,
 ) -> float:
     is_train = optimizer is not None
     total_loss = 0.0
@@ -247,7 +249,13 @@ def _run_epoch(
     nonfinite_grad_steps = 0
     max_nonfinite_grad_steps = max(0, int(max_nonfinite_grad_steps))
 
-    for batch in loader:
+    batches = progress_iter(
+        loader,
+        desc=progress_label or "summ epoch",
+        enabled=progress_enabled,
+        unit="batch",
+    )
+    for batch in batches:
         V, T, mask, elems, dt, obs_mask = _prepare_batch(batch, device)
         if elems == 0.0:
             continue
@@ -454,6 +462,14 @@ def run(
         epoch_start = time.time()
         model.train()
         epoch_stats: Dict[str, int] = {}
+        train_progress_kwargs = (
+            {
+                "progress_enabled": True,
+                "progress_label": f"summ train e{epoch:03d}/{epochs:03d}",
+            }
+            if verbose
+            else {}
+        )
         train_loss = _run_epoch(
             train_loader,
             model,
@@ -465,13 +481,29 @@ def run(
             amp=amp,
             max_nonfinite_grad_steps=max(0, max_nonfinite_grad_steps - skipped_nonfinite_grad_steps),
             epoch_stats=epoch_stats,
+            **train_progress_kwargs,
         )
         skipped_nonfinite_grad_steps += int(epoch_stats.get("skipped_nonfinite_grad_steps", 0))
         epoch_stats_history.append({"epoch": epoch, **epoch_stats})
 
         model.eval()
         with torch.no_grad():
-            val_loss = _run_epoch(val_loader, model, device, loss_weights=loss_weights, amp=amp)
+            val_progress_kwargs = (
+                {
+                    "progress_enabled": True,
+                    "progress_label": f"summ val e{epoch:03d}/{epochs:03d}",
+                }
+                if verbose
+                else {}
+            )
+            val_loss = _run_epoch(
+                val_loader,
+                model,
+                device,
+                loss_weights=loss_weights,
+                amp=amp,
+                **val_progress_kwargs,
+            )
 
         elapsed = time.time() - epoch_start
         improved = val_loss < (best_val - min_delta)
@@ -515,7 +547,19 @@ def run(
 
     model.eval()
     with torch.no_grad():
-        test_loss = _run_epoch(test_loader, model, device, loss_weights=loss_weights, amp=amp)
+        test_progress_kwargs = (
+            {"progress_enabled": True, "progress_label": "summ test"}
+            if verbose
+            else {}
+        )
+        test_loss = _run_epoch(
+            test_loader,
+            model,
+            device,
+            loss_weights=loss_weights,
+            amp=amp,
+            **test_progress_kwargs,
+        )
 
     if verbose:
         print(f"Best val loss: {best_val:.6f} | Test loss: {test_loss:.6f}")

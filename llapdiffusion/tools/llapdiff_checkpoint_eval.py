@@ -17,7 +17,7 @@ from llapdiffusion.configs.config_utils import clone_config, make_jsonable
 from llapdiffusion.configs.dataset_defaults import apply_dataset_preset, dataset_keys, default_horizons
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.datasets.target_selection import resolve_target_selection
-from llapdiffusion.logging_utils import apply_verbosity, is_verbose
+from llapdiffusion.logging_utils import apply_verbosity, is_verbose, progress_task
 
 from llapdiffusion.latent_space.latent_vae import LatentVAE
 from llapdiffusion.models.summarizer import LaplaceAE
@@ -311,6 +311,7 @@ def _evaluate_impute_case(
     rho: float = 7.5,
     generator_seed: Optional[int] = None,
     progress_label: Optional[str] = None,
+    progress_enabled: bool = False,
 ) -> Dict[str, float]:
     abs_sum = sq_sum = elts = 0.0
     crps_sum = crps_elts = 0.0
@@ -321,148 +322,154 @@ def _evaluate_impute_case(
         generator = torch.Generator(device=device)
         generator.manual_seed(int(generator_seed))
 
+    try:
+        progress_total = len(test_dl) * int(num_samples) * max(1, int(steps))
+    except TypeError:
+        progress_total = None
+
     processed_batches = 0
     valid_batches = 0
-    for xb, yb, meta in test_dl:
-        processed_batches += 1
-        (V, T), yb, mask_bn = tv._sanitize_batch(xb, yb, meta, device)
-        if not mask_bn.any():
-            continue
+    with progress_task(
+        desc=progress_label or "checkpoint-eval imputation",
+        enabled=progress_enabled,
+        total=progress_total,
+        unit="step",
+    ) as progress:
+        for xb, yb, meta in test_dl:
+            processed_batches += 1
+            (V, T), yb, mask_bn = tv._sanitize_batch(xb, yb, meta, device)
+            if not mask_bn.any():
+                continue
 
-        cond_summary, cond_summary_raw = tv._build_cond_summary_pair(
-            summarizer,
-            diff_model,
-            V,
-            T,
-            mask_bn,
-            device,
-            dt=meta.get("delta_t"),
-            x_obs_mask=meta.get("x_obs_mask"),
-        )
-        if not tv._is_finite_tensor(cond_summary):
-            raise FloatingPointError("non-finite cond_summary detected during checkpoint evaluation")
-        if cond_summary_raw is not None and not tv._is_finite_tensor(cond_summary_raw):
-            raise FloatingPointError("non-finite raw conditioning summary detected during checkpoint evaluation")
-        dt_b = tv._flatten_dt(
-            meta,
-            mask_bn,
-            device,
-            key="delta_t_y",
-        )
-        x_tok, entity_pad, obs = pack_targets_tokens(
-            yb,
-            mask_bn,
-            device,
-            y_obs_mask=meta.get("y_obs_mask"),
-        )
-        if x_tok is None or not obs.any():
-            continue
+            cond_summary, cond_summary_raw = tv._build_cond_summary_pair(
+                summarizer,
+                diff_model,
+                V,
+                T,
+                mask_bn,
+                device,
+                dt=meta.get("delta_t"),
+                x_obs_mask=meta.get("x_obs_mask"),
+            )
+            if not tv._is_finite_tensor(cond_summary):
+                raise FloatingPointError("non-finite cond_summary detected during checkpoint evaluation")
+            if cond_summary_raw is not None and not tv._is_finite_tensor(cond_summary_raw):
+                raise FloatingPointError("non-finite raw conditioning summary detected during checkpoint evaluation")
+            dt_b = tv._flatten_dt(
+                meta,
+                mask_bn,
+                device,
+                key="delta_t_y",
+            )
+            x_tok, entity_pad, obs = pack_targets_tokens(
+                yb,
+                mask_bn,
+                device,
+                y_obs_mask=meta.get("y_obs_mask"),
+            )
+            if x_tok is None or not obs.any():
+                continue
 
-        obs_any = target_time_observed(obs)
-        keep_mask = keep_fn(obs_any)
-        valid_seq = keep_mask.any(dim=1) & (obs_any & (~keep_mask)).any(dim=1)
-        if not valid_seq.any():
-            continue
-        valid_batches += 1
-        if progress_label and (valid_batches == 1 or valid_batches % 50 == 0):
-            print(
-                f"[checkpoint-eval:{progress_label}] valid_batches={valid_batches} "
-                f"processed_batches={processed_batches}",
-                flush=True,
+            obs_any = target_time_observed(obs)
+            keep_mask = keep_fn(obs_any)
+            valid_seq = keep_mask.any(dim=1) & (obs_any & (~keep_mask)).any(dim=1)
+            if not valid_seq.any():
+                continue
+            valid_batches += 1
+
+            cond_summary = cond_summary[valid_seq]
+            cond_summary_raw = cond_summary_raw[valid_seq]
+            yb = yb[valid_seq]
+            mask_bn = mask_bn[valid_seq]
+            x_tok = x_tok[valid_seq]
+            entity_pad = entity_pad[valid_seq]
+            obs = obs[valid_seq]
+            obs_any = obs_any[valid_seq]
+            keep_mask = keep_mask[valid_seq]
+            dt_model = tv._match_dt_to_horizon(
+                dt_b[valid_seq] if dt_b is not None else None,
+                x_tok.size(1),
             )
 
-        cond_summary = cond_summary[valid_seq]
-        cond_summary_raw = cond_summary_raw[valid_seq]
-        yb = yb[valid_seq]
-        mask_bn = mask_bn[valid_seq]
-        x_tok = x_tok[valid_seq]
-        entity_pad = entity_pad[valid_seq]
-        obs = obs[valid_seq]
-        obs_any = obs_any[valid_seq]
-        keep_mask = keep_mask[valid_seq]
-        dt_model = tv._match_dt_to_horizon(
-            dt_b[valid_seq] if dt_b is not None else None,
-            x_tok.size(1),
-        )
-
-        mu_norm = encode_mu_norm(
-            vae,
-            x_tok,
-            entity_pad=entity_pad,
-            mu_mean=mu_mean,
-            mu_std=mu_std,
-        )
-        mu_norm = mu_norm * obs_any.unsqueeze(-1).to(dtype=mu_norm.dtype)
-        y_obs = mu_norm * keep_mask.unsqueeze(-1).to(dtype=mu_norm.dtype)
-
-        all_samples = []
-        for _ in range(num_samples):
-            x0_norm = diff_model.generate(
-                shape=tuple(mu_norm.shape),
-                steps=steps,
-                guidance_strength=guidance_strength,
-                guidance_power=guidance_power,
-                eta=eta,
-                cond_summary=cond_summary,
-                cond_summary_raw=cond_summary_raw,
-                y_obs=y_obs,
-                obs_mask=keep_mask,
-                dt=dt_model,
-                cfg_rescale=True,
-                self_cond=False,
-                dynamic_thresh_p=dynamic_thresh_p,
-                dynamic_thresh_max=dynamic_thresh_max,
-                rho=rho,
-                generator=generator,
+            mu_norm = encode_mu_norm(
+                vae,
+                x_tok,
+                entity_pad=entity_pad,
+                mu_mean=mu_mean,
+                mu_std=mu_std,
             )
-            all_samples.append(
-                decode_latents_with_vae(
-                    vae,
-                    x0_norm,
-                    entity_pad=entity_pad,
-                    mu_mean=mu_mean,
-                    mu_std=mu_std,
+            mu_norm = mu_norm * obs_any.unsqueeze(-1).to(dtype=mu_norm.dtype)
+            y_obs = mu_norm * keep_mask.unsqueeze(-1).to(dtype=mu_norm.dtype)
+
+            all_samples = []
+            for _ in range(num_samples):
+                x0_norm = diff_model.generate(
+                    shape=tuple(mu_norm.shape),
+                    steps=steps,
+                    guidance_strength=guidance_strength,
+                    guidance_power=guidance_power,
+                    eta=eta,
+                    cond_summary=cond_summary,
+                    cond_summary_raw=cond_summary_raw,
+                    y_obs=y_obs,
+                    obs_mask=keep_mask,
+                    dt=dt_model,
+                    cfg_rescale=True,
+                    self_cond=False,
+                    dynamic_thresh_p=dynamic_thresh_p,
+                    dynamic_thresh_max=dynamic_thresh_max,
+                    rho=rho,
+                    generator=generator,
                 )
+                all_samples.append(
+                    decode_latents_with_vae(
+                        vae,
+                        x0_norm,
+                        entity_pad=entity_pad,
+                        mu_mean=mu_mean,
+                        mu_std=mu_std,
+                    )
+                )
+                progress.update(max(1, int(steps)))
+
+            all_samples = torch.stack(all_samples, dim=0)
+            point_forecast = all_samples.mean(dim=0)
+            y_true = torch.nan_to_num(
+                targets_to_bhnc(yb, mask_bn, device=device),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
             )
 
-        all_samples = torch.stack(all_samples, dim=0)
-        point_forecast = all_samples.mean(dim=0)
-        y_true = torch.nan_to_num(
-            targets_to_bhnc(yb, mask_bn, device=device),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
+            hidden_valid = (obs & (~keep_mask[:, :, None, None])).to(dtype=y_true.dtype)
+            observed_valid = (obs & keep_mask[:, :, None, None]).to(dtype=y_true.dtype)
 
-        hidden_valid = (obs & (~keep_mask[:, :, None, None])).to(dtype=y_true.dtype)
-        observed_valid = (obs & keep_mask[:, :, None, None]).to(dtype=y_true.dtype)
+            res_hidden = (point_forecast - y_true) * hidden_valid
+            abs_sum += res_hidden.abs().sum().item()
+            sq_sum += (res_hidden**2).sum().item()
+            elts += hidden_valid.sum().item()
 
-        res_hidden = (point_forecast - y_true) * hidden_valid
-        abs_sum += res_hidden.abs().sum().item()
-        sq_sum += (res_hidden**2).sum().item()
-        elts += hidden_valid.sum().item()
+            res_obs = (point_forecast - y_true) * observed_valid
+            obs_abs_sum += res_obs.abs().sum().item()
+            obs_elts += observed_valid.sum().item()
 
-        res_obs = (point_forecast - y_true) * observed_valid
-        obs_abs_sum += res_obs.abs().sum().item()
-        obs_elts += observed_valid.sum().item()
+            term1 = (all_samples - y_true.unsqueeze(0)).abs().mean(dim=0)
+            sample_count = all_samples.shape[0]
+            if sample_count <= 1:
+                term2 = torch.zeros_like(term1)
+            else:
+                diffs = []
+                for i in range(sample_count):
+                    for j in range(i + 1, sample_count):
+                        diffs.append((all_samples[i] - all_samples[j]).abs())
+                term2 = torch.stack(diffs, dim=0).mean(dim=0)
+            crps_elem = term1 - 0.5 * term2
+            crps_sum += (crps_elem * hidden_valid).sum().item()
+            crps_elts += hidden_valid.sum().item()
 
-        term1 = (all_samples - y_true.unsqueeze(0)).abs().mean(dim=0)
-        sample_count = all_samples.shape[0]
-        if sample_count <= 1:
-            term2 = torch.zeros_like(term1)
-        else:
-            diffs = []
-            for i in range(sample_count):
-                for j in range(i + 1, sample_count):
-                    diffs.append((all_samples[i] - all_samples[j]).abs())
-            term2 = torch.stack(diffs, dim=0).mean(dim=0)
-        crps_elem = term1 - 0.5 * term2
-        crps_sum += (crps_elem * hidden_valid).sum().item()
-        crps_elts += hidden_valid.sum().item()
-
-        observed_token_sum += keep_mask.sum().item()
-        hidden_token_sum += (obs_any & (~keep_mask)).sum().item()
-        candidate_token_sum += obs_any.sum().item()
+            observed_token_sum += keep_mask.sum().item()
+            hidden_token_sum += (obs_any & (~keep_mask)).sum().item()
+            candidate_token_sum += obs_any.sum().item()
 
     if candidate_token_sum <= 0:
         raise RuntimeError("Imputation evaluation found no candidate observed tokens")
@@ -545,6 +552,8 @@ def evaluate_checkpoint(
         self_cond=bool(getattr(cfg, "SELF_COND", False)),
         generator_seed=generator_seed,
         verbose=verbose,
+        progress_enabled=verbose,
+        progress_label="checkpoint-eval forecast_test",
         **test_sampling,
     )
     regular = _with_imputation_metric_target(_evaluate_impute_case(
@@ -565,7 +574,8 @@ def evaluate_checkpoint(
         dynamic_thresh_max=float(test_sampling["dynamic_thresh_max"]),
         rho=float(test_sampling["rho"]),
         generator_seed=generator_seed,
-        progress_label="regular_keep25" if verbose else None,
+        progress_enabled=verbose,
+        progress_label="checkpoint-eval regular_keep25",
     ))
     random_keep_generator = torch.Generator(device=device)
     random_keep_generator.manual_seed(1234)
@@ -587,7 +597,8 @@ def evaluate_checkpoint(
         dynamic_thresh_max=float(test_sampling["dynamic_thresh_max"]),
         rho=float(test_sampling["rho"]),
         generator_seed=None if generator_seed is None else int(generator_seed) + 100003,
-        progress_label="random_mask" if verbose else None,
+        progress_enabled=verbose,
+        progress_label="checkpoint-eval random_mask",
     ))
 
     result = {

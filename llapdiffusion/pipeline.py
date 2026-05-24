@@ -321,16 +321,17 @@ def run_single_pred(
         try:
             from llapdiffusion.tools.llapdiff_checkpoint_eval import evaluate_checkpoint
 
-            balanced_evaluation = evaluate_checkpoint(
-                config,
-                eval_ckpt,
-                label=f"{_resolve_dataset_key(config=config)}_pred{pred}",
-                random_mask_ratio=checkpoint_eval_random_mask_ratio,
-                num_samples=checkpoint_eval_num_samples,
-                forecast_num_samples=checkpoint_eval_forecast_num_samples,
-                imputation_num_samples=checkpoint_eval_imputation_num_samples,
-                max_eval_batches=checkpoint_eval_max_eval_batches,
-            )
+            eval_kwargs = {
+                "label": f"{_resolve_dataset_key(config=config)}_pred{pred}",
+                "random_mask_ratio": checkpoint_eval_random_mask_ratio,
+                "num_samples": checkpoint_eval_num_samples,
+                "forecast_num_samples": checkpoint_eval_forecast_num_samples,
+                "imputation_num_samples": checkpoint_eval_imputation_num_samples,
+                "max_eval_batches": checkpoint_eval_max_eval_batches,
+            }
+            if bool(getattr(config, "VERBOSE", False) or getattr(config, "DEBUG", False)):
+                eval_kwargs["verbose"] = True
+            balanced_evaluation = evaluate_checkpoint(config, eval_ckpt, **eval_kwargs)
         except Exception as exc:
             if not allow_balanced_eval_failure:
                 raise

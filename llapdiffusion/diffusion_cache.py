@@ -20,6 +20,7 @@ from llapdiffusion.models.llapdiff_utils import (
     simple_norm,
     target_time_observed,
 )
+from llapdiffusion.logging_utils import progress_iter
 
 
 _CHUNK_ROWS = 128
@@ -498,6 +499,7 @@ def _write_split(
     summary_enabled: bool,
     stats_mode: str,
     collect_stats: bool,
+    progress_enabled: bool = False,
 ) -> Tuple[Dict[str, object], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
     latents_mm = obs_mm = summary_mm = None
     latent_shape = None
@@ -509,7 +511,13 @@ def _write_split(
     vae.eval()
     summarizer.eval()
     with torch.no_grad():
-        for xb, yb, meta in dataloader:
+        batches = progress_iter(
+            dataloader,
+            desc=f"diffusion-cache {name}",
+            enabled=progress_enabled,
+            unit="batch",
+        )
+        for xb, yb, meta in batches:
             rows = int(torch.as_tensor(meta["entity_mask"]).shape[0])
             if batch_idx >= len(plan.batch_rows):
                 raise RuntimeError(f"{name} cache writer saw more batches than planned")
@@ -711,6 +719,7 @@ def build_or_load_diffusion_input_cache(
             summary_enabled=summary_enabled,
             stats_mode=stats_mode,
             collect_stats=(name == "train"),
+            progress_enabled=verbose,
         )
         splits[name] = split_manifest
         if stats is not None:

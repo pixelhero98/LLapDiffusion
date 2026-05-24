@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
-from llapdiffusion.logging_utils import is_debug, is_verbose
+from llapdiffusion.logging_utils import is_debug, is_verbose, progress_iter, progress_task
 from llapdiffusion.diffusion_cache import (
     DiffusionSplitCache,
     build_or_load_diffusion_input_cache,
@@ -886,6 +886,8 @@ def evaluate_val_diagnostics(
     min_log_snr: float = -12.0,
     max_log_snr: float = 12.0,
     input_cache: Optional[DiffusionSplitCache] = None,
+    progress_enabled: bool = False,
+    progress_label: Optional[str] = None,
 ) -> Dict[str, object]:
     """Return validation MSE diagnostics for the active prediction parameterization."""
     predict_type_name = str(getattr(config, "PREDICT_TYPE", "x0")).strip().lower() or "x0"
@@ -907,7 +909,13 @@ def evaluate_val_diagnostics(
 
     if input_cache is not None:
         input_cache.reset()
-    for xb, yb, meta in dataloader:
+    batches = progress_iter(
+        dataloader,
+        desc=progress_label or "llapdiff val-diag",
+        enabled=progress_enabled,
+        unit="batch",
+    )
+    for xb, yb, meta in batches:
         (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta, device)
         if not mask_bn.any():
             continue
@@ -1167,6 +1175,8 @@ def evaluate_regression(
     generator_seed: Optional[int] = None,
     crps_pair_samples: int = 200,
     verbose: bool = False,
+    progress_enabled: bool = False,
+    progress_label: Optional[str] = None,
 ):
     """
     Evaluate probabilistic forecasts in observation space (set-VAE pipeline).
@@ -1198,132 +1208,144 @@ def evaluate_regression(
         ema.store(diff_model)
         ema.copy_to(diff_model)
 
-    for xb, yb, meta in dataloader:
-        (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta, device)
-        if not mask_bn.any():
-            continue
+    try:
+        progress_total = len(dataloader) * num_samples * max(1, int(steps))
+    except TypeError:
+        progress_total = None
 
-        cond_summary, cond_summary_raw = _build_cond_summary_pair(
-            summarizer,
-            diff_model,
-            V,
-            T,
-            mask_bn,
-            device,
-            dt=meta.get("delta_t"),
-            x_obs_mask=meta.get("x_obs_mask"),
-        )
-        if disable_conditioning:
-            cond_summary = None
-            cond_summary_raw = None
-        dt_b = _flatten_dt(
-            meta,
-            mask_bn,
-            device,
-            key="delta_t_y",
-        )
+    with progress_task(
+        desc=progress_label or "llapdiff eval",
+        enabled=progress_enabled,
+        total=progress_total,
+        unit="step",
+    ) as progress:
+        for xb, yb, meta in dataloader:
+            (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta, device)
+            if not mask_bn.any():
+                continue
 
-        y_obs_mask = meta.get("y_obs_mask")
-        x_tok, entity_pad, obs = pack_targets_tokens(
-            yb, mask_bn, device, y_obs_mask=y_obs_mask
-        )
-        if x_tok is None or not obs.any():
-            continue
-
-        B, Hcur, Z = x_tok.size(0), x_tok.size(1), int(mu_mean.shape[-1])
-        dt_model = _match_dt_to_horizon(dt_b, Hcur)
-
-        y_true = torch.nan_to_num(
-            targets_to_bhnc(yb, mask_bn, device=device),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        if obs.dim() == 3:
-            obs_entries = obs.unsqueeze(-1)
-        elif obs.dim() == 4:
-            obs_entries = obs
-        else:
-            raise ValueError(f"target observation mask must be [B,H,N] or [B,H,N,C], got {tuple(obs.shape)}")
-        if obs_entries.shape != y_true.shape:
-            try:
-                obs_entries = obs_entries.expand_as(y_true)
-            except RuntimeError as exc:
-                raise ValueError(
-                    f"target observation mask shape {tuple(obs_entries.shape)} does not match target shape {tuple(y_true.shape)}"
-                ) from exc
-        valid = obs_entries.to(dtype=y_true.dtype)
-
-        all_y_hats = []
-        for _ in range(num_samples):
-            x0_norm = diff_model.generate(
-                shape=(B, Hcur, Z),
-                steps=steps,
-                guidance_strength=guidance_strength,
-                guidance_power=guidance_power,
-                eta=eta,
-                cond_summary=cond_summary,
-                cond_summary_raw=cond_summary_raw,
-                self_cond=self_cond,
-                cfg_rescale=True,
-                dt=dt_model,
-                dynamic_thresh_p=dynamic_thresh_p,
-                dynamic_thresh_max=dynamic_thresh_max,
-                rho=rho,
-                generator=generator,
+            cond_summary, cond_summary_raw = _build_cond_summary_pair(
+                summarizer,
+                diff_model,
+                V,
+                T,
+                mask_bn,
+                device,
+                dt=meta.get("delta_t"),
+                x_obs_mask=meta.get("x_obs_mask"),
             )
-            y_hat_sample = decode_latents_with_vae(
-                vae, x0_norm, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std
+            if disable_conditioning:
+                cond_summary = None
+                cond_summary_raw = None
+            dt_b = _flatten_dt(
+                meta,
+                mask_bn,
+                device,
+                key="delta_t_y",
             )
-            all_y_hats.append(y_hat_sample)
 
-        all_samples = torch.stack(all_y_hats, dim=0)  # [S,B,H,N,C]
+            y_obs_mask = meta.get("y_obs_mask")
+            x_tok, entity_pad, obs = pack_targets_tokens(
+                yb, mask_bn, device, y_obs_mask=y_obs_mask
+            )
+            if x_tok is None or not obs.any():
+                continue
 
-        if aggregation_method == "mean":
-            point_forecast = all_samples.mean(dim=0)
-        else:
-            point_forecast = all_samples.median(dim=0).values
+            B, Hcur, Z = x_tok.size(0), x_tok.size(1), int(mu_mean.shape[-1])
+            dt_model = _match_dt_to_horizon(dt_b, Hcur)
 
-        res = (point_forecast - y_true) * valid
-        abs_sum += res.abs().sum().item()
-        sq_sum += (res**2).sum().item()
-        elts += valid.sum().item()
-        target_reduce_dims = (0, 1, 2)
-        batch_abs = res.abs().sum(dim=target_reduce_dims).detach().cpu()
-        batch_sq = (res**2).sum(dim=target_reduce_dims).detach().cpu()
-        batch_elts = valid.sum(dim=target_reduce_dims).detach().cpu()
-        if per_target_abs_sum is None:
-            per_target_abs_sum = batch_abs
-            per_target_sq_sum = batch_sq
-            per_target_elts = batch_elts
-        else:
-            per_target_abs_sum += batch_abs
-            per_target_sq_sum += batch_sq
-            per_target_elts += batch_elts
+            y_true = torch.nan_to_num(
+                targets_to_bhnc(yb, mask_bn, device=device),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            if obs.dim() == 3:
+                obs_entries = obs.unsqueeze(-1)
+            elif obs.dim() == 4:
+                obs_entries = obs
+            else:
+                raise ValueError(f"target observation mask must be [B,H,N] or [B,H,N,C], got {tuple(obs.shape)}")
+            if obs_entries.shape != y_true.shape:
+                try:
+                    obs_entries = obs_entries.expand_as(y_true)
+                except RuntimeError as exc:
+                    raise ValueError(
+                        f"target observation mask shape {tuple(obs_entries.shape)} does not match target shape {tuple(y_true.shape)}"
+                    ) from exc
+            valid = obs_entries.to(dtype=y_true.dtype)
 
-        M = all_samples.shape[0]
-        term1 = (all_samples - y_true.unsqueeze(0)).abs().mean(dim=0)
-        if M <= 1:
-            term2 = torch.zeros_like(term1)
-        else:
-            P_full = M * (M - 1) // 2
-            P = int(min(max(1, crps_pair_samples), P_full))
-            i = torch.randint(0, M, (P,), device=all_samples.device)
-            j = torch.randint(0, M - 1, (P,), device=all_samples.device)
-            j = j + (j >= i).to(j.dtype)
-            diffs = (all_samples[i] - all_samples[j]).abs()
-            term2 = diffs.mean(dim=0)
+            all_y_hats = []
+            for _ in range(num_samples):
+                x0_norm = diff_model.generate(
+                    shape=(B, Hcur, Z),
+                    steps=steps,
+                    guidance_strength=guidance_strength,
+                    guidance_power=guidance_power,
+                    eta=eta,
+                    cond_summary=cond_summary,
+                    cond_summary_raw=cond_summary_raw,
+                    self_cond=self_cond,
+                    cfg_rescale=True,
+                    dt=dt_model,
+                    dynamic_thresh_p=dynamic_thresh_p,
+                    dynamic_thresh_max=dynamic_thresh_max,
+                    rho=rho,
+                    generator=generator,
+                )
+                y_hat_sample = decode_latents_with_vae(
+                    vae, x0_norm, entity_pad=entity_pad, mu_mean=mu_mean, mu_std=mu_std
+                )
+                all_y_hats.append(y_hat_sample)
+                progress.update(max(1, int(steps)))
 
-        crps_elem = term1 - 0.5 * term2
-        crps_sum += (crps_elem * valid).sum().item()
-        crps_elts += valid.sum().item()
+            all_samples = torch.stack(all_y_hats, dim=0)  # [S,B,H,N,C]
 
-        for q in quantiles:
-            q = float(q)
-            y_q = torch.quantile(all_samples, q, dim=0, interpolation="linear")
-            diff = y_true - y_q
-            loss_q = torch.maximum(q * diff, (q - 1.0) * diff) * valid
-            pinball_sums[q] += loss_q.sum().item()
+            if aggregation_method == "mean":
+                point_forecast = all_samples.mean(dim=0)
+            else:
+                point_forecast = all_samples.median(dim=0).values
+
+            res = (point_forecast - y_true) * valid
+            abs_sum += res.abs().sum().item()
+            sq_sum += (res**2).sum().item()
+            elts += valid.sum().item()
+            target_reduce_dims = (0, 1, 2)
+            batch_abs = res.abs().sum(dim=target_reduce_dims).detach().cpu()
+            batch_sq = (res**2).sum(dim=target_reduce_dims).detach().cpu()
+            batch_elts = valid.sum(dim=target_reduce_dims).detach().cpu()
+            if per_target_abs_sum is None:
+                per_target_abs_sum = batch_abs
+                per_target_sq_sum = batch_sq
+                per_target_elts = batch_elts
+            else:
+                per_target_abs_sum += batch_abs
+                per_target_sq_sum += batch_sq
+                per_target_elts += batch_elts
+
+            M = all_samples.shape[0]
+            term1 = (all_samples - y_true.unsqueeze(0)).abs().mean(dim=0)
+            if M <= 1:
+                term2 = torch.zeros_like(term1)
+            else:
+                P_full = M * (M - 1) // 2
+                P = int(min(max(1, crps_pair_samples), P_full))
+                i = torch.randint(0, M, (P,), device=all_samples.device)
+                j = torch.randint(0, M - 1, (P,), device=all_samples.device)
+                j = j + (j >= i).to(j.dtype)
+                diffs = (all_samples[i] - all_samples[j]).abs()
+                term2 = diffs.mean(dim=0)
+
+            crps_elem = term1 - 0.5 * term2
+            crps_sum += (crps_elem * valid).sum().item()
+            crps_elts += valid.sum().item()
+
+            for q in quantiles:
+                q = float(q)
+                y_q = torch.quantile(all_samples, q, dim=0, interpolation="linear")
+                diff = y_true - y_q
+                loss_q = torch.maximum(q * diff, (q - 1.0) * diff) * valid
+                pinball_sums[q] += loss_q.sum().item()
 
     if use_ema:
         ema.restore(diff_model)
@@ -2085,7 +2107,13 @@ def run(
         if train_input_cache is not None:
             train_input_cache.reset()
         epoch_skipped_summary_ft_nonfinite_grad_steps = 0
-        for xb, yb, meta in train_dl:
+        train_batches = progress_iter(
+            train_dl,
+            desc=f"llapdiff train e{epoch + 1:03d}/{epochs:03d}",
+            enabled=verbose,
+            unit="batch",
+        )
+        for xb, yb, meta in train_batches:
             (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta, device)
             if not mask_bn.any():
                 continue
@@ -2588,6 +2616,8 @@ def run(
                 ema=_maybe_metric_ema(val_metric_source, ema),
                 self_cond=bool(getattr(config, "SELF_COND", False)),
                 verbose=debug,
+                progress_enabled=verbose,
+                progress_label=f"llapdiff val e{epoch + 1:03d}/{epochs:03d}",
                 **_sampling_kwargs(config, prefix="EVAL"),
             )
 
@@ -2606,6 +2636,8 @@ def run(
                 min_log_snr=float(getattr(config, "VAL_DIAG_LOGSNR_MIN", -12.0)),
                 max_log_snr=float(getattr(config, "VAL_DIAG_LOGSNR_MAX", 12.0)),
                 input_cache=(diffusion_input_cache.val if diffusion_input_cache is not None else None),
+                progress_enabled=verbose,
+                progress_label=f"llapdiff val-diag e{epoch + 1:03d}/{epochs:03d}",
             )
             predict_type_name = str(getattr(config, "PREDICT_TYPE", "")).strip().lower()
             metric_label = "x0" if predict_type_name in {"", "x0"} else predict_type_name
@@ -2661,6 +2693,8 @@ def run(
                     ema=_maybe_metric_ema(compare_source, ema),
                     self_cond=bool(getattr(config, "SELF_COND", False)),
                     verbose=debug,
+                    progress_enabled=verbose,
+                    progress_label=f"llapdiff val-compare e{epoch + 1:03d}/{epochs:03d}",
                     **_sampling_kwargs(config, prefix="EVAL"),
                 )
                 if compare_source == "raw":
@@ -2824,6 +2858,8 @@ def run(
         ema=_maybe_metric_ema(test_metric_source, ema),
         self_cond=bool(getattr(config, "SELF_COND", False)),
         verbose=debug,
+        progress_enabled=verbose,
+        progress_label="llapdiff test",
         **_sampling_kwargs(config, prefix="TEST"),
     )
 
