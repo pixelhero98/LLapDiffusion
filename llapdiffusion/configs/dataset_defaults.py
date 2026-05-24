@@ -102,6 +102,8 @@ DATASET_PRESETS: Mapping[str, DatasetPreset] = {
         table_batch_size=10,
         vae_latent_channels=16,
         minsnr_gamma=4.5,
+        sum_lr=1e-4,
+        sum_amp=False,
     ),
     "physionet": DatasetPreset(
         key="physionet",
@@ -125,6 +127,8 @@ DATASET_PRESETS: Mapping[str, DatasetPreset] = {
         table_batch_size=15,
         vae_latent_channels=24,
         minsnr_gamma=4.5,
+        sum_lr=1e-4,
+        sum_amp=False,
     ),
     "noaa_uk": DatasetPreset(
         key="noaa_uk",
@@ -135,6 +139,8 @@ DATASET_PRESETS: Mapping[str, DatasetPreset] = {
         table_batch_size=15,
         vae_latent_channels=16,
         minsnr_gamma=4.5,
+        sum_lr=1e-4,
+        sum_amp=False,
     ),
     "us_equity": DatasetPreset(
         key="us_equity",

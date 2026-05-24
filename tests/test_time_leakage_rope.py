@@ -206,6 +206,73 @@ def test_summarizer_builder_passes_rope_base():
     assert torch.allclose(attn.inv_freq.cpu(), expected)
 
 
+def test_summarizer_amp_nonfinite_gradients_are_bounded_skips():
+    from llapdiffusion.trainers import train_val_summarizer as tvs
+
+    class FakeScaler:
+        def scale(self, loss):
+            return loss
+
+        def unscale_(self, optimizer):
+            return None
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            return None
+
+    class FiniteLossInfGrad(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, param):
+            ctx.shape = param.shape
+            return param.new_tensor(1.0)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            return torch.full(ctx.shape, float("inf"), device=grad_output.device, dtype=grad_output.dtype)
+
+    class OccasionallyBadModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = torch.nn.Parameter(torch.ones(()))
+            self.calls = 0
+
+        def forward(self, x, pad_mask=None, dt=None, ctx_diff=None, obs_mask=None):
+            return None, {}
+
+        def recon_loss(self, aux, mask, weights):
+            self.calls += 1
+            if self.calls == 1:
+                return FiniteLossInfGrad.apply(self.param)
+            return self.param * 0.0 + 1.0
+
+    V = torch.zeros(1, 1, 2, 1)
+    T = torch.zeros_like(V)
+    y = torch.zeros(1, 1, 1)
+    meta = {"entity_mask": torch.ones(1, 1, dtype=torch.bool)}
+    loader = [((V, T), y, meta), ((V, T), y, meta)]
+    model = OccasionallyBadModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    epoch_stats = {}
+
+    loss = tvs._run_epoch(
+        loader,
+        model,
+        torch.device("cpu"),
+        loss_weights=(1.0, 0.1, 0.1, 0.0, 0.0),
+        optimizer=optimizer,
+        scaler=FakeScaler(),
+        amp=True,
+        max_nonfinite_grad_steps=1,
+        epoch_stats=epoch_stats,
+    )
+
+    assert loss == pytest.approx(1.0)
+    assert epoch_stats["skipped_nonfinite_grad_steps"] == 1
+    assert epoch_stats["optimizer_steps"] == 1
+
+
 def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
     from llapdiffusion.configs import config as base_cfg
     from llapdiffusion.configs import dataset_defaults as dd
@@ -262,7 +329,7 @@ def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
             assert cfg.SUM_CHANNEL_BALANCED_X_LOSS is False
             assert cfg.SUM_IRREG_POOLING == "none"
             assert cfg.SUM_T_TOKEN_MODE == "none"
-        if key == "bms_air":
+        if key in {"bms_air", "uci_air", "noaa_us", "noaa_uk"}:
             assert cfg.SUM_LR == 1e-4
             assert cfg.SUM_AMP is False
         assert cfg.TARGET_MASK_AUX_P == 0.0
@@ -274,6 +341,8 @@ def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
     assert reused.VAE_INPUT_DROPOUT == 0.20
     assert reused.VAE_RECON_BALANCE == "none"
     assert reused.SUM_CHANNEL_BALANCED_X_LOSS is False
+    assert reused.SUM_LR == 1e-4
+    assert reused.SUM_AMP is False
 
 
 def test_vae_checkpoint_path_preserves_entity_suffix(tmp_path):

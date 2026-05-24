@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, MutableMapping, Optional, Sequence, Tuple
 
 from llapdiffusion.configs import config
 import torch
@@ -54,6 +54,11 @@ def _grads_are_finite(params) -> bool:
         if grad is not None and not torch.isfinite(grad).all():
             return False
     return True
+
+
+def _record_epoch_stat(epoch_stats: Optional[MutableMapping[str, int]], key: str, value: int = 1) -> None:
+    if epoch_stats is not None:
+        epoch_stats[key] = int(epoch_stats.get(key, 0)) + int(value)
 
 
 def save_ckpt(path: Path, model: nn.Module, stats: Dict) -> None:
@@ -242,10 +247,13 @@ def _run_epoch(
     scaler: Optional[GradScaler] = None,
     grad_clip: float = 0.0,
     amp: bool = False,
+    max_nonfinite_grad_steps: int = 0,
+    epoch_stats: Optional[MutableMapping[str, int]] = None,
 ) -> float:
     is_train = optimizer is not None
     total_loss = 0.0
     total_elems = 0.0
+    nonfinite_grad_steps = 0
 
     for batch in loader:
         V, T, mask, elems, dt, obs_mask = _prepare_batch(batch, device)
@@ -269,9 +277,16 @@ def _run_epoch(
             scaler.unscale_(optimizer)
             params = list(model.parameters())
             if not _grads_are_finite(params):
+                nonfinite_grad_steps += 1
+                _record_epoch_stat(epoch_stats, "skipped_nonfinite_grad_steps")
                 optimizer.zero_grad(set_to_none=True)
                 scaler.update()
-                raise FloatingPointError("non-finite summarizer gradients detected")
+                if amp and nonfinite_grad_steps <= max(0, int(max_nonfinite_grad_steps)):
+                    continue
+                raise FloatingPointError(
+                    "non-finite summarizer gradients detected "
+                    f"after {nonfinite_grad_steps} skipped optimizer step(s)"
+                )
             if grad_clip and grad_clip > 0:
                 grad_norm = nn.utils.clip_grad_norm_(params, grad_clip)
                 if not torch.isfinite(torch.as_tensor(grad_norm)):
@@ -280,6 +295,7 @@ def _run_epoch(
                     raise FloatingPointError("non-finite summarizer gradient norm detected")
             scaler.step(optimizer)
             scaler.update()
+            _record_epoch_stat(epoch_stats, "optimizer_steps")
 
         total_loss += loss.item() * elems
         total_elems += elems
@@ -400,6 +416,7 @@ def run(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = bool(config.SUM_AMP and device.type == "cuda")
     grad_clip = getattr(config, "SUM_GRAD_CLIP", getattr(config, "GRAD_CLIP", 0.0))
+    max_nonfinite_grad_steps = int(getattr(config, "SUM_MAX_NONFINITE_GRAD_STEPS", 0) or 0)
     if verbose:
         print(f"Using device: {device}")
 
@@ -434,10 +451,13 @@ def run(
     best_val = math.inf
     best_epoch = 0
     patience_ctr = 0
+    skipped_nonfinite_grad_steps = 0
+    epoch_stats_history = []
 
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
         model.train()
+        epoch_stats: Dict[str, int] = {}
         train_loss = _run_epoch(
             train_loader,
             model,
@@ -447,7 +467,11 @@ def run(
             scaler=scaler,
             grad_clip=grad_clip,
             amp=amp,
+            max_nonfinite_grad_steps=max_nonfinite_grad_steps,
+            epoch_stats=epoch_stats,
         )
+        skipped_nonfinite_grad_steps += int(epoch_stats.get("skipped_nonfinite_grad_steps", 0))
+        epoch_stats_history.append({"epoch": epoch, **epoch_stats})
 
         model.eval()
         with torch.no_grad():
@@ -468,6 +492,12 @@ def run(
                 f"Epoch {epoch:03d}/{epochs:03d} | train {train_loss:.6f} | val {val_loss:.6f} | "
                 f"best {best_val:.6f} @ {best_epoch:03d} | patience {patience_ctr}/{patience} | {elapsed:.1f}s"
             )
+            if epoch_stats.get("skipped_nonfinite_grad_steps"):
+                print(
+                    "Skipped "
+                    f"{epoch_stats['skipped_nonfinite_grad_steps']} summarizer optimizer step(s) "
+                    "with non-finite AMP gradients."
+                )
 
         if patience_ctr >= patience:
             print(f"\nEarly stopping at epoch {epoch}: validation loss plateaued.")
@@ -494,4 +524,6 @@ def run(
         "val_loss": best_val,
         "test_loss": test_loss,
         "checkpoint": str(ckpt_path),
+        "skipped_nonfinite_grad_steps": skipped_nonfinite_grad_steps,
+        "epoch_stats": epoch_stats_history,
     }
