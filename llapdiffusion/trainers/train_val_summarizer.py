@@ -137,15 +137,6 @@ def _nan_to_num(x: torch.Tensor) -> torch.Tensor:
     return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def _entity_finite_mask(x: torch.Tensor) -> torch.Tensor:
-    """Return per-entity mask marking sequences with all finite values."""
-
-    finite = torch.isfinite(x)
-    for _ in range(x.dim() - 2):
-        finite = finite.all(dim=-1)
-    return finite
-
-
 def _apply_entity_mask(series: torch.Tensor, mask_bn: torch.Tensor) -> torch.Tensor:
     if mask_bn.dtype != torch.bool:
         mask_bn = mask_bn.to(dtype=torch.bool)
@@ -254,6 +245,7 @@ def _run_epoch(
     total_loss = 0.0
     total_elems = 0.0
     nonfinite_grad_steps = 0
+    max_nonfinite_grad_steps = max(0, int(max_nonfinite_grad_steps))
 
     for batch in loader:
         V, T, mask, elems, dt, obs_mask = _prepare_batch(batch, device)
@@ -281,7 +273,7 @@ def _run_epoch(
                 _record_epoch_stat(epoch_stats, "skipped_nonfinite_grad_steps")
                 optimizer.zero_grad(set_to_none=True)
                 scaler.update()
-                if amp and nonfinite_grad_steps <= max(0, int(max_nonfinite_grad_steps)):
+                if amp and nonfinite_grad_steps <= max_nonfinite_grad_steps:
                     continue
                 raise FloatingPointError(
                     "non-finite summarizer gradients detected "
@@ -301,6 +293,10 @@ def _run_epoch(
         total_elems += elems
 
     if total_elems == 0.0:
+        if is_train and nonfinite_grad_steps > 0:
+            raise FloatingPointError(
+                "all summarizer optimizer steps were skipped because gradients were non-finite"
+            )
         split = "training" if is_train else "evaluation"
         raise RuntimeError(f"Summarizer {split} epoch processed no valid elements")
     return total_loss / total_elems
@@ -416,7 +412,7 @@ def run(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = bool(config.SUM_AMP and device.type == "cuda")
     grad_clip = getattr(config, "SUM_GRAD_CLIP", getattr(config, "GRAD_CLIP", 0.0))
-    max_nonfinite_grad_steps = int(getattr(config, "SUM_MAX_NONFINITE_GRAD_STEPS", 0) or 0)
+    max_nonfinite_grad_steps = max(0, int(getattr(config, "SUM_MAX_NONFINITE_GRAD_STEPS", 0) or 0))
     if verbose:
         print(f"Using device: {device}")
 
@@ -467,7 +463,7 @@ def run(
             scaler=scaler,
             grad_clip=grad_clip,
             amp=amp,
-            max_nonfinite_grad_steps=max_nonfinite_grad_steps,
+            max_nonfinite_grad_steps=max(0, max_nonfinite_grad_steps - skipped_nonfinite_grad_steps),
             epoch_stats=epoch_stats,
         )
         skipped_nonfinite_grad_steps += int(epoch_stats.get("skipped_nonfinite_grad_steps", 0))
@@ -483,7 +479,16 @@ def run(
             best_val = val_loss
             best_epoch = epoch
             patience_ctr = 0
-            save_ckpt(ckpt_path, model, {"epoch": epoch, "val_loss": val_loss})
+            save_ckpt(
+                ckpt_path,
+                model,
+                {
+                    "epoch": epoch,
+                    "val_loss": val_loss,
+                    "skipped_nonfinite_grad_steps": skipped_nonfinite_grad_steps,
+                    "sum_max_nonfinite_grad_steps": max_nonfinite_grad_steps,
+                },
+            )
         else:
             patience_ctr += 1
 
@@ -525,5 +530,6 @@ def run(
         "test_loss": test_loss,
         "checkpoint": str(ckpt_path),
         "skipped_nonfinite_grad_steps": skipped_nonfinite_grad_steps,
+        "sum_max_nonfinite_grad_steps": max_nonfinite_grad_steps,
         "epoch_stats": epoch_stats_history,
     }

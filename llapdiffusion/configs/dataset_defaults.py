@@ -21,6 +21,7 @@ _BASE_MODEL_SETTINGS: Mapping[str, object] = {
     "VAE_RECON_BALANCE": "none",
     "SUM_LR": 5e-4,
     "SUM_AMP": True,
+    "SUM_MAX_NONFINITE_GRAD_STEPS": 8,
     "SUM_PATIENCE": 10,
     "SUM_LOSS_W_DT": 0.0,
     "SUM_LOSS_W_OBS": 0.0,

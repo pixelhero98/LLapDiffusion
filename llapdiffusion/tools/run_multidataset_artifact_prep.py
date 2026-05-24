@@ -288,6 +288,8 @@ def _compact_summarizer_stage(stage_stats: Dict[str, object], *, trained: bool) 
         "val_loss": stage_stats.get("val_loss"),
         "test_loss": stage_stats.get("test_loss"),
         "checkpoint": stage_stats.get("checkpoint"),
+        "skipped_nonfinite_grad_steps": stage_stats.get("skipped_nonfinite_grad_steps"),
+        "sum_max_nonfinite_grad_steps": stage_stats.get("sum_max_nonfinite_grad_steps"),
     }
 
 

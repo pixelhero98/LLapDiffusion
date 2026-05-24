@@ -96,6 +96,27 @@ def _grads_are_finite_params(params) -> bool:
     return True
 
 
+def _should_skip_nonfinite_summary_ft_gradients(
+    *,
+    diffusion_params,
+    summary_ft_params,
+    amp_enabled: bool,
+    summary_ft_active: bool,
+    skipped_nonfinite_grad_steps: int,
+    max_nonfinite_grad_steps: int,
+) -> bool:
+    if not (amp_enabled and summary_ft_active):
+        return False
+    max_nonfinite_grad_steps = max(0, int(max_nonfinite_grad_steps))
+    if int(skipped_nonfinite_grad_steps) >= max_nonfinite_grad_steps:
+        return False
+    diffusion_params = list(diffusion_params)
+    summary_ft_params = list(summary_ft_params)
+    if not summary_ft_params:
+        return False
+    return _grads_are_finite_params(diffusion_params) and not _grads_are_finite_params(summary_ft_params)
+
+
 def _entity_finite_mask(x: torch.Tensor) -> torch.Tensor:
     finite = torch.isfinite(x)
     for _ in range(x.dim() - 2):
@@ -2029,8 +2050,15 @@ def run(
             f"ema_compare={ema_compare}"
         )
 
+    max_summary_nonfinite_grad_steps = max(
+        0,
+        int(getattr(config, "SUM_MAX_NONFINITE_GRAD_STEPS", 0) or 0),
+    )
+    skipped_summary_ft_nonfinite_grad_steps = 0
+
     # ---------------- Training loop ----------------
     def train_one_epoch(epoch: int) -> Dict[str, object]:
+        nonlocal skipped_summary_ft_nonfinite_grad_steps
         diff_model.train()
         summary_ft_active = bool(sum_ft_named_params) and (epoch + 1) >= sum_ft_start_epoch
         _set_named_params_trainable(sum_ft_named_params, summary_ft_active)
@@ -2056,6 +2084,7 @@ def run(
         train_input_cache = diffusion_input_cache.train if diffusion_input_cache is not None else None
         if train_input_cache is not None:
             train_input_cache.reset()
+        epoch_skipped_summary_ft_nonfinite_grad_steps = 0
         for xb, yb, meta in train_dl:
             (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta, device)
             if not mask_bn.any():
@@ -2278,12 +2307,37 @@ def run(
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            grad_params = list(diff_model.parameters())
-            if summary_ft_active:
-                grad_params.extend(param for _, param in sum_ft_named_params)
-            if not _grads_are_finite_params(grad_params):
+            diffusion_grad_params = [param for param in diff_model.parameters() if param.requires_grad]
+            summary_grad_params = (
+                [param for _, param in sum_ft_named_params if param.requires_grad]
+                if summary_ft_active
+                else []
+            )
+            grad_params = [*diffusion_grad_params, *summary_grad_params]
+            diffusion_grads_finite = _grads_are_finite_params(diffusion_grad_params)
+            summary_grads_finite = _grads_are_finite_params(summary_grad_params)
+            if not (diffusion_grads_finite and summary_grads_finite):
+                skip_summary_ft = _should_skip_nonfinite_summary_ft_gradients(
+                    diffusion_params=diffusion_grad_params,
+                    summary_ft_params=summary_grad_params,
+                    amp_enabled=amp_enabled,
+                    summary_ft_active=summary_ft_active,
+                    skipped_nonfinite_grad_steps=skipped_summary_ft_nonfinite_grad_steps,
+                    max_nonfinite_grad_steps=max_summary_nonfinite_grad_steps,
+                )
                 optimizer.zero_grad(set_to_none=True)
                 scaler.update()
+                if skip_summary_ft:
+                    skipped_summary_ft_nonfinite_grad_steps += 1
+                    epoch_skipped_summary_ft_nonfinite_grad_steps += 1
+                    continue
+                if not diffusion_grads_finite:
+                    raise FloatingPointError("non-finite LLapDiff gradients detected")
+                if summary_ft_active and not summary_grads_finite:
+                    raise FloatingPointError(
+                        "non-finite summarizer fine-tuning gradients detected "
+                        f"after {skipped_summary_ft_nonfinite_grad_steps} skipped optimizer step(s)"
+                    )
                 raise FloatingPointError("non-finite gradients detected")
 
             grad_clip = float(getattr(config, "GRAD_CLIP", 0.0) or 0.0)
@@ -2311,6 +2365,11 @@ def run(
             num_samples += Beff
 
         if num_samples <= 0:
+            if epoch_skipped_summary_ft_nonfinite_grad_steps > 0:
+                raise FloatingPointError(
+                    "all LLapDiff optimizer steps were skipped because summarizer "
+                    "fine-tuning gradients were non-finite"
+                )
             raise RuntimeError("No valid diffusion training samples were processed in this epoch")
         epoch_loss = running_loss / num_samples
         epoch_raw_loss = running_raw_loss / num_samples
@@ -2319,6 +2378,9 @@ def run(
             "raw_loss": epoch_raw_loss,
             "cond_fraction": cond_weight_sum / num_samples,
             "summ_ft_active": float(summary_ft_active),
+            "summ_ft_skipped_nonfinite_grad_steps": int(epoch_skipped_summary_ft_nonfinite_grad_steps),
+            "summ_ft_skipped_nonfinite_grad_steps_total": int(skipped_summary_ft_nonfinite_grad_steps),
+            "summ_max_nonfinite_grad_steps": int(max_summary_nonfinite_grad_steps),
             "target_mask_aux_batches": int(target_mask_aux_batches),
             "target_mask_aux_batch_frac": target_mask_aux_batches / max(1, len(train_dl)),
             "target_mask_keep_frac": target_mask_aux_keep_frac_sum / max(1.0, target_mask_aux_batches),
@@ -2377,6 +2439,8 @@ def run(
             "vae_output_dim": int(vae_output_dim),
             "mu_mean": mu_mean.detach().cpu(),
             "mu_std": mu_std.detach().cpu(),
+            "summ_ft_skipped_nonfinite_grad_steps": int(skipped_summary_ft_nonfinite_grad_steps),
+            "summ_max_nonfinite_grad_steps": int(max_summary_nonfinite_grad_steps),
         }
         payload.update(extra)
         return payload
@@ -2433,6 +2497,12 @@ def run(
                 f"cond_frac={float(epoch_stats['cond_fraction']):.3f} "
                 f"lr={lr_now:.3e}"
             )
+            if int(epoch_stats.get("summ_ft_skipped_nonfinite_grad_steps", 0)) > 0:
+                print(
+                    " skipped "
+                    f"{int(epoch_stats['summ_ft_skipped_nonfinite_grad_steps'])} "
+                    "summarizer fine-tuning optimizer step(s) with non-finite AMP gradients"
+                )
         predict_type_name = str(getattr(config, "PREDICT_TYPE", "")).strip().lower()
         train_metric_key = (
             "train_x0_mse_raw"
@@ -2800,4 +2870,6 @@ def run(
         "last_checkpoint": last_checkpoint,
         "loaded_checkpoint": loaded_checkpoint,
         "checkpoint_dir": str(out_dir),
+        "summ_ft_skipped_nonfinite_grad_steps": int(skipped_summary_ft_nonfinite_grad_steps),
+        "summ_max_nonfinite_grad_steps": int(max_summary_nonfinite_grad_steps),
     }

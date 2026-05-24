@@ -13,6 +13,56 @@ from llapdiffusion.models.summarizer import LaplaceAE
 from llapdiffusion.models.time_utils import relative_time_offsets
 
 
+class _FakeScaler:
+    def scale(self, loss):
+        return loss
+
+    def unscale_(self, optimizer):
+        return None
+
+    def step(self, optimizer):
+        optimizer.step()
+
+    def update(self):
+        return None
+
+
+class _FiniteLossInfGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, param):
+        ctx.shape = param.shape
+        return param.new_tensor(1.0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return torch.full(ctx.shape, float("inf"), device=grad_output.device, dtype=grad_output.dtype)
+
+
+class _PatternBadGradientSummarizer(torch.nn.Module):
+    def __init__(self, bad_calls):
+        super().__init__()
+        self.param = torch.nn.Parameter(torch.ones(()))
+        self.bad_calls = set(bad_calls)
+        self.calls = 0
+
+    def forward(self, x, pad_mask=None, dt=None, ctx_diff=None, obs_mask=None):
+        return None, {}
+
+    def recon_loss(self, aux, mask, weights):
+        self.calls += 1
+        if self.calls in self.bad_calls:
+            return _FiniteLossInfGrad.apply(self.param)
+        return self.param * 0.0 + 1.0
+
+
+def _summarizer_grad_loader(num_batches: int = 1):
+    V = torch.zeros(1, 1, 2, 1)
+    T = torch.zeros_like(V)
+    y = torch.zeros(1, 1, 1)
+    meta = {"entity_mask": torch.ones(1, 1, dtype=torch.bool)}
+    return [((V, T), y, meta) for _ in range(num_batches)]
+
+
 def test_relative_offset_dt_is_not_accumulated_twice():
     dt = torch.tensor([[[0.0], [1.0], [2.0], [3.0]]])
     rel_t = relative_time_offsets(dt)
@@ -209,50 +259,8 @@ def test_summarizer_builder_passes_rope_base():
 def test_summarizer_amp_nonfinite_gradients_are_bounded_skips():
     from llapdiffusion.trainers import train_val_summarizer as tvs
 
-    class FakeScaler:
-        def scale(self, loss):
-            return loss
-
-        def unscale_(self, optimizer):
-            return None
-
-        def step(self, optimizer):
-            optimizer.step()
-
-        def update(self):
-            return None
-
-    class FiniteLossInfGrad(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, param):
-            ctx.shape = param.shape
-            return param.new_tensor(1.0)
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            return torch.full(ctx.shape, float("inf"), device=grad_output.device, dtype=grad_output.dtype)
-
-    class OccasionallyBadModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.param = torch.nn.Parameter(torch.ones(()))
-            self.calls = 0
-
-        def forward(self, x, pad_mask=None, dt=None, ctx_diff=None, obs_mask=None):
-            return None, {}
-
-        def recon_loss(self, aux, mask, weights):
-            self.calls += 1
-            if self.calls == 1:
-                return FiniteLossInfGrad.apply(self.param)
-            return self.param * 0.0 + 1.0
-
-    V = torch.zeros(1, 1, 2, 1)
-    T = torch.zeros_like(V)
-    y = torch.zeros(1, 1, 1)
-    meta = {"entity_mask": torch.ones(1, 1, dtype=torch.bool)}
-    loader = [((V, T), y, meta), ((V, T), y, meta)]
-    model = OccasionallyBadModel()
+    loader = _summarizer_grad_loader(num_batches=2)
+    model = _PatternBadGradientSummarizer(bad_calls={1})
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     epoch_stats = {}
 
@@ -262,7 +270,7 @@ def test_summarizer_amp_nonfinite_gradients_are_bounded_skips():
         torch.device("cpu"),
         loss_weights=(1.0, 0.1, 0.1, 0.0, 0.0),
         optimizer=optimizer,
-        scaler=FakeScaler(),
+        scaler=_FakeScaler(),
         amp=True,
         max_nonfinite_grad_steps=1,
         epoch_stats=epoch_stats,
@@ -271,6 +279,149 @@ def test_summarizer_amp_nonfinite_gradients_are_bounded_skips():
     assert loss == pytest.approx(1.0)
     assert epoch_stats["skipped_nonfinite_grad_steps"] == 1
     assert epoch_stats["optimizer_steps"] == 1
+
+
+def test_summarizer_nonfinite_gradients_raise_without_amp_even_with_budget():
+    from llapdiffusion.trainers import train_val_summarizer as tvs
+
+    model = _PatternBadGradientSummarizer(bad_calls={1})
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    epoch_stats = {}
+
+    with pytest.raises(FloatingPointError, match="non-finite summarizer gradients"):
+        tvs._run_epoch(
+            _summarizer_grad_loader(num_batches=1),
+            model,
+            torch.device("cpu"),
+            loss_weights=(1.0, 0.1, 0.1, 0.0, 0.0),
+            optimizer=optimizer,
+            scaler=_FakeScaler(),
+            amp=False,
+            max_nonfinite_grad_steps=1,
+            epoch_stats=epoch_stats,
+        )
+
+    assert epoch_stats["skipped_nonfinite_grad_steps"] == 1
+    assert "optimizer_steps" not in epoch_stats
+
+
+def test_summarizer_all_skipped_epoch_has_clear_error():
+    from llapdiffusion.trainers import train_val_summarizer as tvs
+
+    model = _PatternBadGradientSummarizer(bad_calls={1})
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    epoch_stats = {}
+
+    with pytest.raises(FloatingPointError, match="all summarizer optimizer steps were skipped"):
+        tvs._run_epoch(
+            _summarizer_grad_loader(num_batches=1),
+            model,
+            torch.device("cpu"),
+            loss_weights=(1.0, 0.1, 0.1, 0.0, 0.0),
+            optimizer=optimizer,
+            scaler=_FakeScaler(),
+            amp=True,
+            max_nonfinite_grad_steps=1,
+            epoch_stats=epoch_stats,
+        )
+
+    assert epoch_stats["skipped_nonfinite_grad_steps"] == 1
+    assert "optimizer_steps" not in epoch_stats
+
+
+def test_summarizer_run_uses_global_nonfinite_gradient_budget(monkeypatch, tmp_path):
+    from llapdiffusion.trainers import train_val_summarizer as tvs
+
+    cfg = SimpleNamespace(
+        SEED=123,
+        SUM_AMP=False,
+        SUM_GRAD_CLIP=1.0,
+        GRAD_CLIP=1.0,
+        SUM_MAX_NONFINITE_GRAD_STEPS=1,
+        SUM_LR=1e-3,
+        SUM_WEIGHT_DECAY=0.0,
+        SUM_EPOCHS=2,
+        SUM_PATIENCE=10,
+        SUM_MIN_DELTA=0.0,
+        SUM_CKPT=str(tmp_path / "summarizer.pt"),
+        SUM_DIR=str(tmp_path),
+    )
+    loaders = ([object()], [object()], [object()])
+    train_budgets = []
+
+    def fake_build_model(train_loader, sizes, device, *, config, verbose=True):
+        return torch.nn.Linear(1, 1).to(device)
+
+    def fake_run_epoch(
+        loader,
+        model,
+        device,
+        *,
+        loss_weights,
+        optimizer=None,
+        scaler=None,
+        grad_clip=0.0,
+        amp=False,
+        max_nonfinite_grad_steps=0,
+        epoch_stats=None,
+    ):
+        if optimizer is None:
+            return 1.0
+        train_budgets.append(max_nonfinite_grad_steps)
+        if max_nonfinite_grad_steps <= 0:
+            raise FloatingPointError("non-finite summarizer gradients detected after global budget")
+        epoch_stats["skipped_nonfinite_grad_steps"] = 1
+        return 1.0
+
+    monkeypatch.setattr(tvs, "_build_model", fake_build_model)
+    monkeypatch.setattr(tvs, "_run_epoch", fake_run_epoch)
+
+    with pytest.raises(FloatingPointError, match="global budget"):
+        tvs.run(
+            train_loader=loaders[0],
+            val_loader=loaders[1],
+            test_loader=loaders[2],
+            sizes=(1, 1, 1),
+            config=cfg,
+        )
+
+    assert train_budgets == [1, 0]
+
+
+def test_llapdiff_summary_ft_nonfinite_skip_is_summary_only():
+    from llapdiffusion.trainers import train_val_llapdiff as tv
+
+    diff_param = torch.nn.Parameter(torch.ones(()))
+    summary_param = torch.nn.Parameter(torch.ones(()))
+    diff_param.grad = torch.ones_like(diff_param)
+    summary_param.grad = torch.full_like(summary_param, float("inf"))
+
+    assert tv._should_skip_nonfinite_summary_ft_gradients(
+        diffusion_params=[diff_param],
+        summary_ft_params=[summary_param],
+        amp_enabled=True,
+        summary_ft_active=True,
+        skipped_nonfinite_grad_steps=0,
+        max_nonfinite_grad_steps=1,
+    )
+    assert not tv._should_skip_nonfinite_summary_ft_gradients(
+        diffusion_params=[diff_param],
+        summary_ft_params=[summary_param],
+        amp_enabled=True,
+        summary_ft_active=True,
+        skipped_nonfinite_grad_steps=1,
+        max_nonfinite_grad_steps=1,
+    )
+
+    diff_param.grad = torch.full_like(diff_param, float("inf"))
+    assert not tv._should_skip_nonfinite_summary_ft_gradients(
+        diffusion_params=[diff_param],
+        summary_ft_params=[summary_param],
+        amp_enabled=True,
+        summary_ft_active=True,
+        skipped_nonfinite_grad_steps=0,
+        max_nonfinite_grad_steps=1,
+    )
 
 
 def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
@@ -297,6 +448,7 @@ def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
             "SUM_PATIENCE",
             "SUM_LR",
             "SUM_AMP",
+            "SUM_MAX_NONFINITE_GRAD_STEPS",
             "SUM_TIME2VEC_DIM",
             "PRIMARY_EVAL_METRIC",
         ]
@@ -306,7 +458,9 @@ def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
 
     improved = {"physionet", "crypto"}
     for key in dd.dataset_keys():
-        cfg = dd.apply_dataset_preset(make_cfg(), key, pred=dd.default_horizons(key)[-1])
+        cfg = make_cfg()
+        cfg.SUM_MAX_NONFINITE_GRAD_STEPS = 123
+        cfg = dd.apply_dataset_preset(cfg, key, pred=dd.default_horizons(key)[-1])
         if key in improved:
             assert cfg.SUM_POS_ENCODING == "continuous_rope"
             assert cfg.VAE_INPUT_DROPOUT == 0.35
@@ -332,10 +486,14 @@ def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
         if key in {"bms_air", "uci_air", "noaa_us", "noaa_uk"}:
             assert cfg.SUM_LR == 1e-4
             assert cfg.SUM_AMP is False
+        assert cfg.SUM_MAX_NONFINITE_GRAD_STEPS == base_cfg.SUM_MAX_NONFINITE_GRAD_STEPS
         assert cfg.TARGET_MASK_AUX_P == 0.0
 
     reused = make_cfg()
+    reused.SUM_MAX_NONFINITE_GRAD_STEPS = 123
     dd.apply_dataset_preset(reused, "physionet", pred=12)
+    assert reused.SUM_MAX_NONFINITE_GRAD_STEPS == base_cfg.SUM_MAX_NONFINITE_GRAD_STEPS
+    reused.SUM_MAX_NONFINITE_GRAD_STEPS = 123
     dd.apply_dataset_preset(reused, "noaa_uk", pred=168)
     assert reused.SUM_POS_ENCODING == "learned_abs"
     assert reused.VAE_INPUT_DROPOUT == 0.20
@@ -343,6 +501,7 @@ def test_public_presets_apply_only_selected_overrides(monkeypatch, tmp_path):
     assert reused.SUM_CHANNEL_BALANCED_X_LOSS is False
     assert reused.SUM_LR == 1e-4
     assert reused.SUM_AMP is False
+    assert reused.SUM_MAX_NONFINITE_GRAD_STEPS == base_cfg.SUM_MAX_NONFINITE_GRAD_STEPS
 
 
 def test_vae_checkpoint_path_preserves_entity_suffix(tmp_path):
