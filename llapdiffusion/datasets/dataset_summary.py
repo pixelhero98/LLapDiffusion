@@ -26,7 +26,9 @@ import numpy as np
 from llapdiffusion.datasets.fin_dataset import (
     CachePaths,
     _assign_ratio_splits,
+    _canonical_split_policy,
     _normalize_to_day,
+    _target_interval_times_for_pairs,
     split_policy_name,
 )
 
@@ -136,6 +138,8 @@ def _apply_split(
     per_asset: bool,
     split_policy: str,
     horizon: int,
+    data_dir: Path | None = None,
+    window: int | None = None,
 ) -> Tuple[int, int, int]:
     """Replicate the ratio split logic from fin_dataset.load_dataloaders_with_ratio_split."""
     if pairs.size == 0:
@@ -149,6 +153,17 @@ def _apply_split(
         order = np.argsort(t_int)
     pairs = pairs[order]
     end_times = end_times[order]
+    policy = _canonical_split_policy(split_policy)
+    target_start_times = target_end_times = None
+    if policy in {"global_purged_horizon", "per_asset_purged_horizon"}:
+        if data_dir is None or window is None:
+            raise ValueError("data_dir and window are required to summarize purged target-interval splits")
+        target_start_times, target_end_times = _target_interval_times_for_pairs(
+            data_dir,
+            pairs,
+            int(window),
+            int(horizon),
+        )
     assign = _assign_ratio_splits(
         pairs,
         end_times,
@@ -156,8 +171,10 @@ def _apply_split(
         val_ratio,
         test_ratio,
         per_asset=per_asset,
-        split_policy=split_policy,
+        split_policy=policy,
         horizon=horizon,
+        target_start_times=target_start_times,
+        target_end_times=target_end_times,
     )
 
     return int((assign == 0).sum()), int((assign == 1).sum()), int((assign == 2).sum())
@@ -223,6 +240,8 @@ def summarize_dataset(
         per_asset=per_asset,
         split_policy=split_policy,
         horizon=horizon,
+        data_dir=data_dir,
+        window=window,
     )
 
     print(f"Package root   : {PACKAGE_ROOT}")

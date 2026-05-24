@@ -766,7 +766,15 @@ def rebuild_window_index_only(
             targets = np.load(paths.targets / f"{aid}.npy", allow_pickle=False).astype(np.float32, copy=False)
             if targets.ndim == 1:
                 targets = targets[:, None]
-            obs = np.isfinite(targets)
+            obs_path = paths.obs_masks / f"{aid}.npy"
+            if obs_path.exists() and target_indices:
+                feature_obs = np.load(obs_path, allow_pickle=False)
+                if feature_obs.ndim == 2 and max(target_indices, default=-1) < feature_obs.shape[1]:
+                    obs = feature_obs[:, target_indices].astype(bool, copy=False)
+                else:
+                    obs = np.isfinite(targets)
+            else:
+                obs = np.isfinite(targets)
         T = int(times.shape[0])
         min_required = window + horizon
         if T < min_required:
@@ -1251,9 +1259,13 @@ class _IndexBackedDataset(Dataset):
             y_vec = y_raw
         else:
             y_vec = Yf[e:e+self.horizon].astype(np.float32)  # [H]
-            y_obs_mask = np.isfinite(y_vec)
+            if Obs is not None and Obs.ndim == 2 and max(target_indices, default=-1) < Obs.shape[1]:
+                y_obs_mask = Obs[e:e+self.horizon, list(target_indices)].astype(bool)
+            else:
+                y_obs_mask = np.isfinite(y_vec)
         if target_dim == 1 and np.ndim(y_vec) == 2:
             y_vec = y_vec[:, 0]
+        if target_dim == 1 and np.ndim(y_obs_mask) == 2:
             y_obs_mask = y_obs_mask[:, 0]
         y_for_label = np.asarray(y_vec)
         raw_last_for_label = (
@@ -1530,6 +1542,99 @@ def _canonical_split_policy(split_policy: str) -> str:
     return value
 
 
+def _target_interval_times_for_pairs(
+    data_dir: PathLike,
+    pairs: np.ndarray,
+    window: int,
+    horizon: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return absolute target interval start/end times for indexed windows."""
+
+    paths = CachePaths.from_dir(data_dir)
+    pairs = np.asarray(pairs)
+    starts = np.empty(pairs.shape[0], dtype="datetime64[ns]")
+    ends = np.empty(pairs.shape[0], dtype="datetime64[ns]")
+    times_cache: Dict[int, np.ndarray] = {}
+    window = int(window)
+    horizon = int(horizon)
+    for row, (aid_raw, start_raw) in enumerate(pairs):
+        aid = int(aid_raw)
+        start = int(start_raw)
+        if aid not in times_cache:
+            times_cache[aid] = np.load(paths.times / f"{aid}.npy", allow_pickle=False).astype("datetime64[ns]")
+        times = times_cache[aid]
+        if horizon > 0:
+            first = start + window
+            last = first + horizon - 1
+        else:
+            first = last = start + window - 1
+        if first < 0 or last >= times.shape[0]:
+            raise ValueError(
+                f"Window (asset={aid}, start={start}, window={window}, horizon={horizon}) "
+                f"exceeds cached time axis length {times.shape[0]}."
+            )
+        starts[row] = times[first]
+        ends[row] = times[last]
+    return starts, ends
+
+
+def _coerce_target_interval_times(
+    target_start_times: Optional[np.ndarray],
+    target_end_times: Optional[np.ndarray],
+    n_rows: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if target_start_times is None or target_end_times is None:
+        raise ValueError("target interval times are required for purged split policies")
+    starts = np.asarray(target_start_times).astype("datetime64[ns]").astype(np.int64)
+    ends = np.asarray(target_end_times).astype("datetime64[ns]").astype(np.int64)
+    if starts.shape != (n_rows,) or ends.shape != (n_rows,):
+        raise ValueError(
+            "target interval time arrays must have shape "
+            f"({n_rows},), got {starts.shape} and {ends.shape}"
+        )
+    if np.any(ends < starts):
+        raise ValueError("target interval end times must be greater than or equal to start times")
+    return starts, ends
+
+
+def _target_interval_boundaries(
+    target_starts: np.ndarray,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+) -> Tuple[int, int]:
+    unique_starts = np.unique(target_starts)
+    if unique_starts.size < 3:
+        raise ValueError(f"Not enough unique target timestamps for purged split: {unique_starts.size}")
+    trn, van, _ = _split_counts(int(unique_starts.size), train_ratio, val_ratio, test_ratio)
+    test_idx = trn + van
+    if trn <= 0 or van <= 0 or test_idx >= unique_starts.size:
+        raise ValueError(f"Could not form non-empty purged splits from {unique_starts.size} target timestamps")
+    return int(unique_starts[trn]), int(unique_starts[test_idx])
+
+
+def _assign_by_target_interval_boundaries(
+    assign: np.ndarray,
+    rows: np.ndarray,
+    target_starts: np.ndarray,
+    target_ends: np.ndarray,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+) -> None:
+    val_start, test_start = _target_interval_boundaries(
+        target_starts[rows],
+        train_ratio,
+        val_ratio,
+        test_ratio,
+    )
+    row_starts = target_starts[rows]
+    row_ends = target_ends[rows]
+    assign[rows[row_ends < val_start]] = 0
+    assign[rows[(row_starts >= val_start) & (row_ends < test_start)]] = 1
+    assign[rows[row_starts >= test_start]] = 2
+
+
 def _assign_ratio_splits(
     pairs: np.ndarray,
     end_times: np.ndarray,
@@ -1540,6 +1645,8 @@ def _assign_ratio_splits(
     per_asset: bool,
     split_policy: str,
     horizon: int,
+    target_start_times: Optional[np.ndarray] = None,
+    target_end_times: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Assign rows to train/val/test using the configured chronological policy."""
 
@@ -1550,42 +1657,44 @@ def _assign_ratio_splits(
         return assign
 
     if policy == "global_purged_horizon":
-        keys = end_times.astype("datetime64[ns]").astype(np.int64)
-        unique_keys = np.unique(keys)
-        purge = max(0, int(horizon))
-        available = int(unique_keys.size) - 2 * purge
-        if available < 3:
-            raise ValueError(
-                "Not enough unique context-end timestamps for "
-                f"global_purged_horizon with horizon={horizon}: {unique_keys.size}"
-            )
-        trn, van, _ = _split_counts(available, train_ratio, val_ratio, test_ratio)
-        val_start = trn + purge
-        val_end = val_start + van
-        test_start = val_end + purge
-        train_keys = unique_keys[:trn]
-        val_keys = unique_keys[val_start:val_end]
-        test_keys = unique_keys[test_start:]
-        assign[np.isin(keys, train_keys)] = 0
-        assign[np.isin(keys, val_keys)] = 1
-        assign[np.isin(keys, test_keys)] = 2
+        target_starts, target_ends = _coerce_target_interval_times(
+            target_start_times,
+            target_end_times,
+            pairs.shape[0],
+        )
+        _assign_by_target_interval_boundaries(
+            assign,
+            np.arange(pairs.shape[0], dtype=np.int64),
+            target_starts,
+            target_ends,
+            train_ratio,
+            val_ratio,
+            test_ratio,
+        )
+        if any(int((assign == split).sum()) == 0 for split in (0, 1, 2)):
+            raise ValueError("target-interval purged split produced an empty train/val/test split")
         return assign
 
     aids = pairs[:, 0].astype(np.int64)
     if policy == "per_asset_purged_horizon":
-        purge = max(0, int(horizon))
+        target_starts, target_ends = _coerce_target_interval_times(
+            target_start_times,
+            target_end_times,
+            pairs.shape[0],
+        )
         for aid in np.unique(aids):
             idx = np.nonzero(aids == aid)[0]
-            available = int(idx.size) - 2 * purge
-            if available < 3:
+            if np.unique(target_starts[idx]).size < 3:
                 continue
-            trn, van, _ = _split_counts(available, train_ratio, val_ratio, test_ratio)
-            val_start = trn + purge
-            val_end = val_start + van
-            test_start = val_end + purge
-            assign[idx[:trn]] = 0
-            assign[idx[val_start:val_end]] = 1
-            assign[idx[test_start:]] = 2
+            _assign_by_target_interval_boundaries(
+                assign,
+                idx,
+                target_starts,
+                target_ends,
+                train_ratio,
+                val_ratio,
+                test_ratio,
+            )
         return assign
 
     if per_asset:
@@ -1812,7 +1921,7 @@ def load_dataloaders_with_ratio_split(
     batch_size: int = 64,
     regression: bool = True,
     per_asset: bool = True,
-    norm_scope: str = "cache",
+    norm_scope: str = "train_only",
     shuffle_train: bool = True,
     num_workers: int = 0,
     pin_memory: Optional[bool] = None,
@@ -1897,6 +2006,14 @@ def load_dataloaders_with_ratio_split(
     pairs = pairs[order]
     end_times = end_times[order]
     aid = pairs[:, 0].astype(np.int32)
+    target_start_times = target_end_times = None
+    if policy in {"global_purged_horizon", "per_asset_purged_horizon"}:
+        target_start_times, target_end_times = _target_interval_times_for_pairs(
+            data_dir,
+            pairs,
+            window,
+            horizon,
+        )
     
     # Ratio assignment
     assign = _assign_ratio_splits(
@@ -1908,6 +2025,8 @@ def load_dataloaders_with_ratio_split(
         per_asset=per_asset,
         split_policy=policy,
         horizon=horizon,
+        target_start_times=target_start_times,
+        target_end_times=target_end_times,
     )
     
     tr_pairs = pairs[assign == 0]

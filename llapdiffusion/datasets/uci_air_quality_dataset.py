@@ -286,16 +286,21 @@ def clean_uci_air_quality(
         resample_freq = freq.lower() if isinstance(freq, str) else freq
         numeric = numeric.resample(resample_freq).mean()
 
+    observed_mask = numeric.notna()
     numeric = numeric.ffill()
 
     required = max(1, int(np.ceil(min_coverage * len(feature_cols))))
-    numeric = numeric.dropna(thresh=required)
-    if not np.isfinite(numeric[target_column]).any():
+    keep_rows = numeric.notna().sum(axis=1) >= required
+    numeric = numeric.loc[keep_rows]
+    observed_mask = observed_mask.reindex(numeric.index).fillna(False)
+    if target_column not in observed_mask.columns or not bool(observed_mask[target_column].any()):
         raise RuntimeError("No observed target values remain after cleaning the UCI Air Quality data.")
     if numeric.empty:
         raise RuntimeError("No usable rows remain after applying coverage filtering.")
 
-    return numeric.astype(np.float32)
+    out = numeric.astype(np.float32)
+    out.attrs["observed_mask"] = observed_mask[cols].astype(bool)
+    return out
 
 
 
@@ -357,10 +362,18 @@ def prepare_uci_air_cache(cfg: UCIAirCacheConfig) -> Mapping[str, List[str]]:
     features = panel.to_numpy(dtype=np.float32, copy=True)
     targets = panel[cfg.target_column].to_numpy(dtype=np.float32, copy=True)
     times = panel.index.to_numpy(dtype="datetime64[ns]")
+    observed_mask = clean_df.attrs.get("observed_mask")
+    if isinstance(observed_mask, pd.DataFrame):
+        obs_mask = observed_mask.reindex(panel.index)[feature_cols].fillna(False).to_numpy(dtype=bool, copy=False)
+    else:
+        obs_mask = np.isfinite(features)
+    fill_mask = np.isfinite(features)
 
     np.save(paths.features / "0.npy", features.astype(np.float16, copy=False))
     np.save(paths.targets / "0.npy", targets.astype(np.float16, copy=False))
     np.save(paths.times / "0.npy", times)
+    np.save(paths.obs_masks / "0.npy", obs_mask)
+    np.save(paths.fill_masks / "0.npy", fill_mask)
 
     norm_acc = NormalizationStatsAccumulator(
         num_assets=len(assets),
@@ -375,7 +388,8 @@ def prepare_uci_air_cache(cfg: UCIAirCacheConfig) -> Mapping[str, List[str]]:
 
     starts = np.arange(0, max_start, dtype=np.int32)
     if cfg.horizon > 0:
-        obs = np.isfinite(targets)
+        target_idx = feature_cols.index(cfg.target_column)
+        obs = obs_mask[:, target_idx]
         future_obs = sliding_window_view(obs, window_shape=cfg.horizon)
         valid = future_obs[cfg.window : cfg.window + max_start].any(axis=1)
         starts = starts[valid]

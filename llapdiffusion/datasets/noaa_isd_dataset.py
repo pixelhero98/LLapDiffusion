@@ -512,6 +512,7 @@ def _build_station_panels(
         station_df = group.set_index("datetime")[available_features]
         station_df = station_df.apply(pd.to_numeric, errors="coerce")
         station_df = station_df.resample(freq).mean()
+        observed_mask = station_df.notna()
         station_df = station_df.ffill()
         if station_df.empty:
             continue
@@ -520,12 +521,16 @@ def _build_station_panels(
         if coverage < min_coverage:
             continue
         required = max(1, int(np.ceil(min_coverage * len(feature_cols))))
-        station_df = station_df.dropna(thresh=required)
+        keep_rows = station_df.notna().sum(axis=1) >= required
+        station_df = station_df.loc[keep_rows]
+        observed_mask = observed_mask.reindex(station_df.index).fillna(False)
         if station_df.empty:
             continue
-        if not np.isfinite(station_df[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=False)).any():
+        if TARGET_COLUMN not in observed_mask.columns or not bool(observed_mask[TARGET_COLUMN].any()):
             continue
-        panels[str(station_id)] = station_df.astype(np.float32)
+        out = station_df.astype(np.float32)
+        out.attrs["observed_mask"] = observed_mask[available_features].astype(bool)
+        panels[str(station_id)] = out
 
     if not panels:
         raise RuntimeError("All stations were filtered out during panel construction.")
@@ -624,10 +629,18 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
         features = panel.to_numpy(dtype=np.float32, copy=True)
         targets = panel[target_col].to_numpy(dtype=np.float32, copy=True)
         times = panel.index.to_numpy(dtype="datetime64[ns]")
+        observed_mask = panel.attrs.get("observed_mask")
+        if isinstance(observed_mask, pd.DataFrame):
+            obs_mask = observed_mask.reindex(panel.index)[feature_cols].fillna(False).to_numpy(dtype=bool, copy=False)
+        else:
+            obs_mask = np.isfinite(features)
+        fill_mask = np.isfinite(features)
 
         np.save(paths.features / f"{aid}.npy", features.astype(np.float16, copy=False))
         np.save(paths.targets / f"{aid}.npy", targets.astype(np.float16, copy=False))
         np.save(paths.times / f"{aid}.npy", times)
+        np.save(paths.obs_masks / f"{aid}.npy", obs_mask)
+        np.save(paths.fill_masks / f"{aid}.npy", fill_mask)
 
         norm_acc.update(aid, features, targets)
 
@@ -636,7 +649,7 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
             continue
         starts = np.arange(0, max_start, dtype=np.int32)
         if cfg.horizon > 0:
-            obs = np.isfinite(targets)
+            obs = obs_mask[:, feature_cols.index(target_col)]
             future_obs = sliding_window_view(obs, window_shape=cfg.horizon)
             valid = future_obs[cfg.window : cfg.window + max_start].any(axis=1)
             starts = starts[valid]

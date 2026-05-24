@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -17,6 +18,7 @@ from llapdiffusion.datasets.target_selection import resolve_target_selection, va
 from llapdiffusion.datasets.fin_dataset import (
     CachePaths,
     _assign_ratio_splits,
+    _target_interval_times_for_pairs,
     load_dataloaders_with_ratio_split,
     make_collate_level_and_firstdiff,
 )
@@ -221,11 +223,32 @@ def _target_time_indices(pairs: np.ndarray, assign: np.ndarray, split: int, *, w
     return out
 
 
+def _target_intervals_ns(data_dir: Path, pairs: np.ndarray, *, window: int, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+    starts, ends = _target_interval_times_for_pairs(data_dir, pairs, window, horizon)
+    return starts.astype("datetime64[ns]").astype(np.int64), ends.astype("datetime64[ns]").astype(np.int64)
+
+
+def _assert_split_target_intervals_are_ordered(
+    pairs: np.ndarray,
+    assign: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+) -> None:
+    del pairs
+    for left, right in ((0, 1), (1, 2)):
+        left_rows = assign == left
+        right_rows = assign == right
+        assert left_rows.any()
+        assert right_rows.any()
+        assert int(ends[left_rows].max()) < int(starts[right_rows].min())
+
+
 def test_global_purged_split_has_no_target_timestamp_overlap(tmp_path):
-    _, pairs, end_times = _write_tiny_cache(tmp_path, length=40, window=2, horizon=3)
+    data_dir, pairs, end_times = _write_tiny_cache(tmp_path, length=40, window=2, horizon=3)
     order = np.argsort(end_times.astype("datetime64[ns]").astype(np.int64), kind="mergesort")
     pairs = pairs[order]
     end_times = end_times[order]
+    target_starts, target_ends = _target_interval_times_for_pairs(data_dir, pairs, 2, 3)
 
     assign = _assign_ratio_splits(
         pairs,
@@ -236,26 +259,75 @@ def test_global_purged_split_has_no_target_timestamp_overlap(tmp_path):
         per_asset=True,
         split_policy="global_purged_horizon",
         horizon=3,
+        target_start_times=target_starts,
+        target_end_times=target_ends,
     )
 
-    train_targets = _target_time_indices(pairs, assign, 0, window=2, horizon=3)
-    val_targets = _target_time_indices(pairs, assign, 1, window=2, horizon=3)
-    test_targets = _target_time_indices(pairs, assign, 2, window=2, horizon=3)
-    assert train_targets
-    assert val_targets
-    assert test_targets
-    assert train_targets.isdisjoint(val_targets)
-    assert train_targets.isdisjoint(test_targets)
-    assert val_targets.isdisjoint(test_targets)
+    starts_ns = target_starts.astype("datetime64[ns]").astype(np.int64)
+    ends_ns = target_ends.astype("datetime64[ns]").astype(np.int64)
+    _assert_split_target_intervals_are_ordered(pairs, assign, starts_ns, ends_ns)
+
+
+def test_global_purged_split_uses_actual_gappy_target_intervals(tmp_path):
+    data_dir, pairs, end_times = _write_tiny_cache(tmp_path, length=80, window=2, horizon=3)
+    paths = CachePaths.from_dir(data_dir)
+    times = np.load(paths.times / "0.npy", allow_pickle=False).astype("datetime64[ns]")
+    gappy = times.copy()
+    gappy[2:] = times[2:] + np.timedelta64(1000, "h")
+    np.save(paths.times / "0.npy", gappy)
+    end_times = end_times.copy()
+    asset0 = pairs[:, 0] == 0
+    end_times[asset0] = gappy[pairs[asset0, 1] + 1]
+    np.save(paths.windows / "end_times.npy", end_times)
+
+    train_dl, val_dl, test_dl, _ = load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=0.7,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        batch_size=8,
+        n_entities=2,
+        shuffle_train=False,
+        date_batching=False,
+        window=2,
+        horizon=3,
+        split_policy="global_purged_horizon",
+        exact_timestamp_batches=True,
+    )
+
+    split_pairs = [dl.dataset.pairs for dl in (train_dl, val_dl, test_dl)]
+    split_intervals = [_target_intervals_ns(data_dir, rows, window=2, horizon=3) for rows in split_pairs]
+    for starts, _ in split_intervals:
+        assert starts.size > 0
+    assert int(split_intervals[0][1].max()) < int(split_intervals[1][0].min())
+    assert int(split_intervals[1][1].max()) < int(split_intervals[2][0].min())
+
+
+def test_purged_split_rejects_mismatched_target_interval_metadata(tmp_path):
+    _, pairs, end_times = _write_tiny_cache(tmp_path, length=40, window=2, horizon=3)
+    with pytest.raises(ValueError, match="target interval time arrays"):
+        _assign_ratio_splits(
+            pairs,
+            end_times,
+            0.7,
+            0.1,
+            0.2,
+            per_asset=True,
+            split_policy="global_purged_horizon",
+            horizon=3,
+            target_start_times=end_times[:-1],
+            target_end_times=end_times[:-1],
+        )
 
 
 def test_physionet_relative_time_split_uses_legacy_per_patient_policy(tmp_path):
-    _, pairs, end_times = _write_tiny_cache(tmp_path, num_assets=4, length=49, window=24, horizon=12)
+    data_dir, pairs, end_times = _write_tiny_cache(tmp_path, num_assets=4, length=49, window=24, horizon=12)
     order = np.lexsort((end_times.astype("datetime64[ns]").astype(np.int64), pairs[:, 0].astype(np.int64)))
     pairs = pairs[order]
     end_times = end_times[order]
+    target_starts, target_ends = _target_interval_times_for_pairs(data_dir, pairs, 24, 12)
 
-    with pytest.raises(ValueError, match="Not enough unique context-end timestamps"):
+    with pytest.raises(ValueError, match="target-interval purged split"):
         _assign_ratio_splits(
             pairs,
             end_times,
@@ -265,6 +337,8 @@ def test_physionet_relative_time_split_uses_legacy_per_patient_policy(tmp_path):
             per_asset=True,
             split_policy="global_purged_horizon",
             horizon=12,
+            target_start_times=target_starts,
+            target_end_times=target_ends,
         )
 
     assign = _assign_ratio_splits(
@@ -307,6 +381,8 @@ def test_dataset_summary_split_counts_match_loader(tmp_path):
         per_asset=True,
         split_policy="global_purged_horizon",
         horizon=3,
+        data_dir=data_dir,
+        window=2,
     )
     assert loaders[3] == summary_counts
 
@@ -415,6 +491,33 @@ def test_loader_coverage_preserves_sparse_missingness_and_target_metadata(tmp_pa
     assert torch.equal(meta0["y_obs_mask"], metah["y_obs_mask"])
     assert torch.equal(meta0["delta_t"], metah["delta_t"])
     assert torch.equal(meta0["delta_t_y"], metah["delta_t_y"])
+
+
+def test_cache_target_mask_uses_saved_observed_mask_for_filled_targets(tmp_path):
+    data_dir, _, _ = _write_tiny_cache(tmp_path, num_assets=1, length=10, window=2, horizon=2)
+    paths = CachePaths.from_dir(data_dir)
+    obs = np.load(paths.obs_masks / "0.npy", allow_pickle=False)
+    obs[2, 1] = False
+    np.save(paths.obs_masks / "0.npy", obs)
+
+    train_dl, _, _, _ = load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        batch_size=1,
+        n_entities=1,
+        shuffle_train=False,
+        date_batching=False,
+        window=2,
+        horizon=2,
+        split_policy="contiguous",
+        exact_timestamp_batches=True,
+    )
+
+    _, y, meta = next(iter(train_dl))
+    assert torch.isfinite(y[0, 0, 0])
+    assert meta["y_obs_mask"][0, 0].tolist() == [False, True]
 
 
 @pytest.mark.parametrize("coverage", [-0.1, 1.0])
@@ -915,6 +1018,118 @@ def test_public_ratio_loader_helpers_expose_split_and_batching_policy():
         assert "split_policy" in signature.parameters
         assert "exact_timestamp_batches" in signature.parameters
         assert "target_col" in signature.parameters
+
+
+def test_direct_ratio_loader_defaults_to_train_only_normalization():
+    signature = inspect.signature(load_dataloaders_with_ratio_split)
+    assert signature.parameters["norm_scope"].default == "train_only"
+
+
+def test_uci_cache_prep_saves_true_observed_mask_before_forward_fill(monkeypatch, tmp_path):
+    from llapdiffusion.datasets import uci_air_quality_dataset as uci
+
+    raw = pd.DataFrame(
+        {
+            "Date": ["01/01/2020"] * 4,
+            "Time": ["00.00.00", "01.00.00", "02.00.00", "03.00.00"],
+            "NO2(GT)": [1.0, np.nan, 3.0, 4.0],
+            "T": [10.0, 11.0, 12.0, 13.0],
+        }
+    )
+    monkeypatch.setattr(uci, "download_uci_air_quality_dataset", lambda raw_root: tmp_path / "raw.csv")
+    monkeypatch.setattr(uci, "load_raw_uci_air_quality", lambda raw_path: raw)
+
+    uci.prepare_uci_air_cache(
+        uci.UCIAirCacheConfig(
+            window=1,
+            horizon=1,
+            data_dir=tmp_path,
+            feature_columns=("NO2(GT)", "T"),
+            min_coverage=0.0,
+            overwrite=True,
+        )
+    )
+
+    paths = CachePaths.from_dir(tmp_path)
+    meta = json.loads(paths.meta.read_text(encoding="utf-8"))
+    target_idx = meta["feature_cols"].index("NO2(GT)")
+    targets = np.load(paths.targets / "0.npy", allow_pickle=False)
+    obs = np.load(paths.obs_masks / "0.npy", allow_pickle=False)
+    assert np.isfinite(targets[1])
+    assert obs[1, target_idx].item() is False
+
+
+def test_noaa_cache_prep_saves_true_observed_mask_before_forward_fill(monkeypatch, tmp_path):
+    from llapdiffusion.datasets import noaa_isd_dataset as noaa
+
+    raw = pd.DataFrame(
+        {
+            "station": ["s1"] * 4,
+            "datetime": pd.date_range("2020-01-01", periods=4, freq="h"),
+            "temperature": [1.0, np.nan, 3.0, 4.0],
+            "dew_point": [0.0, 0.5, 1.0, 1.5],
+        }
+    )
+    monkeypatch.setattr(noaa, "list_isd_stations", lambda **kwargs: pd.DataFrame({"station_id": ["s1"]}))
+    monkeypatch.setattr(noaa, "download_isd_dataset", lambda **kwargs: raw)
+
+    noaa.prepare_isd_cache(
+        noaa.ISDCacheConfig(
+            window=1,
+            horizon=1,
+            years=[2020],
+            data_dir=tmp_path,
+            feature_columns=("temperature", "dew_point"),
+            min_coverage=0.0,
+            overwrite=True,
+        )
+    )
+
+    paths = CachePaths.from_dir(tmp_path)
+    meta = json.loads(paths.meta.read_text(encoding="utf-8"))
+    target_idx = meta["feature_cols"].index("temperature")
+    targets = np.load(paths.targets / "0.npy", allow_pickle=False)
+    obs = np.load(paths.obs_masks / "0.npy", allow_pickle=False)
+    assert np.isfinite(targets[1])
+    assert obs[1, target_idx].item() is False
+
+
+def test_physionet_cache_prep_defaults_outcomes_off_and_saves_true_observed_mask(monkeypatch, tmp_path):
+    from llapdiffusion.datasets import physionet_cinc_dataset as physio
+
+    assert physio.PhysioNetCacheConfig().include_outcomes is False
+
+    panel = pd.DataFrame(
+        {
+            "HR": [1.0, 1.0, 3.0, 4.0],
+            "RespRate": [10.0, 11.0, 12.0, 13.0],
+        },
+        index=pd.date_range("2000-01-01", periods=4, freq="h"),
+    )
+    observed = panel.notna()
+    observed.loc[panel.index[1], "HR"] = False
+    panel.attrs["observed_mask"] = observed
+    monkeypatch.setattr(physio, "download_physionet_cinc_dataset", lambda raw_data_dir, subset: tmp_path / "raw")
+    monkeypatch.setattr(physio, "load_physionet_patient_panels", lambda *args, **kwargs: {"p1": panel})
+
+    physio.prepare_physionet_cinc_cache(
+        physio.PhysioNetCacheConfig(
+            window=1,
+            horizon=1,
+            data_dir=tmp_path,
+            raw_data_dir=tmp_path / "raw",
+            min_coverage=0.0,
+            overwrite=True,
+        )
+    )
+
+    paths = CachePaths.from_dir(tmp_path)
+    meta = json.loads(paths.meta.read_text(encoding="utf-8"))
+    target_idx = meta["feature_cols"].index("HR")
+    targets = np.load(paths.targets / "0.npy", allow_pickle=False)
+    obs = np.load(paths.obs_masks / "0.npy", allow_pickle=False)
+    assert np.isfinite(targets[1])
+    assert obs[1, target_idx].item() is False
 
 
 def test_physionet_public_wrapper_defaults_to_legacy_split():

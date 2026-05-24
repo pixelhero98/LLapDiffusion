@@ -81,7 +81,7 @@ class PhysioNetCacheConfig:
     min_minutes: int = 60
     min_coverage: float = 0.6
     max_patients: Optional[int] = None
-    include_outcomes: bool = True
+    include_outcomes: bool = False
     overwrite: bool = False
 
 
@@ -200,10 +200,14 @@ def _read_patient_file(path: Path) -> Tuple[str, pd.DataFrame]:
 
     pivot = df.pivot_table(index="minutes", columns="Parameter", values="Value", aggfunc="last")
     pivot = pivot.sort_index()
+    observed_mask = pivot.notna()
 
     origin = pd.Timestamp("2000-01-01")
     pivot.index = origin + pd.to_timedelta(pivot.index, unit="m")
+    observed_mask.index = pivot.index
     pivot = pivot.ffill().dropna(how="all")
+    observed_mask = observed_mask.reindex(pivot.index).fillna(False)
+    pivot.attrs["observed_mask"] = observed_mask.astype(bool)
 
     return record_id, pivot
 
@@ -245,14 +249,29 @@ def load_physionet_patient_panels(
             if range_minutes < max(min_minutes, 1):
                 continue
             full_index = pd.date_range(start, end, freq=freq)
+            observed_mask = pivot.attrs.get("observed_mask")
+            if isinstance(observed_mask, pd.DataFrame):
+                observed_mask = observed_mask.reindex(full_index).fillna(False)
+            else:
+                observed_mask = pivot.reindex(full_index).notna()
             pivot = pivot.reindex(full_index)
+        else:
+            observed_mask = pivot.attrs.get("observed_mask")
+            if isinstance(observed_mask, pd.DataFrame):
+                observed_mask = observed_mask.reindex(pivot.index).fillna(False)
+            else:
+                observed_mask = pivot.notna()
         pivot = pivot.ffill()
-        pivot = pivot.dropna(thresh=int(np.ceil(min_coverage * pivot.shape[1])))
+        keep_rows = pivot.notna().sum(axis=1) >= int(np.ceil(min_coverage * pivot.shape[1]))
+        pivot = pivot.loc[keep_rows]
+        observed_mask = observed_mask.reindex(pivot.index).fillna(False)
 
         if pivot.empty:
             continue
 
-        panels[record_id] = pivot.astype(np.float32)
+        out = pivot.astype(np.float32)
+        out.attrs["observed_mask"] = observed_mask[pivot.columns].astype(bool)
+        panels[record_id] = out
 
     if not panels:
         raise RuntimeError(
@@ -293,13 +312,27 @@ def _validate_window_and_horizon(window: int, horizon: int) -> Tuple[int, int]:
 
 
 def _ensure_future_vital_target(panel: pd.DataFrame, target_parameter: str) -> pd.DataFrame:
+    observed_mask = panel.attrs.get("observed_mask")
+    if isinstance(observed_mask, pd.DataFrame):
+        observed_mask = observed_mask.reindex(panel.index).fillna(False)
     if target_parameter not in panel.columns:
         panel[target_parameter] = np.nan
+        if isinstance(observed_mask, pd.DataFrame):
+            observed_mask[target_parameter] = False
 
     target = panel[target_parameter].astype(np.float32)
-    panel = panel.drop(columns=[target_parameter], errors="ignore")
-    panel[TARGET_COLUMN] = target  # keep NaNs for masked training
-    return panel
+    target_observed = (
+        observed_mask[target_parameter].astype(bool)
+        if isinstance(observed_mask, pd.DataFrame) and target_parameter in observed_mask.columns
+        else target.notna()
+    )
+    out = panel.drop(columns=[target_parameter], errors="ignore")
+    out[TARGET_COLUMN] = target  # keep NaNs for masked training
+    if isinstance(observed_mask, pd.DataFrame):
+        obs_out = observed_mask.drop(columns=[target_parameter], errors="ignore")
+        obs_out[TARGET_COLUMN] = target_observed
+        out.attrs["observed_mask"] = obs_out.reindex(index=out.index, columns=out.columns).fillna(False).astype(bool)
+    return out
 
 
 
@@ -358,13 +391,25 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
         panel = _ensure_future_vital_target(panels[asset].copy(), cfg.target_parameter)
 
         if outcomes is not None and asset in outcomes.index:
+            observed_mask = panel.attrs.get("observed_mask")
+            if not isinstance(observed_mask, pd.DataFrame):
+                observed_mask = panel.notna()
             static_values = outcomes.loc[asset]
             for col, value in static_values.items():
                 panel[f"OUTCOME_{col.upper()}"] = np.float32(value) if pd.notna(value) else np.nan
+                observed_mask[f"OUTCOME_{col.upper()}"] = bool(pd.notna(value))
             # Forward-fill only to keep broadcast static covariates constant.
             panel = panel.ffill()
+            panel.attrs["observed_mask"] = (
+                observed_mask.reindex(index=panel.index, columns=panel.columns).fillna(False).astype(bool)
+            )
 
         panel = panel.dropna(how="all")
+        observed_mask = panel.attrs.get("observed_mask")
+        if isinstance(observed_mask, pd.DataFrame):
+            panel.attrs["observed_mask"] = (
+                observed_mask.reindex(index=panel.index, columns=panel.columns).fillna(False).astype(bool)
+            )
         if panel.shape[0] < min_required:
             continue
 
@@ -372,7 +417,12 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
         target_vals = panel.get(TARGET_COLUMN)
         if target_vals is None:
             continue
-        if not np.isfinite(target_vals.to_numpy(dtype=np.float32, copy=False)).any():
+        observed_mask = panel.attrs.get("observed_mask")
+        if isinstance(observed_mask, pd.DataFrame) and TARGET_COLUMN in observed_mask.columns:
+            has_observed_target = bool(observed_mask[TARGET_COLUMN].any())
+        else:
+            has_observed_target = bool(np.isfinite(target_vals.to_numpy(dtype=np.float32, copy=False)).any())
+        if not has_observed_target:
             continue
 
         non_empty_cols = {c for c in panel.columns if not panel[c].isna().all()}
@@ -429,10 +479,18 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
         features = panel.to_numpy(dtype=np.float32, copy=True)
         targets = panel[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=True)
         times = panel.index.to_numpy(dtype="datetime64[ns]")
+        observed_mask = panel.attrs.get("observed_mask")
+        if isinstance(observed_mask, pd.DataFrame):
+            obs_mask = observed_mask.reindex(panel.index)[feature_cols].fillna(False).to_numpy(dtype=bool, copy=False)
+        else:
+            obs_mask = np.isfinite(features)
+        fill_mask = np.isfinite(features)
 
         np.save(paths.features / f"{aid}.npy", features.astype(np.float16, copy=False))
         np.save(paths.targets / f"{aid}.npy", targets.astype(np.float16, copy=False))
         np.save(paths.times / f"{aid}.npy", times)
+        np.save(paths.obs_masks / f"{aid}.npy", obs_mask)
+        np.save(paths.fill_masks / f"{aid}.npy", fill_mask)
 
         # Normalization must ignore missing values downstream (masked training).
         norm_acc.update(aid, features, targets)
@@ -444,7 +502,7 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
 
         # Keep only windows with at least one observed target value in the forecast horizon.
         if horizon > 0:
-            obs = ~np.isnan(targets)
+            obs = obs_mask[:, feature_cols.index(TARGET_COLUMN)]
             future_obs = sliding_window_view(obs, window_shape=horizon)
             valid = future_obs[window : window + max_start].any(axis=1)
             starts = starts[valid]
