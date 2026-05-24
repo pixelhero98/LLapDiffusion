@@ -8,7 +8,7 @@ from llapdiffusion.baselines.runner import TrainConfig, export_notes, run_practi
 
 FULL_NUM_SAMPLES = 25
 FULL_EPOCHS = 600
-FULL_PATIENCE = 50
+FULL_PATIENCE = 20
 COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
 
 
