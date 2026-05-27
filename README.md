@@ -8,7 +8,7 @@ LLapDiffusion trains a timestamp-aware latent diffusion model for irregular mult
 
 ## Limitation
 
-> Less effective when sampling is regular and no temporal (gap) missingness.
+> Less effective when sampling is regular and no informative temporal (gap) missingness.
 > 
 > Realizations of the latent space and the history summarizer are just preliminary, which leaves room for improvement for follow-up works.
 >
