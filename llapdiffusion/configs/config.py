@@ -123,6 +123,7 @@ MODEL_WIDTH = 256
 NUM_LAYERS = 5
 NUM_HEADS = 4
 LAPLACE_K = 256
+RHO_CONDITIONING_MODE = "raw"
 
 
 # ============================ Training Hyperparameters ============================

@@ -8,7 +8,22 @@ from torch.nn.utils import spectral_norm
 
 from llapdiffusion.models.time_utils import relative_time_offsets
 
-__all__ = ["LaplaceTransformEncoder", "LaplacePseudoInverse"]
+RHO_CONDITIONING_MODES = ("legacy_effective", "raw")
+
+__all__ = [
+    "LaplaceTransformEncoder",
+    "LaplacePseudoInverse",
+    "RHO_CONDITIONING_MODES",
+    "normalize_rho_conditioning_mode",
+]
+
+
+def normalize_rho_conditioning_mode(mode: object) -> str:
+    value = str(mode).strip().lower()
+    if value not in RHO_CONDITIONING_MODES:
+        choices = ", ".join(RHO_CONDITIONING_MODES)
+        raise ValueError(f"Unknown rho_conditioning_mode '{mode}'. Use one of: {choices}.")
+    return value
 
 
 class LaplaceTransformEncoder(nn.Module):
@@ -32,6 +47,7 @@ class LaplaceTransformEncoder(nn.Module):
         attn_cond_dim: Optional[int] = None,
         rho_perturb_scale: float = 0.5,
         omega_perturb_scale: float = 0.5,
+        rho_conditioning_mode: str = "raw",
         attn_dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -44,6 +60,7 @@ class LaplaceTransformEncoder(nn.Module):
         self.attn_cond_dim = attn_cond_dim
         self.rho_perturb_scale = float(rho_perturb_scale)
         self.omega_perturb_scale = float(omega_perturb_scale)
+        self.rho_conditioning_mode = normalize_rho_conditioning_mode(rho_conditioning_mode)
 
         if self.hidden_dim % num_heads != 0:
             raise ValueError(
@@ -155,7 +172,11 @@ class LaplaceTransformEncoder(nn.Module):
             d_rho = self.rho_perturb_scale * torch.tanh(delta[:, 0])
             d_omega = self.omega_perturb_scale * torch.tanh(delta[:, 1])
 
-            rho = F.softplus(rho0.unsqueeze(0) + d_rho) + self.alpha_min
+            if self.rho_conditioning_mode == "raw":
+                rho_raw = self._rho_raw.to(device=device, dtype=dtype)
+                rho = F.softplus(rho_raw.unsqueeze(0) + d_rho) + self.alpha_min
+            else:
+                rho = F.softplus(rho0.unsqueeze(0) + d_rho) + self.alpha_min
 
             # Keep omega in (0, omega_max) via logit perturbation of the base sigmoid.
             p0 = (omega0 / self.omega_max).clamp(1e-4, 1 - 1e-4)

@@ -271,6 +271,7 @@ class LapFormer(nn.Module):
         block_summary_adaln: bool = False,
         analysis_summary_qk: bool = False,
         analysis_qk_use_raw_summary: bool = False,
+        rho_conditioning_mode: str = "raw",
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -284,6 +285,7 @@ class LapFormer(nn.Module):
         self.block_summary_adaln = bool(block_summary_adaln)
         self.analysis_summary_qk = bool(analysis_summary_qk)
         self.analysis_qk_use_raw_summary = bool(analysis_qk_use_raw_summary)
+        self.rho_conditioning_mode = str(rho_conditioning_mode).strip().lower()
 
         # Modal analysis/synthesis
         self.analysis = LaplaceTransformEncoder(
@@ -293,6 +295,7 @@ class LapFormer(nn.Module):
             num_heads=num_heads,
             cond_dim=2 * hidden_dim,
             attn_cond_dim=(hidden_dim if self.analysis_summary_qk else None),
+            rho_conditioning_mode=self.rho_conditioning_mode,
             attn_dropout=attn_dropout,
         )
         self.synthesis = LaplacePseudoInverse(

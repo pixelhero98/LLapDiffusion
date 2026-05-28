@@ -144,9 +144,21 @@ def _state_dict_from_checkpoint(payload: object) -> Dict[str, torch.Tensor]:
 
 def _read_model_config(payload: object) -> Dict[str, object]:
     if not isinstance(payload, dict):
-        return {}
+        return {"rho_conditioning_mode": "legacy_effective"}
     model_config = payload.get("model_config")
-    return dict(model_config) if isinstance(model_config, dict) else {}
+    if not isinstance(model_config, dict):
+        return {"rho_conditioning_mode": "legacy_effective"}
+    llapdiff_config = model_config.get("llapdiff")
+    if isinstance(llapdiff_config, dict):
+        config = dict(llapdiff_config)
+    else:
+        config = {
+            key: value
+            for key, value in model_config.items()
+            if key != "cond_adapter"
+        }
+    config.setdefault("rho_conditioning_mode", "legacy_effective")
+    return config
 
 
 def _infer_model_config_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, object]:
@@ -206,6 +218,7 @@ def _model_kwargs(cfg, payload: object, state_dict: Dict[str, torch.Tensor]) -> 
         "block_summary_adaln": bool(getattr(cfg, "BLOCK_SUMMARY_ADALN", False)),
         "analysis_summary_qk": bool(getattr(cfg, "ANALYSIS_SUMMARY_QK", False)),
         "analysis_qk_use_raw_summary": bool(getattr(cfg, "ANALYSIS_QK_USE_RAW", False)),
+        "rho_conditioning_mode": str(getattr(cfg, "RHO_CONDITIONING_MODE", "raw")),
     }
     kwargs.update(_infer_model_config_from_state_dict(state_dict))
     kwargs.update(_read_model_config(payload))

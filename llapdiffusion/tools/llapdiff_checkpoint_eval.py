@@ -280,9 +280,9 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
     )
     summarizer.eval()
 
-    diff_model = tv.build_llapdiff_model(cfg, device)
     payload = torch.load(ckpt_path, map_location=device)
     validate_checkpoint_target_metadata(payload, cfg, context="LLapDiff")
+    diff_model = tv.build_llapdiff_model(cfg, device, checkpoint_payload=payload)
     tv._load_module_state(diff_model, payload["model"], strict=True)
     diff_model.eval()
     mu_mean = payload["mu_mean"].to(device)

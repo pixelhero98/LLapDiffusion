@@ -38,6 +38,7 @@ class LLapDiff(nn.Module):
         block_summary_adaln: bool = False,
         analysis_summary_qk: bool = False,
         analysis_qk_use_raw_summary: bool = False,
+        rho_conditioning_mode: str = "raw",
     ) -> None:
         super().__init__()
         if predict_type not in {"eps", "v", "x0"}:
@@ -69,6 +70,7 @@ class LLapDiff(nn.Module):
             block_summary_adaln=block_summary_adaln,
             analysis_summary_qk=analysis_summary_qk,
             analysis_qk_use_raw_summary=analysis_qk_use_raw_summary,
+            rho_conditioning_mode=rho_conditioning_mode,
         )
         self.time_dim = hidden_dim
 

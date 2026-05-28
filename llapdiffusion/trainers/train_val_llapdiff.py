@@ -1412,6 +1412,7 @@ def _llapdiff_model_kwargs(config_obj: object) -> Dict[str, object]:
         "block_summary_adaln": bool(getattr(config_obj, "BLOCK_SUMMARY_ADALN", False)),
         "analysis_summary_qk": bool(getattr(config_obj, "ANALYSIS_SUMMARY_QK", False)),
         "analysis_qk_use_raw_summary": bool(getattr(config_obj, "ANALYSIS_QK_USE_RAW", False)),
+        "rho_conditioning_mode": str(getattr(config_obj, "RHO_CONDITIONING_MODE", "raw")),
     }
 
 
@@ -1436,8 +1437,43 @@ def _llapdiff_model_config(config_obj: object) -> Dict[str, object]:
     }
 
 
-def build_llapdiff_model(config_obj: object, device: torch.device) -> LLapDiff:
-    model = LLapDiff(**_llapdiff_model_kwargs(config_obj)).to(device)
+def _llapdiff_config_from_checkpoint(payload: object) -> Dict[str, object]:
+    if not isinstance(payload, dict):
+        return {"rho_conditioning_mode": "legacy_effective"}
+    model_config = payload.get("model_config")
+    if not isinstance(model_config, dict):
+        return {"rho_conditioning_mode": "legacy_effective"}
+    llapdiff_config = model_config.get("llapdiff")
+    if isinstance(llapdiff_config, dict):
+        config = dict(llapdiff_config)
+    else:
+        config = {
+            key: value
+            for key, value in model_config.items()
+            if key != "cond_adapter"
+        }
+    config.setdefault("rho_conditioning_mode", "legacy_effective")
+    return config
+
+
+def _llapdiff_model_kwargs_from_checkpoint(config_obj: object, payload: object) -> Dict[str, object]:
+    kwargs = _llapdiff_model_kwargs(config_obj)
+    kwargs.update(_llapdiff_config_from_checkpoint(payload))
+    return kwargs
+
+
+def build_llapdiff_model(
+    config_obj: object,
+    device: torch.device,
+    *,
+    checkpoint_payload: object | None = None,
+) -> LLapDiff:
+    model_kwargs = (
+        _llapdiff_model_kwargs(config_obj)
+        if checkpoint_payload is None
+        else _llapdiff_model_kwargs_from_checkpoint(config_obj, checkpoint_payload)
+    )
+    model = LLapDiff(**model_kwargs).to(device)
     adapter_cfg = _cond_adapter_config(config_obj)
     if adapter_cfg["mode"] == "stats":
         model.cond_adapter = ContextStatsAdapter(
