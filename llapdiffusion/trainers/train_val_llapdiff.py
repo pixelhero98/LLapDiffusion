@@ -1567,6 +1567,22 @@ def _maybe_metric_ema(source: str, ema: Optional[EMA]) -> Optional[EMA]:
     return ema if source == "ema" else None
 
 
+def _resolve_final_test_eval_mode(value: object) -> str:
+    if isinstance(value, bool):
+        return "run" if value else "skip"
+    mode = str(value).strip().lower()
+    if mode in {"", "true", "yes", "on", "1", "run", "evaluate", "eval"}:
+        return "run"
+    if mode in {"false", "no", "off", "0", "skip", "skipped", "none"}:
+        return "skip"
+    if mode in {"defer", "deferred"}:
+        return "defer"
+    raise ValueError(
+        "FINAL_TEST_EVAL must be one of 'run', 'skip', or 'defer' "
+        f"(or a boolean), got {value!r}."
+    )
+
+
 def _finite_or_none(value: float) -> Optional[float]:
     return None if not math.isfinite(float(value)) else float(value)
 
@@ -2873,31 +2889,52 @@ def run(
         best_ckpt_path_ema=best_ckpt_path_ema,
         last_ckpt_path=last_ckpt_path,
     )
-    loaded_checkpoint = _load_eval_checkpoint(
-        eval_checkpoint_path,
-        diff_model=diff_model,
-        ema=ema,
-        device=device,
-        config_obj=config,
-        verbose=verbose,
-    )
+    final_test_eval_mode = _resolve_final_test_eval_mode(getattr(config, "FINAL_TEST_EVAL", "run"))
+    loaded_checkpoint = str(eval_checkpoint_path) if eval_checkpoint_path is not None else None
+    test_metrics: Dict[str, object]
+    if final_test_eval_mode == "run":
+        loaded_checkpoint = _load_eval_checkpoint(
+            eval_checkpoint_path,
+            diff_model=diff_model,
+            ema=ema,
+            device=device,
+            config_obj=config,
+            verbose=verbose,
+        )
 
-    test_metrics = evaluate_regression(
-        diff_model,
-        vae,
-        laplace_summarizer,
-        test_dl,
-        device,
-        mu_mean,
-        mu_std,
-        config,
-        ema=_maybe_metric_ema(test_metric_source, ema),
-        self_cond=bool(getattr(config, "SELF_COND", False)),
-        verbose=debug,
-        progress_enabled=verbose,
-        progress_label="llapdiff test",
-        **_sampling_kwargs(config, prefix="TEST"),
-    )
+        test_metrics = evaluate_regression(
+            diff_model,
+            vae,
+            laplace_summarizer,
+            test_dl,
+            device,
+            mu_mean,
+            mu_std,
+            config,
+            ema=_maybe_metric_ema(test_metric_source, ema),
+            self_cond=bool(getattr(config, "SELF_COND", False)),
+            verbose=debug,
+            progress_enabled=verbose,
+            progress_label="llapdiff test",
+            **_sampling_kwargs(config, prefix="TEST"),
+        )
+        final_test_eval = {
+            "status": "completed",
+            "mode": final_test_eval_mode,
+            "metric_source": test_metric_source,
+            "checkpoint": loaded_checkpoint,
+        }
+    else:
+        final_test_eval = {
+            "status": "deferred" if final_test_eval_mode == "defer" else "skipped",
+            "mode": final_test_eval_mode,
+            "reason": f"FINAL_TEST_EVAL={final_test_eval_mode}",
+            "metric_source": test_metric_source,
+            "checkpoint": loaded_checkpoint,
+        }
+        test_metrics = dict(final_test_eval)
+        if verbose:
+            print(f"[test eval] {final_test_eval['status']} ({final_test_eval['reason']})")
 
     return {
         "benchmark_protocol": llapdiff_protocol_metadata(),
@@ -2910,6 +2947,7 @@ def run(
         "ema_val_history": ema_val_history,
         "pole_probe_history": pole_probe_history,
         "eval_stats": test_metrics,
+        "final_test_eval": final_test_eval,
         "best_val": best_val,
         "best_val_by_source": {
             "raw": _finite_or_none(best_val_crps_by_source["raw"]),

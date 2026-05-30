@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from llapdiffusion.models.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
 
@@ -10,6 +11,33 @@ def _init_small_out_proj(layer: nn.Linear, *, std: float = 1e-2) -> None:
     """Keep residual branches near-identity while preserving gradient flow at step 1."""
     nn.init.normal_(layer.weight, mean=0.0, std=std)
     nn.init.zeros_(layer.bias)
+
+
+def _scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    attn_bias: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    training: bool = False,
+) -> torch.Tensor:
+    dropout_p = float(dropout_p) if training else 0.0
+    if hasattr(F, "scaled_dot_product_attention"):
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_bias,
+            dropout_p=dropout_p,
+        )
+
+    attn = torch.matmul(q, k.transpose(-2, -1)) / (k.shape[-1] ** 0.5)
+    if attn_bias is not None:
+        attn = attn + attn_bias
+    attn = torch.softmax(attn, dim=-1)
+    attn = F.dropout(attn, p=dropout_p, training=training)
+    return torch.matmul(attn, v)
 
 
 class AdaLayerNorm(nn.Module):
@@ -113,12 +141,14 @@ class TransformerBlock(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B,heads,L,dh]
-        attn = torch.matmul(q, k.transpose(-2, -1)) / (k.shape[-1] ** 0.5)
-        if attn_bias is not None:
-            attn = attn + attn_bias
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, L, H)
+        out = _scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_bias=attn_bias,
+            dropout_p=self.attn_dropout.p,
+            training=self.training,
+        ).transpose(1, 2).reshape(B, L, H)
         x = x + self.resid_dropout(self.proj(out))
         x = x + self.mlp(self.norm2(x, cond_vec))
         return x
@@ -164,10 +194,13 @@ class CrossAttnBlock(nn.Module):
         k = kv[:, :, 0].transpose(1, 2)
         v = kv[:, :, 1].transpose(1, 2)
 
-        attn = torch.matmul(q, k.transpose(-2, -1)) / (k.shape[-1] ** 0.5)
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, Lq, H)
+        out = _scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.attn_dropout.p,
+            training=self.training,
+        ).transpose(1, 2).reshape(B, Lq, H)
         return x_q + self.resid_dropout(self.proj(out))
 
 
