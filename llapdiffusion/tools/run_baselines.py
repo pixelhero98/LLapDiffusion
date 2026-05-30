@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 
+from llapdiffusion.benchmark_protocol import DETERMINISTIC_BASELINE_SEEDS, PROBABILISTIC_BASELINE_NUM_SAMPLES
 from llapdiffusion.baselines.registry import DATASET_KEYS, EXTRAPOLATION_BASELINES, IMPUTATION_BASELINES, selected
 from llapdiffusion.baselines.runner import TrainConfig, export_notes, run_practical_matrix
 
 
-FULL_NUM_SAMPLES = 25
+FULL_NUM_SAMPLES = PROBABILISTIC_BASELINE_NUM_SAMPLES
 FULL_EPOCHS = 600
 FULL_PATIENCE = 20
 COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
@@ -22,7 +23,22 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", default="baseline_results")
     parser.add_argument("--work-cache-dir", default=None)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Evaluation/training seed for probabilistic baselines; deterministic baselines use --deterministic-seeds.",
+    )
+    parser.add_argument(
+        "--deterministic-seeds",
+        nargs="+",
+        type=int,
+        default=list(DETERMINISTIC_BASELINE_SEEDS),
+        help=(
+            "Seeds to train/evaluate and mean for deterministic practical baselines. "
+            "The default is 42 through 51."
+        ),
+    )
     parser.add_argument(
         "--target-col",
         default=None,
@@ -74,6 +90,9 @@ def _train_config(args: argparse.Namespace) -> TrainConfig:
     if not 0.0 <= coverage < 1.0:
         raise SystemExit("--coverage must satisfy 0 <= coverage < 1.")
     target_cols = tuple(args.target_cols) if getattr(args, "target_cols", None) else None
+    deterministic_seeds = tuple(int(seed) for seed in getattr(args, "deterministic_seeds", ()))
+    if not deterministic_seeds:
+        raise SystemExit("--deterministic-seeds must contain at least one seed.")
     return TrainConfig(
         source_root=args.source_root,
         output_dir=args.output_dir,
@@ -81,6 +100,7 @@ def _train_config(args: argparse.Namespace) -> TrainConfig:
         device=args.device,
         seed=args.seed,
         num_samples=FULL_NUM_SAMPLES,
+        deterministic_seeds=deterministic_seeds,
         imputation_random_mask_ratio=args.imputation_random_mask_ratio,
         allow_cache_copy=args.allow_cache_copy,
         epochs=FULL_EPOCHS,

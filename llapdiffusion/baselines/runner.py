@@ -3,15 +3,20 @@ from __future__ import annotations
 import csv
 import json
 import random
+import statistics
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import torch
 
-from llapdiffusion.benchmark_protocol import baseline_protocol_metadata
+from llapdiffusion.benchmark_protocol import (
+    DETERMINISTIC_BASELINE_SEEDS,
+    PROBABILISTIC_BASELINE_NUM_SAMPLES,
+    baseline_protocol_metadata,
+)
 from llapdiffusion.baselines.adapters import build_adapter
 from llapdiffusion.baselines.data import (
     batch_to_device,
@@ -36,7 +41,9 @@ class TrainConfig:
     work_cache_dir: Path | str | None = None
     device: str = "auto"
     seed: int = 42
-    num_samples: int = 25
+    num_samples: int = PROBABILISTIC_BASELINE_NUM_SAMPLES
+    deterministic_seeds: tuple[int, ...] = DETERMINISTIC_BASELINE_SEEDS
+    run_suffix: str | None = None
     imputation_random_mask_ratio: float = 0.30
     allow_cache_copy: bool = False
     epochs: int = 600
@@ -228,6 +235,55 @@ def _config_payload(config: TrainConfig) -> dict[str, object]:
     return payload
 
 
+def _seed_run_config(config: TrainConfig, seed: int) -> TrainConfig:
+    seed_value = int(seed)
+    return replace(config, seed=seed_value, run_suffix=f"seed{seed_value}")
+
+
+def _mean_std(values: Sequence[object]) -> tuple[float | None, float | None]:
+    finite = [float(value) for value in values if value is not None and np.isfinite(float(value))]
+    if not finite:
+        return None, None
+    mean = float(statistics.fmean(finite))
+    std = float(statistics.stdev(finite)) if len(finite) > 1 else 0.0
+    return mean, std
+
+
+def _aggregate_deterministic_seed_rows(seed_rows: Sequence[dict[str, object]]) -> dict[str, object]:
+    if not seed_rows:
+        raise ValueError("Cannot aggregate an empty deterministic seed result set.")
+
+    first = seed_rows[0]
+    seeds = [int(row["seed"]) for row in seed_rows]
+    aggregate = {key: value for key, value in first.items() if key not in {"history", "checkpoint", "test"}}
+    aggregate["seed"] = None
+    aggregate["seeds"] = seeds
+    aggregate["seed_count"] = len(seeds)
+    aggregate["seed_aggregation"] = "mean"
+    aggregate["num_samples"] = None
+    aggregate["checkpoint"] = [row.get("checkpoint") for row in seed_rows]
+    aggregate["runtime_seconds"] = sum(float(row.get("runtime_seconds") or 0.0) for row in seed_rows)
+
+    test_rows = [row.get("test") for row in seed_rows if isinstance(row.get("test"), dict)]
+    test = dict(test_rows[0]) if test_rows else {}
+    for metric in ("loss", "mse", "mae", "crps"):
+        mean, std = _mean_std([row.get(metric) for row in test_rows])
+        test[metric] = mean
+        test[f"{metric}_std"] = std
+    for metric in ("best_epoch", "best_val_mse"):
+        mean, std = _mean_std([row.get(metric) for row in seed_rows])
+        aggregate[metric] = mean
+        aggregate[f"{metric}_std"] = std
+    aggregate["test"] = test
+
+    train_config = dict(first.get("train_config") or {})
+    train_config["seed"] = None
+    train_config["deterministic_seeds"] = seeds
+    train_config["run_suffix"] = None
+    aggregate["train_config"] = train_config
+    return aggregate
+
+
 def _target_dim(dataset_info: dict[str, object]) -> int:
     return int(dataset_info.get("target_dim") or max(1, len(dataset_info.get("target_cols") or [])))
 
@@ -296,6 +352,15 @@ def write_rows(rows: Sequence[dict[str, object]], output: Path | str, *, prefix:
         "time_feature_protocol",
         "parameter_count",
         "completion_mode",
+        "seed",
+        "seeds",
+        "seed_count",
+        "seed_aggregation",
+        "num_samples",
+        "eval_replicate_protocol",
+        "num_eval_samples",
+        "deterministic_seed_count",
+        "deterministic_seeds",
         "num_entities_used",
         "valid_observations",
         "loss",
@@ -303,15 +368,21 @@ def write_rows(rows: Sequence[dict[str, object]], output: Path | str, *, prefix:
         "mae",
         "crps",
         "best_epoch",
+        "best_epoch_std",
         "best_val_mse",
+        "best_val_mse_std",
         "test_batches",
         "test_valid_batches",
         "test_raw_batches_scanned",
         "test_valid_observations",
         "test_loss",
+        "test_loss_std",
         "test_mse",
+        "test_mse_std",
         "test_mae",
+        "test_mae_std",
         "test_crps",
+        "test_crps_std",
         "test_metric_aggregation",
         "test_loss_aggregation",
         "train_loader_batches",
@@ -442,7 +513,10 @@ def run_practical_one(
     ).to(device)
     parameter_count = _parameter_count(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    run_dir = output_dir(run_root) / f"{baseline}_{dataset}_h{dataset_info['horizon']}"
+    run_name = f"{baseline}_{dataset}_h{dataset_info['horizon']}"
+    if config.run_suffix:
+        run_name = f"{run_name}_{config.run_suffix}"
+    run_dir = output_dir(run_root) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     best_path = run_dir / "best.pt"
     history = []
@@ -533,6 +607,11 @@ def run_practical_one(
         "batching_policy": dataset_info.get("batching_policy", "exact_context_end_timestamp"),
         "parameter_count": parameter_count,
         "completion_mode": "full_train_loop",
+        "seed": int(config.seed),
+        "seeds": [int(config.seed)],
+        "seed_count": 1,
+        "seed_aggregation": "single_seed",
+        "num_samples": int(config.num_samples) if bool(spec.probabilistic) else None,
         "best_epoch": best_epoch,
         "best_val_mse": best_val,
         "history": history,
@@ -547,11 +626,21 @@ def run_practical_one(
 
 
 def run_practical_matrix(baselines: Sequence[str], datasets: Sequence[str], config: TrainConfig, run_root: Path | str) -> list[dict[str, object]]:
-    rows = [
-        run_practical_one(baseline, dataset, config, run_root, horizon=horizon)
-        for dataset in datasets
-        for horizon in _selected_horizons(dataset, config)
-        for baseline in baselines
-    ]
+    rows: list[dict[str, object]] = []
+    deterministic_seed_rows: list[dict[str, object]] = []
+    for dataset in datasets:
+        for horizon in _selected_horizons(dataset, config):
+            for baseline in baselines:
+                if BASELINES[baseline].probabilistic:
+                    rows.append(run_practical_one(baseline, dataset, config, run_root, horizon=horizon))
+                    continue
+                seed_rows = [
+                    run_practical_one(baseline, dataset, _seed_run_config(config, seed), run_root, horizon=horizon)
+                    for seed in config.deterministic_seeds
+                ]
+                deterministic_seed_rows.extend(seed_rows)
+                rows.append(_aggregate_deterministic_seed_rows(seed_rows))
     write_rows(rows, run_root, prefix="baseline_practical")
+    if deterministic_seed_rows:
+        write_rows(deterministic_seed_rows, run_root, prefix="baseline_practical_seed_rows")
     return rows

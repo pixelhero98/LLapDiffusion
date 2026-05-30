@@ -59,6 +59,10 @@ def test_benchmark_protocol_metadata_declares_comparison_scopes():
     assert llapdiff["missingness_scope"] == "per_feature_covariate_mask"
     assert notes["csdi"]["comparison_type"] == "imputation"
     assert notes["dlinear"]["modeling_scope"] == "uni-average/shared-weight"
+    assert timegrad["num_eval_samples"] == 25
+    assert timegrad["seed_aggregation"] == "single_seed"
+    assert dlinear["seed_aggregation"] == "mean"
+    assert dlinear["deterministic_seed_count"] == 10
 
 
 def _require_mr_diff_adapter():
@@ -1051,6 +1055,59 @@ def test_practical_matrix_expands_all_supported_horizons(monkeypatch, tmp_path):
     assert [row["horizon"] for row in rows] == [4, 8]
 
 
+def test_practical_matrix_averages_deterministic_seed_rows(monkeypatch, tmp_path):
+    from llapdiffusion.baselines import runner
+
+    calls = []
+    written = []
+
+    def fake_run_one(baseline, dataset, config, run_root, *, horizon=None):
+        calls.append((baseline, dataset, horizon, config.seed, config.run_suffix))
+        return {
+            "status": "ok",
+            "baseline": baseline,
+            "dataset": dataset,
+            "horizon": horizon,
+            "seed": config.seed,
+            "seeds": [config.seed],
+            "seed_count": 1,
+            "seed_aggregation": "single_seed",
+            "num_samples": None,
+            "completion_mode": "full_train_loop",
+            "best_epoch": config.seed - 100,
+            "best_val_mse": float(config.seed),
+            "checkpoint": f"seed-{config.seed}/best.pt",
+            "train_config": {"seed": config.seed, "deterministic_seeds": list(config.deterministic_seeds)},
+            "test": {
+                "loss": float(config.seed),
+                "mse": float(config.seed),
+                "mae": float(config.seed) / 10.0,
+                "crps": None,
+                "valid_observations": 12,
+            },
+            "runtime_seconds": 1.0,
+        }
+
+    monkeypatch.setattr(runner, "default_horizons", lambda dataset: (4,))
+    monkeypatch.setattr(runner, "run_practical_one", fake_run_one)
+    monkeypatch.setattr(runner, "write_rows", lambda rows, output, *, prefix: written.append((prefix, list(rows))))
+
+    config = runner.TrainConfig(source_root=None, deterministic_seeds=(101, 102))
+    rows = runner.run_practical_matrix(("dlinear",), ("crypto",), config, tmp_path)
+
+    assert calls == [
+        ("dlinear", "crypto", 4, 101, "seed101"),
+        ("dlinear", "crypto", 4, 102, "seed102"),
+    ]
+    assert len(rows) == 1
+    assert rows[0]["seed_aggregation"] == "mean"
+    assert rows[0]["seed_count"] == 2
+    assert rows[0]["seeds"] == [101, 102]
+    assert rows[0]["test"]["mse"] == pytest.approx(101.5)
+    assert rows[0]["test"]["mae"] == pytest.approx(10.15)
+    assert [item[0] for item in written] == ["baseline_practical", "baseline_practical_seed_rows"]
+
+
 def test_run_baselines_practical_defaults_are_full_comparison(monkeypatch):
     from llapdiffusion.tools import run_baselines
 
@@ -1062,6 +1119,7 @@ def test_run_baselines_practical_defaults_are_full_comparison(monkeypatch):
     assert config.epochs == 600
     assert config.patience == 20
     assert config.num_samples == 25
+    assert config.deterministic_seeds == tuple(range(42, 52))
     assert config.device == "auto"
     assert config.input_policy == "target_only"
     assert config.target_cols is None

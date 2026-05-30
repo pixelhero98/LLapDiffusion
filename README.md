@@ -183,6 +183,8 @@ llapdiff-baselines csdi-imputation \
 
 The primary extrapolation comparison uses target-only baseline inputs. `--input-policy all_features` and multi-target `--target-cols` are available for DLinear/PatchTST ablations; other extrapolation adapters remain scalar target-only. CSDI is reported separately as target-horizon imputation, not as forecast extrapolation.
 
+The practical extrapolation protocol matches LLapDiff sampling for probabilistic baselines: TimeGrad, mTAN, and MR-Diff use 25 stochastic forecast samples. Deterministic extrapolation baselines are reported as the mean over 10 full train/eval seeds, defaulting to seeds 42 through 51; per-seed rows are also written to `baseline_practical_seed_rows.{json,csv}` for audit.
+
 Result metadata records `comparison_type`, `input_scope`, `missingness_scope`, `modeling_scope`, `split_note`, and `time_feature_protocol`. Baseline future time features use known query-grid metadata only; PhysioNet is marked as the patient-relative split special case.
 
 ## Citation
