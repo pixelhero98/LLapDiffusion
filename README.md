@@ -6,6 +6,7 @@ LLapDiffusion trains a timestamp-aware latent diffusion model for irregular mult
 
 *Continuous-time latent generation with context samples, query path, latent coordinates, and stable complex poles.*
 
+![LLapDiff continuous-time poles overview](imgs/raw_rho_poles_montage.png)
 ## Limitation
 
 > Less effective when sampling is regular and no informative temporal (gap) missingness.
