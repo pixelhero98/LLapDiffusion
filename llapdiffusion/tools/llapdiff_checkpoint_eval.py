@@ -13,7 +13,7 @@ import torch
 from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
 from llapdiffusion.trainers import train_val_llapdiff as tv
 from llapdiffusion.configs.dataset_archives import configure_dataset_archive
-from llapdiffusion.configs.config_utils import clone_config, make_jsonable
+from llapdiffusion.configs.config_utils import clone_config, make_jsonable, normalize_predict_type
 from llapdiffusion.configs.dataset_defaults import apply_dataset_preset, dataset_keys, default_horizons
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.datasets.target_selection import resolve_target_selection
@@ -32,13 +32,18 @@ from llapdiffusion.models.llapdiff_utils import (
     vae_io_dims_for_target_dim,
 )
 from llapdiffusion.target_artifacts import (
-    apply_target_metadata_to_config,
+    checkpoint_target_metadata,
+    sync_target_artifact_config,
     unwrap_checkpoint_model,
     validate_checkpoint_target_metadata,
 )
 
 
 COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
+PREDICT_TYPE_HELP = (
+    "Diffusion prediction parameterization for legacy checkpoints that do not record it. "
+    "Modern checkpoints infer this from checkpoint metadata."
+)
 
 
 def build_eval_config(
@@ -182,6 +187,103 @@ def _with_imputation_metric_target(metrics: Dict[str, float]) -> Dict[str, objec
     return tagged
 
 
+def _add_predict_type_candidate(candidates: list[tuple[str, str]], value: object, source: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, str) and value.strip() == "":
+        return
+    candidates.append((normalize_predict_type(value), source))
+
+
+def _checkpoint_predict_type_metadata(payload: object) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+
+    candidates: list[tuple[str, str]] = []
+    model_config = payload.get("model_config")
+    if isinstance(model_config, dict):
+        llapdiff_config = model_config.get("llapdiff")
+        if isinstance(llapdiff_config, dict):
+            _add_predict_type_candidate(
+                candidates,
+                llapdiff_config.get("predict_type"),
+                "checkpoint.model_config.llapdiff.predict_type",
+            )
+        _add_predict_type_candidate(
+            candidates,
+            model_config.get("predict_type"),
+            "checkpoint.model_config.predict_type",
+        )
+    _add_predict_type_candidate(candidates, payload.get("predict_type"), "checkpoint.predict_type")
+
+    if not candidates:
+        return None
+
+    values = {value for value, _ in candidates}
+    if len(values) > 1:
+        detail = ", ".join(f"{source}={value}" for value, source in candidates)
+        raise ValueError(f"Checkpoint has conflicting predict_type metadata: {detail}")
+    return candidates[0][0]
+
+
+def _resolve_checkpoint_predict_type(
+    payload: object,
+    *,
+    explicit_predict_type: Optional[str],
+) -> tuple[str, str]:
+    metadata_predict_type = _checkpoint_predict_type_metadata(payload)
+    explicit = (
+        None
+        if explicit_predict_type is None
+        or (isinstance(explicit_predict_type, str) and explicit_predict_type.strip() == "")
+        else normalize_predict_type(explicit_predict_type)
+    )
+    if metadata_predict_type is not None:
+        if explicit is not None and explicit != metadata_predict_type:
+            raise ValueError(
+                "Explicit --predict-type does not match checkpoint metadata: "
+                f"{explicit} != {metadata_predict_type}."
+            )
+        return metadata_predict_type, "checkpoint_metadata"
+    if explicit is None:
+        raise ValueError(
+            "Checkpoint does not record predict_type metadata; pass --predict-type explicitly "
+            "when evaluating a legacy checkpoint."
+        )
+    return explicit, "cli"
+
+
+def _apply_checkpoint_predict_type(
+    cfg: SimpleNamespace,
+    payload: object,
+    *,
+    explicit_predict_type: Optional[str],
+) -> tuple[str, str]:
+    resolved_predict_type, predict_type_source = _resolve_checkpoint_predict_type(
+        payload,
+        explicit_predict_type=explicit_predict_type,
+    )
+    setattr(cfg, "PREDICT_TYPE", resolved_predict_type)
+    setattr(cfg, "PREDICT_TYPE_SOURCE", predict_type_source)
+    return resolved_predict_type, predict_type_source
+
+
+def _has_target_request(cfg: SimpleNamespace) -> bool:
+    requested = getattr(cfg, "TARGET_COL", None)
+    requested_cols = getattr(cfg, "TARGET_COLS", None)
+    return bool(requested) or bool(requested_cols)
+
+
+def _apply_checkpoint_target_metadata_if_unrequested(cfg: SimpleNamespace, payload: object) -> bool:
+    if _has_target_request(cfg):
+        return False
+    metadata = checkpoint_target_metadata(payload)
+    if metadata is None:
+        return False
+    sync_target_artifact_config(cfg, metadata, update_output_dirs=False)
+    return True
+
+
 def _target_policy(cfg: SimpleNamespace) -> Dict[str, object]:
     requested = getattr(cfg, "TARGET_COL", None)
     requested_cols = getattr(cfg, "TARGET_COLS", None)
@@ -222,7 +324,16 @@ def _target_policy(cfg: SimpleNamespace) -> Dict[str, object]:
         }
 
 
-def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, train_dl, *, verbose: bool = False):
+def _load_stack(
+    cfg: SimpleNamespace,
+    ckpt_path: Path,
+    device: torch.device,
+    train_dl,
+    *,
+    checkpoint_payload: object | None = None,
+    predict_type: Optional[str] = None,
+    verbose: bool = False,
+):
     _, num_entities, window_size, feat_dim = tv._summarize_dataset(train_dl, None, verbose=verbose)
     target_dim = int(getattr(cfg, "TARGET_DIM", 0) or 0)
     if target_dim <= 0:
@@ -231,6 +342,15 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
     vae_input_dim, vae_output_dim = vae_io_dims_for_target_dim(cfg, target_dim)
     setattr(cfg, "VAE_INPUT_DIM", vae_input_dim)
     setattr(cfg, "VAE_OUTPUT_DIM", vae_output_dim)
+    payload = (
+        torch.load(ckpt_path, map_location=device)
+        if checkpoint_payload is None
+        else checkpoint_payload
+    )
+    if not getattr(cfg, "PREDICT_TYPE_SOURCE", None):
+        _apply_checkpoint_predict_type(cfg, payload, explicit_predict_type=predict_type)
+    else:
+        setattr(cfg, "PREDICT_TYPE", normalize_predict_type(getattr(cfg, "PREDICT_TYPE")))
 
     vae = LatentVAE(
         seq_len=cfg.PRED,
@@ -280,7 +400,6 @@ def _load_stack(cfg: SimpleNamespace, ckpt_path: Path, device: torch.device, tra
     )
     summarizer.eval()
 
-    payload = torch.load(ckpt_path, map_location=device)
     validate_checkpoint_target_metadata(payload, cfg, context="LLapDiff")
     diff_model = tv.build_llapdiff_model(cfg, device, checkpoint_payload=payload)
     tv._load_module_state(diff_model, payload["model"], strict=True)
@@ -500,9 +619,18 @@ def evaluate_checkpoint(
     forecast_num_samples: Optional[int] = None,
     imputation_num_samples: Optional[int] = None,
     max_eval_batches: Optional[int] = None,
+    predict_type: Optional[str] = None,
     verbose: Optional[bool] = None,
 ) -> Dict[str, object]:
     ckpt_path = Path(ckpt_path)
+    checkpoint_payload = torch.load(ckpt_path, map_location="cpu")
+    _apply_checkpoint_predict_type(cfg, checkpoint_payload, explicit_predict_type=predict_type)
+    setattr(
+        cfg,
+        "CHECKPOINT_TARGET_METADATA_APPLIED",
+        _apply_checkpoint_target_metadata_if_unrequested(cfg, checkpoint_payload),
+    )
+
     verbose = is_verbose(cfg) if verbose is None else bool(verbose)
     if random_mask_ratio is None:
         random_mask_ratio = float(getattr(cfg, "IMPUTATION_RANDOM_MASK_RATIO", 0.30))
@@ -534,8 +662,16 @@ def evaluate_checkpoint(
     )
     if verbose and sizes is not None:
         print("eval sizes:", tuple(sizes))
-    apply_target_metadata_to_config(cfg, _target_policy(cfg))
-    diff_model, vae, summarizer, mu_mean, mu_std = _load_stack(cfg, ckpt_path, device, train_dl, verbose=verbose)
+    sync_target_artifact_config(cfg, _target_policy(cfg), update_output_dirs=False)
+    diff_model, vae, summarizer, mu_mean, mu_std = _load_stack(
+        cfg,
+        ckpt_path,
+        device,
+        train_dl,
+        checkpoint_payload=checkpoint_payload,
+        predict_type=predict_type,
+        verbose=verbose,
+    )
     test_sampling = tv._sampling_kwargs(cfg, prefix="TEST")
     forecast_cfg = _config_with_num_eval_samples(cfg, forecast_samples)
 
@@ -604,6 +740,11 @@ def evaluate_checkpoint(
     result = {
         "label": label,
         "checkpoint": str(ckpt_path),
+        "predict_type": getattr(cfg, "PREDICT_TYPE", None),
+        "predict_type_source": getattr(cfg, "PREDICT_TYPE_SOURCE", None),
+        "checkpoint_target_metadata_applied": bool(
+            getattr(cfg, "CHECKPOINT_TARGET_METADATA_APPLIED", False)
+        ),
         "benchmark_protocol": llapdiff_protocol_metadata(),
         "data_policy": {
             **_target_policy(cfg),
@@ -718,6 +859,12 @@ def _parse_args() -> argparse.Namespace:
         help="Fraction of observed target entries hidden in the random-mask imputation case.",
     )
     parser.add_argument(
+        "--predict-type",
+        type=str,
+        default=None,
+        help=PREDICT_TYPE_HELP,
+    )
+    parser.add_argument(
         "--dataset-zip",
         type=str,
         default=None,
@@ -757,6 +904,7 @@ def main() -> None:
         forecast_num_samples=args.forecast_num_samples,
         imputation_num_samples=args.imputation_num_samples,
         max_eval_batches=args.max_eval_batches,
+        predict_type=args.predict_type,
         verbose=args.verbose or args.debug,
     )
     if args.print_json:

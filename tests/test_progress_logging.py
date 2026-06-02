@@ -84,7 +84,17 @@ def _checkpoint_eval_impute_metrics():
     }
 
 
-def _patch_checkpoint_eval_dependencies(monkeypatch, ce, *, forecast_fn=None, impute_fn=None):
+def _patch_checkpoint_eval_dependencies(
+    monkeypatch,
+    ce,
+    *,
+    forecast_fn=None,
+    impute_fn=None,
+    checkpoint_payload=None,
+):
+    if checkpoint_payload is None:
+        checkpoint_payload = {"model_config": {"llapdiff": {"predict_type": "x0"}}}
+    monkeypatch.setattr(ce.torch, "load", lambda *args, **kwargs: checkpoint_payload)
     monkeypatch.setattr(ce, "set_torch", lambda **kwargs: torch.device("cpu"))
     monkeypatch.setattr(
         ce,

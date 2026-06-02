@@ -94,6 +94,15 @@ Train LLapDiff extrapolation checkpoints:
 llapdiff-train --dataset-key crypto --preds 100
 ```
 
+The default LLapDiff parameterization is velocity prediction (`v`). To train an x0 or epsilon-prediction checkpoint while keeping the dataset preset hyperparameters unchanged:
+
+```bash
+llapdiff-train --dataset-key crypto --preds 100 --predict-type x0
+llapdiff-train --dataset-key crypto --preds 100 --predict-type eps
+```
+
+Non-default parameterizations are written under separate artifact directories such as `ldt/output/<dataset>/predict-x0/pred-<horizon>` and `ldt/checkpoints/<dataset>/predict-x0/pred-<horizon>`, so they do not overwrite default v-prediction runs.
+
 Evaluate a forecast checkpoint on raw forecast scale and LLapDiff target-horizon imputation:
 
 ```bash
@@ -106,6 +115,7 @@ llapdiff-checkpoint-eval \
 ```
 
 This evaluates a forecast checkpoint by hiding observed target-horizon entries at evaluation time; `--imputation-random-mask-ratio 0.30` hides 30% of observed target-horizon entries.
+Checkpoint evaluation infers the diffusion parameterization from checkpoint metadata. For legacy checkpoints without recorded metadata, pass `--predict-type v`, `--predict-type x0`, or `--predict-type eps` explicitly.
 
 Optional target-mask auxiliary training mixes target-horizon completion batches into LLapDiff training:
 

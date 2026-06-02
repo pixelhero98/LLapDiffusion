@@ -1615,6 +1615,10 @@ def _checkpoint_eval_cfg(num_eval_samples=25):
         DETERMINISTIC=False,
         NUM_EVAL_SAMPLES=num_eval_samples,
         SELF_COND=False,
+        VAE_DIR="vae",
+        VAE_LATENT_CHANNELS=4,
+        VAE_ENTITY_CONDITION=False,
+        VAE_CKPT="vae/pred-10_ch-4_elbo.pt",
     )
 
 
@@ -1636,9 +1640,13 @@ def _patch_checkpoint_eval_dependencies(
     test_dl=None,
     forecast_fn=None,
     impute_fn=None,
+    checkpoint_payload=None,
 ):
     if test_dl is None:
         test_dl = ["test"]
+    if checkpoint_payload is None:
+        checkpoint_payload = {"model_config": {"llapdiff": {"predict_type": "x0"}}}
+    monkeypatch.setattr(ce.torch, "load", lambda *args, **kwargs: checkpoint_payload)
     monkeypatch.setattr(ce, "set_torch", lambda **kwargs: torch.device("cpu"))
     monkeypatch.setattr(
         ce,
@@ -1922,6 +1930,11 @@ def test_checkpoint_eval_random_mask30_uses_seventy_percent_keep(monkeypatch, tm
 
     captured = {}
 
+    monkeypatch.setattr(
+        ce.torch,
+        "load",
+        lambda *args, **kwargs: {"model_config": {"llapdiff": {"predict_type": "x0"}}},
+    )
     monkeypatch.setattr(ce, "set_torch", lambda **kwargs: torch.device("cpu"))
     monkeypatch.setattr(
         ce,

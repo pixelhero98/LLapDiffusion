@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 
@@ -118,6 +119,56 @@ def apply_target_metadata_to_config(config_obj: object, policy: Mapping[str, obj
     setattr(config_obj, "REQUESTED_TARGET_COLS", list(metadata["requested_target_cols"]))
     setattr(config_obj, "TARGET_SIGNATURE", metadata["target_signature"])
     setattr(config_obj, "TARGET_ARTIFACT_SUFFIX", suffix)
+    return metadata
+
+
+def sync_target_artifact_config(
+    config_obj: object,
+    policy: Mapping[str, object] | None = None,
+    *,
+    update_output_dirs: bool = True,
+) -> dict[str, object]:
+    metadata = (
+        apply_target_metadata_to_config(config_obj, policy)
+        if policy is not None
+        else apply_target_metadata_to_config(config_obj, target_metadata_from_config(config_obj))
+    )
+    target_dim = int(metadata.get("target_dim") or 1)
+    suffix = str(getattr(config_obj, "TARGET_ARTIFACT_SUFFIX", "") or "")
+    setattr(config_obj, "VAE_OUTPUT_DIM", target_dim)
+    setattr(config_obj, "VAE_INPUT_DIM", 2 * target_dim)
+    if not suffix:
+        return metadata
+
+    required = ("VAE_DIR", "PRED", "VAE_LATENT_CHANNELS")
+    missing = [name for name in required if not hasattr(config_obj, name)]
+    if missing:
+        raise AttributeError(
+            "Cannot build target-specific VAE checkpoint path; "
+            f"missing config attributes: {', '.join(missing)}"
+        )
+
+    entity_suffix = "_entity" if bool(getattr(config_obj, "VAE_ENTITY_CONDITION", False)) else ""
+    setattr(
+        config_obj,
+        "VAE_CKPT",
+        str(
+            Path(str(getattr(config_obj, "VAE_DIR")))
+            / f"pred-{getattr(config_obj, 'PRED')}_ch-{getattr(config_obj, 'VAE_LATENT_CHANNELS')}"
+            f"{entity_suffix}{suffix}_elbo.pt"
+        ),
+    )
+    if update_output_dirs:
+        if hasattr(config_obj, "OUT_DIR"):
+            out_dir = Path(str(getattr(config_obj, "OUT_DIR")))
+            if not out_dir.name.endswith(suffix):
+                setattr(config_obj, "OUT_DIR", str(out_dir.with_name(out_dir.name + suffix)))
+        if hasattr(config_obj, "CKPT_DIR"):
+            ckpt_dir = Path(str(getattr(config_obj, "CKPT_DIR")))
+            if not ckpt_dir.name.endswith(suffix):
+                setattr(config_obj, "CKPT_DIR", str(ckpt_dir.with_name(ckpt_dir.name + suffix)))
+        if hasattr(config_obj, "POLE_PLOT_DIR") and hasattr(config_obj, "OUT_DIR"):
+            setattr(config_obj, "POLE_PLOT_DIR", str(Path(str(getattr(config_obj, "OUT_DIR"))) / "pole_plots"))
     return metadata
 
 

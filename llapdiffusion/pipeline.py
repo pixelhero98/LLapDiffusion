@@ -8,21 +8,31 @@ from typing import Any, Dict, Iterable, Tuple
 
 from llapdiffusion.configs import config
 from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
-from llapdiffusion.configs.config_utils import make_jsonable
+from llapdiffusion.configs.config_utils import (
+    DEFAULT_PREDICT_TYPE,
+    PREDICT_TYPES,
+    make_jsonable,
+    normalize_predict_type,
+)
 from llapdiffusion.configs.dataset_archives import configure_dataset_archive
 from llapdiffusion.configs.dataset_defaults import apply_dataset_preset, dataset_keys, default_horizons, infer_dataset_key
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.datasets.target_selection import resolve_target_selection
 from llapdiffusion.logging_utils import apply_verbosity
-from llapdiffusion.target_artifacts import apply_target_metadata_to_config, loader_target_request_from_config
-from llapdiffusion.trainers import train_val_latent, train_val_summarizer, train_val_llapdiff
+from llapdiffusion.target_artifacts import (
+    loader_target_request_from_config,
+    sync_target_artifact_config,
+)
 
 
 COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
+PREDICT_TYPE_DIR_PREFIX = "predict"
 
 
 def _import_trainers():
     """Return the trainer modules exposed through the public package layout."""
+    from llapdiffusion.trainers import train_val_latent, train_val_summarizer, train_val_llapdiff
+
     return train_val_latent, train_val_summarizer, train_val_llapdiff
 
 
@@ -72,6 +82,13 @@ def _validate_batch_size(value: object) -> int:
     return batch_size
 
 
+def _parse_predict_type(value: object) -> str:
+    try:
+        return normalize_predict_type(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _effective_batch_size(config=config) -> int:
     fallback = getattr(config, "DATES_PER_BATCH", 1)
     return _validate_batch_size(getattr(config, "BATCH_SIZE", fallback))
@@ -110,6 +127,58 @@ def _resolve_dataset_key(config=config) -> str:
     if data_dir:
         return infer_dataset_key(data_dir)
     raise ValueError("DATASET_KEY is required for preset-driven pipeline runs.")
+
+
+def _requested_predict_type_arg(config=config) -> str | None:
+    requested = getattr(config, "REQUESTED_PREDICT_TYPE_ARG", None)
+    if requested in (None, ""):
+        return None
+    return normalize_predict_type(requested)
+
+
+def _active_predict_type(config=config) -> str:
+    requested = _requested_predict_type_arg(config=config)
+    if requested is not None:
+        return requested
+    return normalize_predict_type(getattr(config, "PREDICT_TYPE", DEFAULT_PREDICT_TYPE))
+
+
+def _predict_type_dir_name(predict_type: str) -> str:
+    return f"{PREDICT_TYPE_DIR_PREFIX}-{predict_type}"
+
+
+def _path_contains_predict_type_dir(path: Path, dirname: str) -> bool:
+    return any(part == dirname or part.startswith(f"{dirname}_") for part in path.parts)
+
+
+def _apply_predict_type_output_routing(*, config=config) -> str:
+    """
+    Put explicit non-default prediction parameterizations in their own artifact dirs.
+
+    The default v-pred run keeps the historical paths. Target-specific suffixing is
+    still applied later by _sync_target_shape_config, so checkpoint filename tags keep
+    their existing pred/target composition.
+    """
+    predict_type = _active_predict_type(config=config)
+    config.PREDICT_TYPE = predict_type
+    if predict_type == DEFAULT_PREDICT_TYPE:
+        return predict_type
+
+    dirname = _predict_type_dir_name(predict_type)
+
+    def route(value: object) -> Path:
+        path = Path(str(value))
+        if _path_contains_predict_type_dir(path, dirname):
+            return path
+        return path / dirname
+
+    if hasattr(config, "OUT_DIR"):
+        config.OUT_DIR = str(route(getattr(config, "OUT_DIR")))
+    if hasattr(config, "CKPT_DIR"):
+        config.CKPT_DIR = str(route(getattr(config, "CKPT_DIR")))
+    if hasattr(config, "POLE_PLOT_DIR") and hasattr(config, "OUT_DIR"):
+        config.POLE_PLOT_DIR = str(Path(str(config.OUT_DIR)) / "pole_plots")
+    return predict_type
 
 
 def _target_policy(config=config) -> Dict[str, object]:
@@ -154,28 +223,7 @@ def _target_policy(config=config) -> Dict[str, object]:
 
 def _sync_target_shape_config(config=config) -> Dict[str, object]:
     policy = _target_policy(config=config)
-    target_dim = int(policy.get("target_dim") or 1)
-    target_metadata = apply_target_metadata_to_config(config, policy)
-    config.VAE_OUTPUT_DIM = target_dim
-    config.VAE_INPUT_DIM = 2 * target_dim
-    suffix = str(getattr(config, "TARGET_ARTIFACT_SUFFIX", "") or "")
-    if suffix:
-        entity_suffix = "_entity" if bool(getattr(config, "VAE_ENTITY_CONDITION", False)) else ""
-        config.VAE_CKPT = str(
-            Path(config.VAE_DIR)
-            / f"pred-{config.PRED}_ch-{config.VAE_LATENT_CHANNELS}{entity_suffix}{suffix}_elbo.pt"
-        )
-        if hasattr(config, "OUT_DIR"):
-            out_dir = Path(str(config.OUT_DIR))
-            if not out_dir.name.endswith(suffix):
-                config.OUT_DIR = str(out_dir.with_name(out_dir.name + suffix))
-        if hasattr(config, "CKPT_DIR"):
-            ckpt_dir = Path(str(config.CKPT_DIR))
-            if not ckpt_dir.name.endswith(suffix):
-                config.CKPT_DIR = str(ckpt_dir.with_name(ckpt_dir.name + suffix))
-        if hasattr(config, "POLE_PLOT_DIR") and hasattr(config, "OUT_DIR"):
-            config.POLE_PLOT_DIR = str(Path(str(config.OUT_DIR)) / "pole_plots")
-    config.TARGET_METADATA = target_metadata
+    sync_target_artifact_config(config, policy, update_output_dirs=True)
     return policy
 
 
@@ -194,6 +242,8 @@ def _update_config_for_pred(pred: int, config=config) -> None:
         "REQUESTED_TARGET_COLS_ARG",
         getattr(config, "TARGET_COLS", None),
     )
+    requested_predict_type = _requested_predict_type_arg(config=config)
+    active_predict_type = _active_predict_type(config=config)
     apply_dataset_preset(config, _resolve_dataset_key(config=config), pred=int(pred))
     config.split_policy = split_policy
     config.split_scope = split_scope
@@ -207,6 +257,8 @@ def _update_config_for_pred(pred: int, config=config) -> None:
     config.REQUESTED_TARGET_COLS_ARG = requested_target_cols
     config.TARGET_COL = requested_target_col
     config.TARGET_COLS = requested_target_cols
+    config.REQUESTED_PREDICT_TYPE_ARG = requested_predict_type
+    config.PREDICT_TYPE = active_predict_type
     config.SUM_CONTEXT_LEN = _resolve_sum_context_len(pred, config=config)
     config.SUM_CKPT = str(
         Path(config.SUM_DIR) / f"{pred}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
@@ -258,6 +310,8 @@ def run_single_pred(
             base_ckpt_dir=base_ckpt_dir,
             config=config,
         )
+    else:
+        _apply_predict_type_output_routing(config=config)
     _apply_training_overrides(training_overrides, config=config)
     data_policy = _sync_target_shape_config(config=config)
 
@@ -390,6 +444,7 @@ def run_preds(
     """
     Run the pipeline for multiple prediction horizons and collect stats.
     """
+    _apply_predict_type_output_routing(config=config)
     base_out_dir = Path(getattr(config, "OUT_DIR", "./outputs"))
     base_ckpt_dir = Path(getattr(config, "CKPT_DIR", str(base_out_dir / "checkpoints")))
 
@@ -454,6 +509,13 @@ def _parse_args() -> argparse.Namespace:
         type=_validate_batch_size,
         default=None,
         help="Effective loader batch size. Defaults to the dataset preset table value.",
+    )
+    parser.add_argument(
+        "--predict-type",
+        type=_parse_predict_type,
+        choices=PREDICT_TYPES,
+        default=None,
+        help="Diffusion prediction parameterization. Defaults to v.",
     )
     parser.add_argument(
         "--recompute-vae",
@@ -760,11 +822,17 @@ def main() -> Dict[int, Dict[str, object]]:
     if args.calendar_day_batches:
         config.exact_timestamp_batches = False
     config.COVERAGE = _validate_coverage(args.coverage)
+    config.REQUESTED_PREDICT_TYPE_ARG = args.predict_type
+    if args.predict_type is not None:
+        config.PREDICT_TYPE = args.predict_type
+    else:
+        config.PREDICT_TYPE = normalize_predict_type(getattr(config, "PREDICT_TYPE", DEFAULT_PREDICT_TYPE))
     training_overrides = _training_overrides_from_args(args)
     preds = tuple(args.preds) if args.preds else _pred_list_from_config(config=config)
     if not preds:
         raise ValueError("No prediction horizons provided to the pipeline.")
 
+    _apply_predict_type_output_routing(config=config)
     base_out_dir = Path(getattr(config, "OUT_DIR", "./outputs"))
     base_ckpt_dir = Path(getattr(config, "CKPT_DIR", str(base_out_dir / "checkpoints")))
 
