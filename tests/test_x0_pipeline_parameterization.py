@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,30 @@ def test_normalize_predict_type_canonicalizes_supported_names():
 
     with pytest.raises(ValueError, match="Unknown predict_type"):
         normalize_predict_type("score")
+
+
+def test_project_script_uses_success_returning_train_wrapper():
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert pyproject["project"]["scripts"]["llapdiff-train"] == "llapdiffusion.pipeline:cli_main"
+
+
+def test_direct_predict_type_defaults_match_documented_v():
+    pytest.importorskip("torch")
+    from llapdiffusion.models.llapdiff import LLapDiff
+    from llapdiffusion.models.llapdiff_utils import diffusion_loss
+
+    model = LLapDiff(
+        data_dim=2,
+        hidden_dim=8,
+        num_layers=1,
+        num_heads=1,
+        laplace_k=4,
+        timesteps=4,
+    )
+
+    assert model.predict_type == "v"
+    assert diffusion_loss.__kwdefaults__["predict_type"] == "v"
 
 
 def test_diffusion_loss_x0_targets_latent_tensor():
@@ -196,6 +221,21 @@ def test_llapdiff_train_predict_type_routes_cli_base_dirs(monkeypatch, tmp_path)
         "base_out_dir": tmp_path / "out" / "predict-eps",
         "base_ckpt_dir": tmp_path / "ckpt" / "predict-eps",
     }
+
+
+def test_llapdiff_train_console_entrypoint_returns_success(monkeypatch):
+    from llapdiffusion import pipeline
+
+    called = {}
+
+    def fake_main():
+        called["main"] = True
+        return {100: {"status": "ok"}}
+
+    monkeypatch.setattr(pipeline, "main", fake_main)
+
+    assert pipeline.cli_main() is None
+    assert called == {"main": True}
 
 
 def test_predict_type_dir_and_target_suffix_compose(monkeypatch, tmp_path):

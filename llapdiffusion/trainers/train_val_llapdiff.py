@@ -890,7 +890,7 @@ def evaluate_val_diagnostics(
     progress_label: Optional[str] = None,
 ) -> Dict[str, object]:
     """Return validation MSE diagnostics for the active prediction parameterization."""
-    predict_type_name = str(getattr(config, "PREDICT_TYPE", "x0")).strip().lower() or "x0"
+    predict_type_name = str(getattr(config, "PREDICT_TYPE", "v")).strip().lower() or "v"
     diff_model.eval()
     scheduler = diff_model.scheduler
 

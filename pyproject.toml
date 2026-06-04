@@ -48,7 +48,7 @@ baselines-dev = [
 ]
 
 [project.scripts]
-llapdiff-train = "llapdiffusion.pipeline:main"
+llapdiff-train = "llapdiffusion.pipeline:cli_main"
 llapdiff-checkpoint-eval = "llapdiffusion.tools.llapdiff_checkpoint_eval:main"
 llapdiff-artifact-prep = "llapdiffusion.tools.run_multidataset_artifact_prep:main"
 llapdiff-synthetic-regime = "llapdiffusion.tools.run_synthetic_regime_shift:main"

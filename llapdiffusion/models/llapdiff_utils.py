@@ -869,7 +869,7 @@ def diffusion_loss(
     *,
     cond_summary: Optional[torch.Tensor],
     cond_summary_raw: Optional[torch.Tensor] = None,
-    predict_type: str = "x0",
+    predict_type: str = "v",
     weight_scheme: str = "none",
     minsnr_gamma: float = 5.0,
     sc_feat: Optional[torch.Tensor] = None,

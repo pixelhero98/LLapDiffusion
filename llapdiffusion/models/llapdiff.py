@@ -26,7 +26,7 @@ class LLapDiff(nn.Module):
         num_layers: int,
         num_heads: int,
         *,
-        predict_type: str = "x0",
+        predict_type: str = "v",
         laplace_k: int = 32,
         timesteps: int = 1000,
         schedule: str = "cosine",

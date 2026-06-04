@@ -863,5 +863,9 @@ def main() -> Dict[int, Dict[str, object]]:
     return results
 
 
-if __name__ == "__main__":  # pragma: no cover
+def cli_main() -> None:
     main()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    cli_main()

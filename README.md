@@ -101,7 +101,7 @@ llapdiff-train --dataset-key crypto --preds 100 --predict-type x0
 llapdiff-train --dataset-key crypto --preds 100 --predict-type eps
 ```
 
-Non-default parameterizations are written under separate artifact directories such as `ldt/output/<dataset>/predict-x0/pred-<horizon>` and `ldt/checkpoints/<dataset>/predict-x0/pred-<horizon>`, so they do not overwrite default v-prediction runs.
+Non-default LLapDiff outputs and checkpoints are written under separate artifact directories such as `ldt/output/<dataset>/predict-x0/pred-<horizon>`, so they do not overwrite default v-prediction runs.
 
 Evaluate a forecast checkpoint on raw forecast scale and LLapDiff target-horizon imputation:
 
