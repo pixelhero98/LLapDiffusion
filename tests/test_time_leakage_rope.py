@@ -726,6 +726,7 @@ def test_run_single_pred_applies_output_dirs_after_pred_update(monkeypatch, tmp_
     fake_llapdiff = SimpleNamespace(run=lambda **kwargs: {"eval_stats": {}, "loaded_checkpoint": None})
 
     monkeypatch.setattr(pipeline, "_update_config_for_pred", fake_update)
+    monkeypatch.setattr(pipeline, "_sync_target_shape_config", lambda config: {})
     monkeypatch.setattr(pipeline, "_import_trainers", lambda: (fake_latent, fake_summarizer, fake_llapdiff))
     monkeypatch.setattr(pipeline, "prepare_dataloaders", lambda config: (None, None, None, (0, 0, 0)))
 
@@ -765,6 +766,7 @@ def test_run_single_pred_checkpoint_eval_is_opt_in(monkeypatch, tmp_path):
         return {"forecast_test": {"mse": 2.0}}
 
     monkeypatch.setattr(pipeline, "_update_config_for_pred", fake_update)
+    monkeypatch.setattr(pipeline, "_sync_target_shape_config", lambda config: {})
     monkeypatch.setattr(pipeline, "_import_trainers", lambda: (fake_latent, fake_summarizer, fake_llapdiff))
     monkeypatch.setattr(pipeline, "prepare_dataloaders", lambda config: (None, None, None, (0, 0, 0)))
     monkeypatch.setitem(
@@ -1309,6 +1311,35 @@ def test_sanitize_batch_entity_mask_does_not_inspect_future_targets():
 
     assert clean_mask.tolist() == [[True]]
     assert torch.isfinite(y_clean).all()
+
+
+def test_sanitize_batch_preserves_missing_targets_for_generic_latent_supervision():
+    from llapdiffusion.trainers import train_val_llapdiff as tv
+
+    class FakeVAE(torch.nn.Module):
+        def forward(self, x_tok, entity_pad=None):
+            batch_size, horizon = x_tok.shape[:2]
+            mu = torch.zeros(batch_size, horizon, 1, device=x_tok.device)
+            reconstruction = torch.zeros(batch_size, horizon, 1, 1, device=x_tok.device)
+            return reconstruction, mu, torch.zeros_like(mu)
+
+    xb = (torch.ones(1, 1, 2, 1), torch.zeros(1, 1, 2, 1))
+    yb = torch.tensor([[[1.0, float("nan"), 3.0]]])
+    meta = {"entity_mask": torch.tensor([[True]])}
+
+    (_, _), y_clean, clean_mask = tv._sanitize_batch(xb, yb, meta, torch.device("cpu"))
+    _, observed_horizons = tv._latent_targets_for_batch(
+        FakeVAE(),
+        y_clean,
+        clean_mask,
+        meta,
+        torch.device("cpu"),
+        torch.zeros(1),
+        torch.ones(1),
+    )
+
+    assert y_clean.tolist() == [[[1.0, 0.0, 3.0]]]
+    assert observed_horizons.tolist() == [[True, False, True]]
 
 
 def test_default_config_allows_imputation_but_keeps_aux_inactive():

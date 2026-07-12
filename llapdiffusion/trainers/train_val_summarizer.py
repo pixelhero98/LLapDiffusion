@@ -10,13 +10,13 @@ from typing import Dict, Iterable, MutableMapping, Optional, Sequence, Tuple
 from llapdiffusion.configs import config
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.logging_utils import is_debug, is_verbose, progress_iter
 from llapdiffusion.models.summarizer import LaplaceAE
 from llapdiffusion.target_artifacts import loader_target_request_from_config
+from llapdiffusion.trainers.amp_utils import autocast_for_device, create_grad_scaler
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
 
 
@@ -235,7 +235,7 @@ def _run_epoch(
     *,
     loss_weights: Tuple[float, float, float, float, float],
     optimizer: Optional[torch.optim.Optimizer] = None,
-    scaler: Optional[GradScaler] = None,
+    scaler: Optional[object] = None,
     grad_clip: float = 0.0,
     amp: bool = False,
     max_nonfinite_grad_steps: int = 0,
@@ -265,7 +265,7 @@ def _run_epoch(
                 raise ValueError("GradScaler must be provided when training.")
             optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=amp):
+        with autocast_for_device(enabled=amp, device=device):
             _, aux = model(V, pad_mask=mask, ctx_diff=T, dt=dt, obs_mask=obs_mask)
             loss = model.recon_loss(aux, mask, weights=loss_weights)
 
@@ -431,7 +431,7 @@ def run(
         print(f"Model params: {count_params(model) / 1e6:.2f}M")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.SUM_LR, weight_decay=config.SUM_WEIGHT_DECAY)
-    scaler = GradScaler(enabled=amp)
+    scaler = create_grad_scaler(enabled=amp, device=device)
     loss_weights = _loss_weights(config)
     if debug:
         print(

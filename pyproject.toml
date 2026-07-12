@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff>=0.8"]
 noaa-download = ["isd-fetch"]
 baselines = [
   "torchcde",
@@ -60,3 +60,14 @@ include = ["llapdiffusion*"]
 
 [tool.setuptools.package-data]
 "llapdiffusion.datasets" = ["*.txt", "*.zip"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

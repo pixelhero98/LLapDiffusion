@@ -34,10 +34,21 @@ Optional baseline dependencies:
 python -m pip install -e ".[baselines]"
 ```
 
-## Quick start
-`Preset default checkpoints and raw datasets are available over HF`: Model: https://huggingface.co/pixelhero98/llapdiff-checkpoints, Dataset: https://huggingface.co/datasets/pixelhero98/llapdiff-raw
+## Development and tests
 
-Run one public preset:
+Install the development dependencies and run the test suite:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m ruff check .
+python -m pytest -q
+```
+
+## Quick start
+
+Pretrained checkpoints and raw datasets are available on Hugging Face: [model checkpoints](https://huggingface.co/mpstoryfans/llapdiff-checkpoints) and [raw datasets](https://huggingface.co/datasets/mpstoryfans/llapdiff-raw).
+
+Run every supported horizon for one public dataset preset:
 
 ```bash
 cd /path/to/LLapDiffusion
@@ -74,7 +85,7 @@ llapdiff-train \
   --dataset-extract-dir /path/to/cache
 ```
 
-The same settings can be provided with `LLAPDIFF_DATASET_ZIP` and `LLAPDIFF_DATASET_EXTRACT_DIR`. Extracted caches are written outside the installed package by default. The archive contains derived caches from public sources; each dataset remains governed by its original source terms.
+The same settings can be provided with `LLAPDIFF_DATASET_ZIP` and `LLAPDIFF_DATASET_EXTRACT_DIR`. When no extraction directory is supplied, extracted caches are written outside the installed package. The archive contains derived caches from public sources; each dataset remains governed by its original source terms.
 
 `--coverage` means induced context missingness: the fraction of observed context entries to hide before modeling. Use `--coverage 0` for no induced missingness. Dense-date panel filtering, where supported by loader internals, is `panel_coverage` and separate from this setting.
 
@@ -94,14 +105,14 @@ Train LLapDiff extrapolation checkpoints:
 llapdiff-train --dataset-key crypto --preds 100
 ```
 
-The default LLapDiff parameterization is velocity prediction (`v`). To train an x0 or epsilon-prediction checkpoint while keeping the dataset preset hyperparameters unchanged:
+LLapDiff uses velocity prediction (`v`) unless `--predict-type` selects another documented parameterization. To train an x0 or epsilon-prediction checkpoint while keeping the dataset preset hyperparameters unchanged:
 
 ```bash
 llapdiff-train --dataset-key crypto --preds 100 --predict-type x0
 llapdiff-train --dataset-key crypto --preds 100 --predict-type eps
 ```
 
-Non-default LLapDiff outputs and checkpoints are written under separate artifact directories such as `ldt/output/<dataset>/predict-x0/pred-<horizon>`, so they do not overwrite default v-prediction runs.
+Alternate LLapDiff outputs and checkpoints are written under separate artifact directories such as `ldt/output/<dataset>/predict-x0/pred-<horizon>`, so they do not overwrite v-prediction runs.
 
 Evaluate a forecast checkpoint on raw forecast scale and LLapDiff target-horizon imputation:
 
@@ -115,7 +126,8 @@ llapdiff-checkpoint-eval \
 ```
 
 This evaluates a forecast checkpoint by hiding observed target-horizon entries at evaluation time; `--imputation-random-mask-ratio 0.30` hides 30% of observed target-horizon entries.
-Checkpoint evaluation infers the diffusion parameterization from checkpoint metadata. For legacy checkpoints without recorded metadata, pass `--predict-type v`, `--predict-type x0`, or `--predict-type eps` explicitly.
+Checkpoint evaluation infers the diffusion parameterization from checkpoint metadata. For checkpoints without recorded metadata, pass `--predict-type v`, `--predict-type x0`, or `--predict-type eps` explicitly.
+Checkpoint evaluation also requires the matching VAE and summarizer artifacts for the selected dataset, horizon, and target selection. Create those artifacts with `llapdiff-train` or `llapdiff-artifact-prep` first, and run evaluation from the same artifact root (`ldt/` when `ARTIFACT_ROOT` is not changed).
 
 Optional target-mask auxiliary training mixes target-horizon completion batches into LLapDiff training:
 
@@ -140,6 +152,8 @@ llapdiff-plot-poles \
   --output-dir ldt/results/pole_plot
 ```
 
+Pole plotting builds real conditioning contexts and therefore requires the matching summarizer artifact for the selected dataset, horizon, and target selection under the same artifact root (`ldt/` when `ARTIFACT_ROOT` is not changed).
+
 Run synthetic regime-shift experiments:
 
 ```bash
@@ -158,7 +172,7 @@ Dataset presets define the public context lengths, horizons, latent sizes, split
 llapdiff-train --dataset-key noaa_us --preds 24 48 96 168
 ```
 
-By default each cache uses its recorded target column metadata. To forecast selected feature columns already present in the cache, pass `--target-col` for one target or `--target-cols` for a multi-target LLapDiffusion run. DLinear/PatchTST baselines also support multi-target ablations:
+Without a target-selection flag, each cache uses its recorded target column metadata. To forecast selected feature columns already present in the cache, pass `--target-col` for one target or `--target-cols` for a multi-target LLapDiffusion run. DLinear/PatchTST baselines also support multi-target ablations:
 
 ```bash
 llapdiff-train --dataset-key crypto --target-col RVOL20_CLOSE --preds 100

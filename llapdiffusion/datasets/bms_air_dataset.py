@@ -353,7 +353,8 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
 
         norm_acc.update(aid, features, targets)
 
-        total_rows = panel.shape[0]; max_start = total_rows - min_required + 1
+        total_rows = panel.shape[0]
+        max_start = total_rows - min_required + 1
         if max_start <= 0:
             continue
         starts = np.arange(0, max_start, dtype=np.int32)
@@ -385,7 +386,6 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
 
     meta = {
         "dataset": "bms_air_quality",
-        "format": "indexcache_v1",
         "assets": assets,
         "asset2id": asset_to_id,
         "feature_cols": feature_cols,
@@ -565,7 +565,6 @@ def run_experiment(
             window=K,
             horizon=H,
             update_meta=False,
-            backup_old=False,
             target_col=target_col,
             target_cols=target_cols,
         )

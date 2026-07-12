@@ -7,17 +7,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from llapdiffusion.configs.config_utils import normalize_predict_type
+from llapdiffusion.configs.config_utils import resolve_predict_type
 
 
-def test_normalize_predict_type_canonicalizes_supported_names():
-    assert normalize_predict_type(None) == "v"
-    assert normalize_predict_type("V") == "v"
-    assert normalize_predict_type("x_0") == "x0"
-    assert normalize_predict_type("epsilon") == "eps"
+def test_resolve_predict_type_accepts_only_documented_values():
+    assert resolve_predict_type(None) == "v"
+    assert resolve_predict_type("V") == "v"
+    assert resolve_predict_type("x0") == "x0"
+    assert resolve_predict_type("eps") == "eps"
 
-    with pytest.raises(ValueError, match="Unknown predict_type"):
-        normalize_predict_type("score")
+    with pytest.raises(ValueError, match="Unsupported predict_type"):
+        resolve_predict_type("epsilon")
 
 
 def test_project_script_uses_success_returning_train_wrapper():
@@ -86,6 +86,7 @@ def test_update_config_for_pred_preserves_explicit_predict_type_reset(monkeypatc
         config.DATASET_KEY = dataset_key
         config.PRED = pred
         config.PREDICT_TYPE = "v"
+        config.COVERAGE = 0.0
         config.SUM_DIR = str(tmp_path / "summarizer")
         config.VAE_LATENT_CHANNELS = 12
 
@@ -96,6 +97,7 @@ def test_update_config_for_pred_preserves_explicit_predict_type_reset(monkeypatc
         split_policy="global_purged_horizon",
         split_scope="global_target_time",
         exact_timestamp_batches=True,
+        COVERAGE=0.25,
         TARGET_COL=None,
         TARGET_COLS=None,
     )
@@ -107,7 +109,29 @@ def test_update_config_for_pred_preserves_explicit_predict_type_reset(monkeypatc
     assert calls == [("crypto", 20)]
     assert cfg.PREDICT_TYPE == "x0"
     assert cfg.REQUESTED_PREDICT_TYPE_ARG == "x0"
+    assert cfg.COVERAGE == pytest.approx(0.25)
     assert cfg.SUM_CKPT == str(tmp_path / "summarizer" / "20-12-summarizer.pt")
+
+
+def test_target_policy_rejects_unresolvable_present_metadata(tmp_path):
+    from llapdiffusion import pipeline
+
+    meta_path = tmp_path / "cache_ratio_index" / "meta.json"
+    meta_path.parent.mkdir(parents=True)
+    meta_path.write_text('{"feature_cols": []}', encoding="utf-8")
+    cfg = SimpleNamespace(DATA_DIR=str(tmp_path), TARGET_COL=None, TARGET_COLS=None)
+
+    with pytest.raises(ValueError, match="Could not resolve target columns from dataset metadata"):
+        pipeline._target_policy(config=cfg)
+
+
+def test_target_policy_requires_dataset_metadata(tmp_path):
+    from llapdiffusion import pipeline
+
+    cfg = SimpleNamespace(DATA_DIR=str(tmp_path), TARGET_COL=None, TARGET_COLS=None)
+
+    with pytest.raises(FileNotFoundError, match="Dataset metadata is required"):
+        pipeline._target_policy(config=cfg)
 
 
 def test_run_preds_routes_nondefault_mode_before_base_dirs(monkeypatch, tmp_path):

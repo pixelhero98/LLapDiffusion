@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -91,6 +92,7 @@ def _config(tmp_path):
         WINDOW=4,
         BATCH_SIZE=2,
         DATES_PER_BATCH=2,
+        SEED=42,
         VAE_LATENT_CHANNELS=3,
         LATENT_NORM_MODE="global",
         SUM_CONTEXT_LEN=4,
@@ -205,6 +207,107 @@ def test_cache_metadata_rejects_stale_batch_identity(tmp_path):
             load_latents=True,
             load_summary=False,
         )
+
+
+@pytest.mark.parametrize("mask_name", ("x_obs_mask", "y_obs_mask"))
+def test_cache_metadata_rejects_changed_observation_masks(tmp_path, mask_name):
+    cache, ((v, t), y, meta) = _build_cache(tmp_path)
+    changed_meta = dict(meta)
+    changed_mask = meta[mask_name].clone()
+    changed_mask.reshape(-1)[0] = ~changed_mask.reshape(-1)[0]
+    changed_meta[mask_name] = changed_mask
+
+    cache.train.reset()
+    with pytest.raises(RuntimeError, match="cache order mismatch"):
+        cache.train.next_batch(
+            changed_meta,
+            device=torch.device("cpu"),
+            mu_mean=cache.mu_mean,
+            mu_std=cache.mu_std,
+            load_latents=True,
+            load_summary=False,
+        )
+
+
+def test_cache_manifest_rebuilds_when_seed_changes(tmp_path):
+    batch = _batch()
+    cfg = _config(tmp_path)
+    loader = [batch]
+
+    build_or_load_diffusion_input_cache(
+        train_dl=loader,
+        val_dl=loader,
+        test_dl=loader,
+        vae=TinyVAE(),
+        summarizer=TinySummarizer(),
+        device=torch.device("cpu"),
+        config_obj=cfg,
+        summary_ft_mode="none",
+        verbose=False,
+    )
+    first_manifest = json.loads((tmp_path / "cache" / "manifest.json").read_text(encoding="utf-8"))
+
+    cfg.SEED = 99
+    build_or_load_diffusion_input_cache(
+        train_dl=loader,
+        val_dl=loader,
+        test_dl=loader,
+        vae=TinyVAE(),
+        summarizer=TinySummarizer(),
+        device=torch.device("cpu"),
+        config_obj=cfg,
+        summary_ft_mode="none",
+        verbose=False,
+    )
+    second_manifest = json.loads((tmp_path / "cache" / "manifest.json").read_text(encoding="utf-8"))
+
+    assert first_manifest["core"]["seed"] == 42
+    assert second_manifest["core"]["seed"] == 99
+
+
+def test_cache_manifest_rebuilds_when_source_tensors_change(tmp_path):
+    batch = _batch()
+    cfg = _config(tmp_path)
+    loader = [batch]
+
+    build_or_load_diffusion_input_cache(
+        train_dl=loader,
+        val_dl=loader,
+        test_dl=loader,
+        vae=TinyVAE(),
+        summarizer=TinySummarizer(),
+        device=torch.device("cpu"),
+        config_obj=cfg,
+        summary_ft_mode="none",
+        verbose=False,
+    )
+    manifest_path = tmp_path / "cache" / "manifest.json"
+    first_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    (values, timestamps), targets, meta = batch
+    changed_values = values.clone()
+    changed_values[0, 0, 0, 0] += 1.0
+    changed_targets = targets.clone()
+    changed_targets[0, 0, 0] += 1.0
+    changed_batch = ((changed_values, timestamps.clone()), changed_targets, dict(meta))
+
+    build_or_load_diffusion_input_cache(
+        train_dl=[changed_batch],
+        val_dl=[changed_batch],
+        test_dl=[changed_batch],
+        vae=TinyVAE(),
+        summarizer=TinySummarizer(),
+        device=torch.device("cpu"),
+        config_obj=cfg,
+        summary_ft_mode="none",
+        verbose=False,
+    )
+    second_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert (
+        first_manifest["splits"]["train"]["source_digest"]
+        != second_manifest["splits"]["train"]["source_digest"]
+    )
 
 
 def test_summary_cache_disabled_when_summarizer_is_trainable(tmp_path):

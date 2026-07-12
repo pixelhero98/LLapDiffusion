@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 from torch.utils.data import DataLoader, Subset
 
 from llapdiffusion.datasets._normalization import NormalizationStatsAccumulator
@@ -276,7 +275,6 @@ def run_experiment(
             window=K,
             horizon=H,
             update_meta=needs_reindex,
-            backup_old=False,
             target_col=target_col,
             target_cols=target_cols,
         )

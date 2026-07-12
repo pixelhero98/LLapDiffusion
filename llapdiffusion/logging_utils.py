@@ -82,18 +82,21 @@ def progress_iter(
     stream = sys.stderr if stream is None else stream
     resolved_total = _safe_len(iterable) if total is None else int(total)
     if _use_tqdm(stream):
-        from tqdm.auto import tqdm
-
-        yield from tqdm(
-            iterable,
-            total=resolved_total,
-            desc=desc,
-            unit=unit,
-            file=stream,
-            dynamic_ncols=True,
-            leave=False,
-        )
-        return
+        try:
+            from tqdm.auto import tqdm
+        except ImportError:
+            pass
+        else:
+            yield from tqdm(
+                iterable,
+                total=resolved_total,
+                desc=desc,
+                unit=unit,
+                file=stream,
+                dynamic_ncols=True,
+                leave=False,
+            )
+            return
 
     interval = _progress_interval(resolved_total, log_every)
     count = 0
@@ -137,18 +140,21 @@ class _ProgressTask(AbstractContextManager["_ProgressTask"]):
         if not self.enabled:
             return self
         if _use_tqdm(self.stream):
-            from tqdm.auto import tqdm
-
-            self._bar = tqdm(
-                total=self.total,
-                desc=self.desc,
-                unit=self.unit,
-                file=self.stream,
-                dynamic_ncols=True,
-                leave=False,
-            )
-        else:
-            _emit_progress(self.stream, self.desc, 0, self.total, self.unit)
+            try:
+                from tqdm.auto import tqdm
+            except ImportError:
+                pass
+            else:
+                self._bar = tqdm(
+                    total=self.total,
+                    desc=self.desc,
+                    unit=self.unit,
+                    file=self.stream,
+                    dynamic_ncols=True,
+                    leave=False,
+                )
+                return self
+        _emit_progress(self.stream, self.desc, 0, self.total, self.unit)
         return self
 
     def update(self, n: int = 1) -> None:

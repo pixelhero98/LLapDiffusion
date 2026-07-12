@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from llapdiffusion.configs import config
@@ -29,6 +28,7 @@ from llapdiffusion.models.llapdiff_utils import (
     targets_to_bhnc,
     vae_io_dims_for_target_dim,
 )
+from llapdiffusion.trainers.amp_utils import autocast_for_device, create_grad_scaler
 from llapdiffusion.target_artifacts import (
     loader_target_request_from_config,
     target_metadata_from_config,
@@ -256,7 +256,7 @@ def _epoch_pass(
     beta: float,
     *,
     optimizer: Optional[torch.optim.Optimizer] = None,
-    scaler: Optional[GradScaler] = None,
+    scaler: Optional[object] = None,
     grad_clip: float = 1.0,
     amp_enabled: bool = False,
     p_drop: float = 0.0,
@@ -306,7 +306,7 @@ def _epoch_pass(
             optimizer.zero_grad(set_to_none=True)
 
         with grad_ctx_factory():
-            with autocast(enabled=amp_enabled):
+            with autocast_for_device(enabled=amp_enabled, device=device):
                 y_hat_bt, mu, logvar = model(x_tok, entity_pad=entity_pad)  # [B,T,N,C]
                 y_hat = y_hat_bt.permute(0, 2, 1, 3).contiguous()  # -> [B,N,T,C]
 
@@ -772,7 +772,7 @@ def run(
         lr=config.VAE_LEARNING_RATE,
         weight_decay=config.VAE_WEIGHT_DECAY,
     )
-    scaler = GradScaler(enabled=amp_enabled)
+    scaler = create_grad_scaler(enabled=amp_enabled, device=device)
 
     vae_beta = float(getattr(config, "VAE_BETA", 0.0))
     warmup_epochs = int(getattr(config, "VAE_WARMUP_EPOCHS", 0))

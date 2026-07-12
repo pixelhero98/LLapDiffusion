@@ -48,9 +48,11 @@ from llapdiffusion.target_artifacts import (
     validate_checkpoint_target_metadata,
 )
 from llapdiffusion.models.time_utils import relative_time_offsets
+from llapdiffusion.trainers.amp_utils import autocast_for_device, create_grad_scaler
 
 
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
+_INFERRED_TARGET_OBS_MASK_KEY = "_inferred_target_obs_mask"
 
 
 def _cfg_value(config_obj: object, *names: str, default):
@@ -58,18 +60,6 @@ def _cfg_value(config_obj: object, *names: str, default):
         if hasattr(config_obj, name):
             return getattr(config_obj, name)
     return default
-
-
-def _make_grad_scaler(*, enabled: bool, device: torch.device):
-    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        return torch.amp.GradScaler(device=device.type, enabled=enabled)
-    return torch.cuda.amp.GradScaler(enabled=enabled)  # pragma: no cover
-
-
-def _autocast_context(*, enabled: bool, device: torch.device):
-    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
-        return torch.amp.autocast(device_type=device.type, enabled=enabled)
-    return torch.cuda.amp.autocast(enabled=enabled)  # pragma: no cover
 
 
 def _nan_to_num(x: torch.Tensor) -> torch.Tensor:
@@ -189,6 +179,27 @@ def _canon_target_obs_mask_like(
     raise ValueError(f"y_obs_mask shape {tuple(mask.shape)} is incompatible with target shape {tuple(yb.shape)}")
 
 
+def _target_obs_mask_for_batch(
+    meta: Dict[str, torch.Tensor],
+    yb: torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return explicit or inferred target observations without changing cache fingerprints."""
+
+    y_obs = _canon_target_obs_mask_like(meta.get("y_obs_mask"), yb, device=device)
+    if y_obs is not None:
+        return y_obs
+
+    inferred = meta.get(_INFERRED_TARGET_OBS_MASK_KEY)
+    if inferred is not None:
+        inferred_mask = _canon_target_obs_mask_like(inferred, yb, device=device)
+        if inferred_mask is not None:
+            return inferred_mask
+
+    return torch.isfinite(yb)
+
+
 def _raise_if_observed_nonfinite(name: str, tensor: torch.Tensor, observed: torch.Tensor) -> None:
     bad = observed.to(device=tensor.device, dtype=torch.bool) & ~torch.isfinite(tensor)
     if bad.any():
@@ -215,12 +226,14 @@ def _sanitize_batch(
     _raise_if_observed_nonfinite("V", V, observed)
     _raise_if_observed_nonfinite("T", T, observed)
 
-    y_obs = _canon_target_obs_mask_like(meta.get("y_obs_mask"), yb, device=device)
-    if y_obs is not None:
-        entity_target_mask = mask[:, :, None]
-        if yb.dim() == 4:
-            entity_target_mask = entity_target_mask.unsqueeze(-1)
-        _raise_if_observed_nonfinite("yb", yb, y_obs & entity_target_mask)
+    y_obs = _target_obs_mask_for_batch(meta, yb, device=device)
+    if meta.get("y_obs_mask") is None:
+        # Keep the inferred mask private so frozen-cache fingerprints remain stable.
+        meta[_INFERRED_TARGET_OBS_MASK_KEY] = y_obs
+    entity_target_mask = mask[:, :, None]
+    if yb.dim() == 4:
+        entity_target_mask = entity_target_mask.unsqueeze(-1)
+    _raise_if_observed_nonfinite("yb", yb, y_obs & entity_target_mask)
 
     if x_obs is None:
         mask = mask & _entity_finite_mask(V) & _entity_finite_mask(T)
@@ -692,9 +705,8 @@ def _latent_targets_for_batch(
     if cached_batch is not None and cached_batch.mu_norm is not None and cached_batch.obs_any is not None:
         return cached_batch.mu_norm, cached_batch.obs_any
 
-    x_tok, entity_pad, obs = pack_targets_tokens(
-        yb, mask_bn, device, y_obs_mask=meta.get("y_obs_mask")
-    )
+    y_obs_mask = _target_obs_mask_for_batch(meta, yb, device=device)
+    x_tok, entity_pad, obs = pack_targets_tokens(yb, mask_bn, device, y_obs_mask=y_obs_mask)
     if x_tok is None or obs is None or not obs.any():
         return None, None
 
@@ -1244,7 +1256,7 @@ def evaluate_regression(
                 key="delta_t_y",
             )
 
-            y_obs_mask = meta.get("y_obs_mask")
+            y_obs_mask = _target_obs_mask_for_batch(meta, yb, device=device)
             x_tok, entity_pad, obs = pack_targets_tokens(
                 yb, mask_bn, device, y_obs_mask=y_obs_mask
             )
@@ -1932,7 +1944,7 @@ def run(
         )
     optimizer = torch.optim.AdamW(optimizer_param_groups, lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
     amp_enabled = bool(getattr(config, "DIFF_AMP", False) and device.type == "cuda")
-    scaler = _make_grad_scaler(enabled=amp_enabled, device=device)
+    scaler = create_grad_scaler(enabled=amp_enabled, device=device)
     total_steps = max(1, int(config.EPOCHS) * max(1, len(train_dl)))
     lr_schedule_name = str(getattr(config, "LR_SCHEDULE", "warmup_cosine"))
     lr_sched = make_lr_scheduler(
@@ -2321,7 +2333,7 @@ def run(
             loss = torch.zeros((), device=device)
             raw_loss = torch.zeros((), device=device)
 
-            with _autocast_context(enabled=amp_enabled, device=device):
+            with autocast_for_device(enabled=amp_enabled, device=device):
                 if idx_c.numel() > 0:
                     loss_c, loss_c_stats = diffusion_loss(
                         diff_model,

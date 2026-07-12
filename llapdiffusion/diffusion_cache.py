@@ -7,7 +7,7 @@ import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -75,6 +75,9 @@ def batch_fingerprint(meta: Dict[str, torch.Tensor]) -> Dict[str, object]:
         "rows": rows,
         "context_end_time_keys": _tensor_int_list(meta.get("context_end_time_keys")),
         "entity_mask": _tensor_digest(entity_mask),
+        "x_obs_mask": _tensor_digest(meta.get("x_obs_mask")),
+        "y_obs_mask": _tensor_digest(meta.get("y_obs_mask")),
+        "delta_t": _tensor_digest(meta.get("delta_t"), floating_round=6),
         "delta_t_y": _tensor_digest(meta.get("delta_t_y"), floating_round=6),
         "cache_asset_ids": _tensor_digest(meta.get("cache_asset_ids")),
         "cache_window_starts": _tensor_digest(meta.get("cache_window_starts")),
@@ -84,6 +87,22 @@ def batch_fingerprint(meta: Dict[str, torch.Tensor]) -> Dict[str, object]:
 def fingerprint_digest(meta: Dict[str, torch.Tensor]) -> str:
     payload = json.dumps(batch_fingerprint(meta), sort_keys=True, separators=(",", ":"))
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def source_batch_digest(
+    xb: Tuple[torch.Tensor, torch.Tensor],
+    yb: torch.Tensor,
+) -> str:
+    """Return a content digest for source tensors used to build frozen inputs."""
+
+    values, timestamps = xb
+    payload = {
+        "context_values": _tensor_digest(values),
+        "context_timestamps": _tensor_digest(timestamps, floating_round=6),
+        "targets": _tensor_digest(yb),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.blake2b(serialized.encode("utf-8"), digest_size=16).hexdigest()
 
 
 def _digest_strings(values: Sequence[str]) -> str:
@@ -118,6 +137,7 @@ class _SplitPlan:
     name: str
     batch_rows: List[int]
     batch_digests: List[str]
+    source_batch_digests: List[str]
 
     @property
     def total_rows(self) -> int:
@@ -126,6 +146,10 @@ class _SplitPlan:
     @property
     def digest(self) -> str:
         return _digest_strings(self.batch_digests)
+
+    @property
+    def source_digest(self) -> str:
+        return _digest_strings(self.source_batch_digests)
 
 
 @dataclass
@@ -367,7 +391,8 @@ def cache_allowed(config_obj: object, *, summary_ft_mode: Optional[str] = None) 
 def _metadata_plan(name: str, dataloader) -> _SplitPlan:
     batch_rows: List[int] = []
     batch_digests: List[str] = []
-    for _, _, meta in dataloader:
+    source_batch_digests: List[str] = []
+    for xb, yb, meta in dataloader:
         if meta.get("context_end_time_keys") is None:
             raise RuntimeError(
                 "diffusion input cache requires context_end_time_keys; "
@@ -376,9 +401,15 @@ def _metadata_plan(name: str, dataloader) -> _SplitPlan:
         rows = int(torch.as_tensor(meta["entity_mask"]).shape[0])
         batch_rows.append(rows)
         batch_digests.append(fingerprint_digest(meta))
+        source_batch_digests.append(source_batch_digest(xb, yb))
     if not batch_rows:
         raise RuntimeError(f"{name} dataloader produced no batches for diffusion cache")
-    return _SplitPlan(name=name, batch_rows=batch_rows, batch_digests=batch_digests)
+    return _SplitPlan(
+        name=name,
+        batch_rows=batch_rows,
+        batch_digests=batch_digests,
+        source_batch_digests=source_batch_digests,
+    )
 
 
 def _manifest_core(config_obj: object, *, summary_enabled: bool) -> Dict[str, object]:
@@ -393,6 +424,7 @@ def _manifest_core(config_obj: object, *, summary_enabled: bool) -> Dict[str, ob
         "window": int(getattr(config_obj, "WINDOW", 0)),
         "batch_size": int(getattr(config_obj, "BATCH_SIZE", 0)),
         "dates_per_batch": int(getattr(config_obj, "DATES_PER_BATCH", 0)),
+        "seed": int(getattr(config_obj, "SEED", 42)),
         "latent_channels": int(getattr(config_obj, "VAE_LATENT_CHANNELS", 0)),
         "latent_norm_mode": str(getattr(config_obj, "LATENT_NORM_MODE", "global")),
         "sum_context_len": int(getattr(config_obj, "SUM_CONTEXT_LEN", 0)),
@@ -459,6 +491,8 @@ def _load_existing_cache(
         if split is None:
             return None
         if split.get("batch_digest") != plan.digest:
+            return None
+        if split.get("source_digest") != plan.source_digest:
             return None
         if split.get("total_rows") != plan.total_rows:
             return None
@@ -641,6 +675,7 @@ def _write_split(
         "batch_rows": plan.batch_rows,
         "batch_digests": plan.batch_digests,
         "batch_digest": plan.digest,
+        "source_digest": plan.source_digest,
         "latent_shape": list(latent_shape),
         "summary_shape": None if summary_shape is None else list(summary_shape),
         "latent_dtype": str(latent_dtype),

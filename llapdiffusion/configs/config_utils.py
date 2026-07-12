@@ -8,31 +8,22 @@ from llapdiffusion.configs import config as base_config
 
 
 PREDICT_TYPES = ("v", "x0", "eps")
-DEFAULT_PREDICT_TYPE = "v"
+PREDICT_TYPE_VELOCITY = "v"
 
 
-def normalize_predict_type(value: object) -> str:
-    """Return the canonical diffusion prediction parameterization name."""
+def resolve_predict_type(value: object) -> str:
+    """Validate and return a supported diffusion prediction parameterization."""
+
     raw = (
-        DEFAULT_PREDICT_TYPE
+        PREDICT_TYPE_VELOCITY
         if value is None or (isinstance(value, str) and not value.strip())
         else value
     )
-    name = str(raw).strip().lower().replace("-", "_")
-    aliases = {
-        "epsilon": "eps",
-        "noise": "eps",
-        "x_0": "x0",
-        "xstart": "x0",
-        "x_start": "x0",
-        "velocity": "v",
-        "v_prediction": "v",
-    }
-    normalized = aliases.get(name, name)
-    if normalized not in PREDICT_TYPES:
+    predict_type = str(raw).strip().lower()
+    if predict_type not in PREDICT_TYPES:
         choices = ", ".join(PREDICT_TYPES)
-        raise ValueError(f"Unknown predict_type {value!r}; expected one of: {choices}.")
-    return normalized
+        raise ValueError(f"Unsupported predict_type {value!r}; expected one of: {choices}.")
+    return predict_type
 
 
 def clone_config(source: object = base_config) -> SimpleNamespace:

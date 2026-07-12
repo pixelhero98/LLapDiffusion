@@ -21,6 +21,7 @@ from llapdiffusion.datasets.fin_dataset import (
     _target_interval_times_for_pairs,
     load_dataloaders_with_ratio_split,
     make_collate_level_and_firstdiff,
+    validate_split_policy,
 )
 
 
@@ -241,6 +242,23 @@ def _assert_split_target_intervals_are_ordered(
         assert left_rows.any()
         assert right_rows.any()
         assert int(ends[left_rows].max()) < int(starts[right_rows].min())
+
+
+@pytest.mark.parametrize(
+    "split_policy",
+    ("global_purged_horizon", "per_asset_purged_horizon", "contiguous"),
+)
+def test_split_policy_validator_accepts_documented_values(split_policy):
+    assert validate_split_policy(split_policy) == split_policy
+
+
+@pytest.mark.parametrize(
+    "split_policy",
+    ("purged_horizon", "global", "legacy", "ratio", "global-purged-horizon", None),
+)
+def test_split_policy_validator_rejects_undocumented_values(split_policy):
+    with pytest.raises(ValueError, match="split_policy"):
+        validate_split_policy(split_policy)
 
 
 def test_global_purged_split_has_no_target_timestamp_overlap(tmp_path):
@@ -518,6 +536,40 @@ def test_cache_target_mask_uses_saved_observed_mask_for_filled_targets(tmp_path)
     _, y, meta = next(iter(train_dl))
     assert torch.isfinite(y[0, 0, 0])
     assert meta["y_obs_mask"][0, 0].tolist() == [False, True]
+
+
+def test_public_classification_loader_collates_scalar_labels(tmp_path):
+    data_dir, _, _ = _write_tiny_cache(tmp_path, num_assets=1, length=10, window=2, horizon=3)
+    paths = CachePaths.from_dir(data_dir)
+    observed = np.load(paths.obs_masks / "0.npy", allow_pickle=False)
+    observed[2, 1] = False
+    np.save(paths.obs_masks / "0.npy", observed)
+
+    train_dl, _, _, _ = load_dataloaders_with_ratio_split(
+        data_dir=str(data_dir),
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        batch_size=1,
+        n_entities=1,
+        regression=False,
+        norm_scope="cache",
+        shuffle_train=False,
+        date_batching=False,
+        window=2,
+        horizon=3,
+        split_policy="contiguous",
+    )
+
+    _, labels, meta = next(iter(train_dl))
+
+    assert labels.shape == (1, 1, 1)
+    assert labels.dtype == torch.int64
+    assert labels[0, 0, 0].item() in {0, 1}
+    assert meta["y_obs_mask"].shape == labels.shape
+    assert meta["y_obs_mask"][0, 0, 0].item() is True
+    assert meta["delta_t_y"].shape == labels.shape
+    assert meta["delta_t_y"][0, 0, 0].item() == pytest.approx(3.0)
 
 
 @pytest.mark.parametrize("coverage", [-0.1, 1.0])

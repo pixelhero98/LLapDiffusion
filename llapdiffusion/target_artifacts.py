@@ -46,11 +46,11 @@ def normalize_target_metadata(metadata: Mapping[str, object] | None) -> dict[str
     indices = _int_list(payload.get("target_indices"))
     if not cols and target_col:
         cols = [target_col]
-    legacy = bool(
+    uses_unsuffixed_scalar_artifact = bool(
         target_dim == 1
         and source in {"", "cache_target", "unresolved"}
     )
-    canonical = {
+    normalized = {
         "target_col": target_col,
         "target_cols": cols,
         "target_indices": indices,
@@ -58,10 +58,10 @@ def normalize_target_metadata(metadata: Mapping[str, object] | None) -> dict[str
         "target_source": source,
         "requested_target_col": requested_target_col,
         "requested_target_cols": requested_cols,
-        "legacy_scalar_default": legacy,
+        "uses_unsuffixed_scalar_artifact": uses_unsuffixed_scalar_artifact,
     }
-    canonical["target_signature"] = target_signature(canonical)
-    return canonical
+    normalized["target_signature"] = target_signature(normalized)
+    return normalized
 
 
 def target_signature(metadata: Mapping[str, object]) -> str:
@@ -101,7 +101,7 @@ def target_metadata_from_config(config_obj: object) -> dict[str, object]:
 
 def target_artifact_suffix(metadata: Mapping[str, object]) -> str:
     normalized = normalize_target_metadata(metadata)
-    if bool(normalized.get("legacy_scalar_default")):
+    if bool(normalized.get("uses_unsuffixed_scalar_artifact")):
         return ""
     return "_" + str(normalized["target_signature"])
 
@@ -223,15 +223,15 @@ def validate_checkpoint_target_metadata(
     expected = target_metadata_from_config(config_obj)
     actual = checkpoint_target_metadata(payload)
     if actual is None:
-        if bool(expected.get("legacy_scalar_default")):
+        if bool(expected.get("uses_unsuffixed_scalar_artifact")):
             return
         raise ValueError(
             f"{context} checkpoint does not contain target metadata; "
             f"expected {expected['target_signature']} for target_cols={expected['target_cols']}."
         )
     if (
-        bool(actual.get("legacy_scalar_default"))
-        and bool(expected.get("legacy_scalar_default"))
+        bool(actual.get("uses_unsuffixed_scalar_artifact"))
+        and bool(expected.get("uses_unsuffixed_scalar_artifact"))
         and not actual.get("target_cols")
     ):
         return

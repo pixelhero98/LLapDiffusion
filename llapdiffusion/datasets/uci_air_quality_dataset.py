@@ -407,7 +407,6 @@ def prepare_uci_air_cache(cfg: UCIAirCacheConfig) -> Mapping[str, List[str]]:
 
     meta = {
         "dataset": "uci_air_quality",
-        "format": "indexcache_v1",
         "assets": assets,
         "asset2id": asset_to_id,
         "feature_cols": feature_cols,
@@ -534,7 +533,6 @@ def run_experiment(
             window=K,
             horizon=H,
             update_meta=True,
-            backup_old=False,
             target_col=target_col,
             target_cols=target_cols,
         )
@@ -544,7 +542,6 @@ def run_experiment(
             window=K,
             horizon=H,
             update_meta=False,
-            backup_old=False,
             target_col=target_col,
             target_cols=target_cols,
         )

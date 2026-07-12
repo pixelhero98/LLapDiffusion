@@ -13,7 +13,7 @@ import torch
 from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
 from llapdiffusion.trainers import train_val_llapdiff as tv
 from llapdiffusion.configs.dataset_archives import configure_dataset_archive
-from llapdiffusion.configs.config_utils import clone_config, make_jsonable, normalize_predict_type
+from llapdiffusion.configs.config_utils import clone_config, make_jsonable, resolve_predict_type
 from llapdiffusion.configs.dataset_defaults import apply_dataset_preset, dataset_keys, default_horizons
 from llapdiffusion.configs.dataset_registry import resolve_run_experiment
 from llapdiffusion.datasets.target_selection import resolve_target_selection
@@ -41,7 +41,7 @@ from llapdiffusion.target_artifacts import (
 
 COVERAGE_HELP = "fraction of observed context entries to hide; 0 disables induced missingness"
 PREDICT_TYPE_HELP = (
-    "Diffusion prediction parameterization for legacy checkpoints that do not record it. "
+    "Diffusion prediction parameterization for checkpoints that do not record it. "
     "Modern checkpoints infer this from checkpoint metadata."
 )
 
@@ -192,7 +192,7 @@ def _add_predict_type_candidate(candidates: list[tuple[str, str]], value: object
         return
     if isinstance(value, str) and value.strip() == "":
         return
-    candidates.append((normalize_predict_type(value), source))
+    candidates.append((resolve_predict_type(value), source))
 
 
 def _checkpoint_predict_type_metadata(payload: object) -> Optional[str]:
@@ -236,7 +236,7 @@ def _resolve_checkpoint_predict_type(
         None
         if explicit_predict_type is None
         or (isinstance(explicit_predict_type, str) and explicit_predict_type.strip() == "")
-        else normalize_predict_type(explicit_predict_type)
+        else resolve_predict_type(explicit_predict_type)
     )
     if metadata_predict_type is not None:
         if explicit is not None and explicit != metadata_predict_type:
@@ -248,7 +248,7 @@ def _resolve_checkpoint_predict_type(
     if explicit is None:
         raise ValueError(
             "Checkpoint does not record predict_type metadata; pass --predict-type explicitly "
-            "when evaluating a legacy checkpoint."
+            "when evaluating a checkpoint without recorded prediction metadata."
         )
     return explicit, "cli"
 
@@ -350,7 +350,7 @@ def _load_stack(
     if not getattr(cfg, "PREDICT_TYPE_SOURCE", None):
         _apply_checkpoint_predict_type(cfg, payload, explicit_predict_type=predict_type)
     else:
-        setattr(cfg, "PREDICT_TYPE", normalize_predict_type(getattr(cfg, "PREDICT_TYPE")))
+        setattr(cfg, "PREDICT_TYPE", resolve_predict_type(getattr(cfg, "PREDICT_TYPE")))
 
     vae = LatentVAE(
         seq_len=cfg.PRED,

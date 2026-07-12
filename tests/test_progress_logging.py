@@ -269,7 +269,12 @@ def test_llapdiff_val_diag_and_cache_wrap_verbose_progress(monkeypatch, tmp_path
         dc._write_split(
             name="train",
             dataloader=[],
-            plan=dc._SplitPlan(name="train", batch_rows=[], batch_digests=[]),
+                plan=dc._SplitPlan(
+                    name="train",
+                    batch_rows=[],
+                    batch_digests=[],
+                    source_batch_digests=[],
+                ),
             root=tmp_path,
             vae=FakeModule(),
             summarizer=FakeModule(),

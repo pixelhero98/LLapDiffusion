@@ -671,7 +671,6 @@ def prepare_features_and_index_cache(
     # ---- Meta
     meta = {
         'dataset': 'fin_dataset',
-        'format': 'indexcache_v1',
         'assets': assets,
         'asset2id': {a:i for i,a in enumerate(assets)},
         'start': start, 'end': end,
@@ -726,7 +725,6 @@ def rebuild_window_index_only(
     horizon: int,
     max_windows_per_ticker: Optional[int] = None,
     update_meta: bool = True,
-    backup_old: bool = True,
     target_col: Optional[str] = None,
     target_cols: Optional[Sequence[str]] = None,
 ) -> int:
@@ -736,7 +734,6 @@ def rebuild_window_index_only(
 
     Returns the total number of indexed windows.
     """
-    import shutil
     paths = CachePaths.from_dir(data_dir)
     times_dir = paths.times
     windows_dir = paths.windows
@@ -804,10 +801,6 @@ def rebuild_window_index_only(
     windows_dir.mkdir(parents=True, exist_ok=True)
     gp_path = windows_dir / "global_pairs.npy"
     et_path = windows_dir / "end_times.npy"
-    if backup_old:
-        for p in (gp_path, et_path):
-            if p.exists():
-                shutil.move(str(p), str(p.with_suffix(p.suffix + ".bak")))
 
     np.save(gp_path, global_pairs)
     np.save(et_path, end_times)
@@ -927,12 +920,20 @@ def make_collate_level_and_firstdiff(
                 raise KeyError("Sample must contain V/T/y (or aliases).")
 
             # expected shapes per entity sample: [K,F], [K,F], [H] or [H,C]
-            if y.ndim == 2 and y.shape[-1] == 1:
+            scalar_label = y.ndim == 0
+            if scalar_label:
+                y = y.reshape(1)
+            elif y.ndim == 2 and y.shape[-1] == 1:
                 y = y[..., 0]
 
             V_list.append(V.astype(np.float32, copy=False))
             T_list.append(T.astype(np.float32, copy=False))
-            y_list.append(y.astype(np.float32, copy=False))
+            y_dtype = (
+                np.int64
+                if scalar_label and np.issubdtype(y.dtype, np.integer)
+                else np.float32
+            )
+            y_list.append(y.astype(y_dtype, copy=False))
 
             asset_ids.append(int(_pick(s, "asset_id", "entity_id", default=-1)))
             window_starts.append(int(_pick(s, "start_idx", "window_start", default=-1)))
@@ -940,6 +941,9 @@ def make_collate_level_and_firstdiff(
             ctx_times = _pick(s, "ctx_times", "times_x", "x_times")
             y_times = _pick(s, "y_times", "times_y", "target_times")
             ctx_times_arr = _as_np(ctx_times) if ctx_times is not None else None
+            y_times_arr = _as_np(y_times) if y_times is not None else None
+            if scalar_label and y_times_arr is not None:
+                y_times_arr = np.asarray(y_times_arr).reshape(-1)[-1:]
             context_end_key = _pick(s, "context_end_time_key", "context_end_key")
             if ctx_times_arr is None and context_end_key is not None:
                 key_arr = np.asarray(context_end_key).reshape(-1)
@@ -949,18 +953,25 @@ def make_collate_level_and_firstdiff(
                     except Exception:
                         ctx_times_arr = key_arr[:1]
             ctx_times_list.append(ctx_times_arr)
-            y_times_list.append(_as_np(y_times) if y_times is not None else None)
+            y_times_list.append(y_times_arr)
 
             # Preserve explicit relative deltas when provided by the dataset.
             dt_ctx = _pick(s, "delta_t", "dt_x", "x_delta_t")
             dt_y = _pick(s, "delta_t_y", "dt_y", "y_delta_t")
             delta_t_list.append(_as_np(dt_ctx) if dt_ctx is not None else None)
-            delta_t_y_list.append(_as_np(dt_y) if dt_y is not None else None)
+            dt_y_arr = _as_np(dt_y) if dt_y is not None else None
+            if scalar_label and dt_y_arr is not None:
+                dt_y_arr = np.asarray(dt_y_arr).reshape(-1)[-1:]
+            delta_t_y_list.append(dt_y_arr)
 
             x_obs = _pick(s, "x_obs_mask", "obs_mask_x")
             y_obs = _pick(s, "y_obs_mask", "obs_mask_y")
             x_obs_list.append(_as_np(x_obs) if x_obs is not None else None)
-            y_obs_list.append(_as_np(y_obs) if y_obs is not None else None)
+            y_obs_arr = _as_np(y_obs) if y_obs is not None else None
+            if scalar_label and y_obs_arr is not None:
+                # Classification labels are derived from the final horizon target.
+                y_obs_arr = np.asarray(y_obs_arr).reshape(-1)[-1:]
+            y_obs_list.append(y_obs_arr)
 
         # Infer dimensions
         K, F = V_list[0].shape
@@ -1019,7 +1030,7 @@ def make_collate_level_and_firstdiff(
         V_full = np.zeros((B, int(n_entities), K, F), dtype=np.float32)
         T_full = np.zeros((B, int(n_entities), K, F), dtype=np.float32)
         y_full_shape = (B, int(n_entities), H, *y_tail_shape)
-        y_full = np.zeros(y_full_shape, dtype=np.float32)
+        y_full = np.zeros(y_full_shape, dtype=y.dtype)
 
         x_obs_full = None
         y_obs_full = None
@@ -1519,27 +1530,19 @@ def _split_counts(n: int, tr: float, vr: float, te: float) -> Tuple[int, int, in
     return trn, van, ten
 
 
-def _canonical_split_policy(split_policy: str) -> str:
-    value = str(split_policy or "global_purged_horizon").strip().lower().replace("-", "_")
-    aliases = {
-        "purged_horizon": "global_purged_horizon",
-        "global_purged": "global_purged_horizon",
-        "global_purge": "global_purged_horizon",
-        "global": "global_purged_horizon",
-        "per_asset_purged": "per_asset_purged_horizon",
-        "per_asset_purge": "per_asset_purged_horizon",
-        "asset_purged_horizon": "per_asset_purged_horizon",
-        "asset_purge": "per_asset_purged_horizon",
-        "ratio": "contiguous",
-        "legacy": "contiguous",
-    }
-    value = aliases.get(value, value)
-    if value not in {"global_purged_horizon", "per_asset_purged_horizon", "contiguous"}:
+def validate_split_policy(split_policy: str) -> str:
+    """Validate and return one of the documented split-policy names."""
+
+    if not isinstance(split_policy, str) or split_policy not in (
+        "global_purged_horizon",
+        "per_asset_purged_horizon",
+        "contiguous",
+    ):
         raise ValueError(
             "split_policy must be one of "
             "{'global_purged_horizon', 'per_asset_purged_horizon', 'contiguous'}"
         )
-    return value
+    return split_policy
 
 
 def _target_interval_times_for_pairs(
@@ -1651,7 +1654,7 @@ def _assign_ratio_splits(
     """Assign rows to train/val/test using the configured chronological policy."""
 
     assign = np.full(pairs.shape[0], 255, dtype=np.uint8)
-    policy = _canonical_split_policy(split_policy)
+    policy = validate_split_policy(split_policy)
 
     if pairs.size == 0:
         return assign
@@ -1710,12 +1713,6 @@ def _assign_ratio_splits(
         assign[trn:trn + van] = 1
         assign[trn + van:] = 2
     return assign
-
-
-def split_policy_name(split_policy: str) -> str:
-    """Return the canonical public name for a split policy string."""
-
-    return _canonical_split_policy(split_policy)
 
 
 def _compute_train_only_norm_stats(
@@ -1996,7 +1993,7 @@ def load_dataloaders_with_ratio_split(
         # We'll sort by (asset_id, end_time)
         
     aid = pairs[:, 0].astype(np.int32)
-    policy = _canonical_split_policy(split_policy)
+    policy = validate_split_policy(split_policy)
     if policy == "global_purged_horizon":
         order = np.argsort(end_times.astype('datetime64[ns]').astype(np.int64), kind='mergesort')
     elif per_asset:
@@ -2214,7 +2211,6 @@ def run_experiment(
             window=K,
             horizon=H,
             update_meta=True,
-            backup_old=False,
             target_col=target_col,
             target_cols=target_cols,
         )

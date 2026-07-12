@@ -28,6 +28,15 @@ import numpy as np
 import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 
+from llapdiffusion.datasets._normalization import NormalizationStatsAccumulator
+from llapdiffusion.datasets._types import PathLike
+from llapdiffusion.datasets.fin_dataset import (
+    CachePaths,
+    _validate_context_missingness_rate,
+    load_dataloaders_with_ratio_split as _load_fin_ratio_split,
+    rebuild_window_index_only as _rebuild_window_index_only,
+)
+
 
 def _initialise_isd_backend() -> Tuple[Optional[object], Optional[str]]:
     """Attempt to import an ISD client from supported third-party libraries."""
@@ -80,14 +89,6 @@ def _initialise_isd_backend() -> Tuple[Optional[object], Optional[str]]:
 
 isd, _isd_backend_name = _initialise_isd_backend()
 
-from llapdiffusion.datasets._normalization import NormalizationStatsAccumulator
-from llapdiffusion.datasets._types import PathLike
-from llapdiffusion.datasets.fin_dataset import (
-    CachePaths,
-    _validate_context_missingness_rate,
-    load_dataloaders_with_ratio_split as _load_fin_ratio_split,
-    rebuild_window_index_only as _rebuild_window_index_only,
-)
 TARGET_COLUMN = "temperature"
 DEFAULT_FREQ = "h"  # Hourly sampling interval
 MAX_LOOKBACK = 336
@@ -676,7 +677,6 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
 
     meta = {
         "dataset": "noaa_isd",
-        "format": "indexcache_v1",
         "assets": assets,
         "asset2id": asset_to_id,
         "feature_cols": feature_cols,
@@ -826,7 +826,6 @@ def run_experiment(
             window=K,
             horizon=H,
             update_meta=needs_reindex,
-            backup_old=False,
             target_col=target_col,
             target_cols=target_cols,
         )

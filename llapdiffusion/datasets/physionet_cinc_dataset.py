@@ -12,9 +12,10 @@ under the unified column name ``future_vital``.
 
 from __future__ import annotations
 
-import io
 import json
+import os
 import shutil
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,18 +139,19 @@ def download_physionet_cinc_dataset(dest_path="./physionet_cinc_raw", subset="se
     # --- Fall back: download the split zip and extract into dest/ ---
     dest.mkdir(parents=True, exist_ok=True)
     url = DATA_URLS[subset_key]
-    import tempfile, os
     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
         response = requests.get(url, stream=True, timeout=120)
         response.raise_for_status()
-        for chunk in response.iter_content(chunk_size=1024*1024):
-            if chunk: tmp_file.write(chunk)
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                tmp_file.write(chunk)
         tmp_path = tmp_file.name
     try:
         with zipfile.ZipFile(tmp_path) as zf:
             extract_zip_safely(zf, dest)
     finally:
-        if os.path.exists(tmp_path): os.remove(tmp_path)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
     subset_dir = dest / subset_key
     outcomes = subset_dir / OUTCOME_FILENAMES[subset_key]
@@ -531,7 +533,6 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
 
     meta = {
         "dataset": "physionet_cinc",
-        "format": "indexcache_v1",
         "subset": cfg.subset,
         "window": window,
         "horizon": horizon,
@@ -656,7 +657,6 @@ def run_experiment(
             window=K,
             horizon=H,
             update_meta=needs_reindex,
-            backup_old=False,
             target_col=target_col,
             target_cols=target_cols,
         )

@@ -26,10 +26,9 @@ import numpy as np
 from llapdiffusion.datasets.fin_dataset import (
     CachePaths,
     _assign_ratio_splits,
-    _canonical_split_policy,
     _normalize_to_day,
     _target_interval_times_for_pairs,
-    split_policy_name,
+    validate_split_policy,
 )
 
 
@@ -153,7 +152,7 @@ def _apply_split(
         order = np.argsort(t_int)
     pairs = pairs[order]
     end_times = end_times[order]
-    policy = _canonical_split_policy(split_policy)
+    policy = validate_split_policy(split_policy)
     target_start_times = target_end_times = None
     if policy in {"global_purged_horizon", "per_asset_purged_horizon"}:
         if data_dir is None or window is None:
@@ -189,6 +188,7 @@ def summarize_dataset(
     per_asset: bool,
     split_policy: str,
 ) -> None:
+    policy = validate_split_policy(split_policy)
     paths = CachePaths.from_dir(data_dir)
     meta = _load_meta(paths)
     assets = meta.get("assets", [])
@@ -238,7 +238,7 @@ def summarize_dataset(
         val_ratio=val_ratio,
         test_ratio=test_ratio,
         per_asset=per_asset,
-        split_policy=split_policy,
+        split_policy=policy,
         horizon=horizon,
         data_dir=data_dir,
         window=window,
@@ -273,7 +273,7 @@ def summarize_dataset(
             f"max={filtered_cov_summary.max:.3f}"
         )
     print()
-    print(f"Windows by split (policy={split_policy_name(split_policy)}):")
+    print(f"Windows by split (policy={policy}):")
     print(f"  train={tr_steps}  val={va_steps}  test={te_steps}")
 
 

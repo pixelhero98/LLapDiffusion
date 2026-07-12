@@ -53,9 +53,9 @@ def test_checkpoint_metadata_predict_type_wins():
 def test_legacy_checkpoint_requires_explicit_predict_type():
     from llapdiffusion.tools import llapdiff_checkpoint_eval as ce
 
-    with pytest.raises(ValueError, match="legacy checkpoint"):
+    with pytest.raises(ValueError, match="without recorded prediction metadata"):
         ce._resolve_checkpoint_predict_type({"model": {}}, explicit_predict_type=None)
-    with pytest.raises(ValueError, match="legacy checkpoint"):
+    with pytest.raises(ValueError, match="without recorded prediction metadata"):
         ce._resolve_checkpoint_predict_type({"model": {}}, explicit_predict_type="")
 
 

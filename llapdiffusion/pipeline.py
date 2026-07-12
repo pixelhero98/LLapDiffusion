@@ -9,10 +9,10 @@ from typing import Any, Dict, Iterable, Tuple
 from llapdiffusion.configs import config
 from llapdiffusion.benchmark_protocol import llapdiff_protocol_metadata, split_protocol_metadata
 from llapdiffusion.configs.config_utils import (
-    DEFAULT_PREDICT_TYPE,
     PREDICT_TYPES,
+    PREDICT_TYPE_VELOCITY,
     make_jsonable,
-    normalize_predict_type,
+    resolve_predict_type,
 )
 from llapdiffusion.configs.dataset_archives import configure_dataset_archive
 from llapdiffusion.configs.dataset_defaults import apply_dataset_preset, dataset_keys, default_horizons, infer_dataset_key
@@ -84,7 +84,7 @@ def _validate_batch_size(value: object) -> int:
 
 def _parse_predict_type(value: object) -> str:
     try:
-        return normalize_predict_type(value)
+        return resolve_predict_type(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
@@ -133,14 +133,14 @@ def _requested_predict_type_arg(config=config) -> str | None:
     requested = getattr(config, "REQUESTED_PREDICT_TYPE_ARG", None)
     if requested in (None, ""):
         return None
-    return normalize_predict_type(requested)
+    return resolve_predict_type(requested)
 
 
 def _active_predict_type(config=config) -> str:
     requested = _requested_predict_type_arg(config=config)
     if requested is not None:
         return requested
-    return normalize_predict_type(getattr(config, "PREDICT_TYPE", DEFAULT_PREDICT_TYPE))
+    return resolve_predict_type(getattr(config, "PREDICT_TYPE", PREDICT_TYPE_VELOCITY))
 
 
 def _predict_type_dir_name(predict_type: str) -> str:
@@ -153,15 +153,15 @@ def _path_contains_predict_type_dir(path: Path, dirname: str) -> bool:
 
 def _apply_predict_type_output_routing(*, config=config) -> str:
     """
-    Put explicit non-default prediction parameterizations in their own artifact dirs.
+    Put explicit alternate prediction parameterizations in their own artifact dirs.
 
-    The default v-pred run keeps the historical paths. Target-specific suffixing is
-    still applied later by _sync_target_shape_config, so checkpoint filename tags keep
-    their existing pred/target composition.
+    The standard v-pred run keeps its established paths. Target-specific suffixing is
+    still applied later by _sync_target_shape_config, so checkpoint filename tags retain
+    their pred/target composition.
     """
     predict_type = _active_predict_type(config=config)
     config.PREDICT_TYPE = predict_type
-    if predict_type == DEFAULT_PREDICT_TYPE:
+    if predict_type == PREDICT_TYPE_VELOCITY:
         return predict_type
 
     dirname = _predict_type_dir_name(predict_type)
@@ -185,40 +185,43 @@ def _target_policy(config=config) -> Dict[str, object]:
     requested = getattr(config, "TARGET_COL", None)
     requested_cols = getattr(config, "TARGET_COLS", None)
     meta_path = Path(str(getattr(config, "DATA_DIR", ""))) / "cache_ratio_index" / "meta.json"
+
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Dataset metadata is required to resolve target columns: {meta_path}"
+        ) from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read dataset metadata: {meta_path}") from exc
+
+    if not isinstance(meta, dict):
+        raise ValueError(
+            f"Could not resolve target columns from dataset metadata: {meta_path}; "
+            "expected a JSON object."
+        )
+
+    try:
         selected = resolve_target_selection(
             meta,
             None if requested_cols else requested,
             requested_target_cols=requested_cols,
         )
-        return {
-            "target_col": selected.target_col,
-            "target_cols": list(selected.target_cols),
-            "target_indices": list(selected.target_indices),
-            "target_dim": selected.target_dim,
-            "target_source": selected.target_source,
-            "requested_target_col": selected.requested_target_col,
-            "requested_target_cols": list(selected.requested_target_cols or []),
-            "calendar_feature_cols": list(selected.calendar_feature_cols),
-        }
-    except Exception as exc:
-        if requested not in (None, "") or requested_cols not in (None, "", []):
-            raise ValueError(f"Could not resolve requested target columns.") from exc
-        return {
-            "target_col": requested,
-            "target_cols": (
-                list(requested_cols)
-                if requested_cols
-                else ([requested] if requested else [])
-            ),
-            "target_indices": [],
-            "target_dim": 1,
-            "target_source": "unresolved",
-            "requested_target_col": requested,
-            "requested_target_cols": list(requested_cols) if requested_cols else [],
-            "calendar_feature_cols": [],
-        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Could not resolve target columns from dataset metadata: {meta_path}"
+        ) from exc
+
+    return {
+        "target_col": selected.target_col,
+        "target_cols": list(selected.target_cols),
+        "target_indices": list(selected.target_indices),
+        "target_dim": selected.target_dim,
+        "target_source": selected.target_source,
+        "requested_target_col": selected.requested_target_col,
+        "requested_target_cols": list(selected.requested_target_cols or []),
+        "calendar_feature_cols": list(selected.calendar_feature_cols),
+    }
 
 
 def _sync_target_shape_config(config=config) -> Dict[str, object]:
@@ -231,6 +234,7 @@ def _update_config_for_pred(pred: int, config=config) -> None:
     split_policy = getattr(config, "split_policy", "global_purged_horizon")
     split_scope = getattr(config, "split_scope", "global_target_time")
     exact_timestamp_batches = bool(getattr(config, "exact_timestamp_batches", True))
+    coverage = _validate_coverage(getattr(config, "COVERAGE", 0.0))
     requested_batch_size = getattr(config, "REQUESTED_BATCH_SIZE_ARG", None)
     requested_target_col = getattr(
         config,
@@ -248,6 +252,7 @@ def _update_config_for_pred(pred: int, config=config) -> None:
     config.split_policy = split_policy
     config.split_scope = split_scope
     config.exact_timestamp_batches = exact_timestamp_batches
+    config.COVERAGE = coverage
     config.REQUESTED_BATCH_SIZE_ARG = requested_batch_size
     if requested_batch_size is not None:
         batch_size = _validate_batch_size(requested_batch_size)
@@ -501,7 +506,7 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=None,
-        help="Prediction horizons to run. Defaults to config.PIPELINE_PREDS or [config.PRED].",
+        help="Prediction horizons to run. When omitted, runs every supported horizon for the selected dataset.",
     )
     parser.add_argument("--coverage", type=float, default=0.0, help=COVERAGE_HELP)
     parser.add_argument(
@@ -826,7 +831,9 @@ def main() -> Dict[int, Dict[str, object]]:
     if args.predict_type is not None:
         config.PREDICT_TYPE = args.predict_type
     else:
-        config.PREDICT_TYPE = normalize_predict_type(getattr(config, "PREDICT_TYPE", DEFAULT_PREDICT_TYPE))
+        config.PREDICT_TYPE = resolve_predict_type(
+            getattr(config, "PREDICT_TYPE", PREDICT_TYPE_VELOCITY)
+        )
     training_overrides = _training_overrides_from_args(args)
     preds = tuple(args.preds) if args.preds else _pred_list_from_config(config=config)
     if not preds:
