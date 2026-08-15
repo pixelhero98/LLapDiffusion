@@ -1,3 +1,29 @@
+# Latent Laplace Diffusion
+
+> ICML 2026 Spotlight · [Paper](https://arxiv.org/abs/2605.19805)
+
+## 30-second entry point
+
+**Problem.** Irregular multivariate observations do not share a stable discrete
+sampling grid, making long-horizon forecasting and target-horizon imputation
+difficult to model with ordinary sequence assumptions.
+
+**Method.** LLapDiffusion denoises compact latent trajectories parameterized by
+stable Laplace-domain modes while conditioning on observed values, timestamps,
+gaps, and masks.
+
+**Verified result.** The work is accepted as an ICML 2026 Spotlight. The public
+package includes seven dataset presets, checkpoint evaluation, public baseline
+adapters, pole visualisation, and explicit irregular-time and missingness
+protocols.
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+llapdiff-train --dataset-key crypto --preds 100
+```
+
 ## Overview
 
 LLapDiffusion trains a timestamp-aware latent diffusion model for irregular multivariate forecasting and target-horizon imputation. The model conditions on observed values, timestamps, gaps, and masks, then denoises compact latent trajectories parameterized by stable Laplace-domain modes.
